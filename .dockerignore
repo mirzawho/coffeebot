@@ -1,0 +1,20 @@
+# Build context exclusions — keep the image small and free of secrets/state.
+node_modules
+data
+uploads
+.git
+.github
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+*.log
+tests
+.bun-tmp
+.claude
+IMPLEMENTATION_STATUS.md
+PROJECT_BRIEF.md
+README.md
+Dockerfile
+.dockerignore

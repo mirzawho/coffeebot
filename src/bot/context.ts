@@ -1,0 +1,70 @@
+import type { Config } from "../config";
+import type { Db } from "../db/database";
+import type { MenuService } from "../services/menu";
+import type { CartService } from "../services/cart";
+import type { OrdersService } from "../services/orders";
+import type { BusinessHoursService } from "../services/business-hours";
+import type { AiService } from "../services/ollama";
+import type { TokenService } from "./tokens";
+import type { CustomersService } from "../services/customers";
+import type { LoyaltyService } from "../services/loyalty";
+
+export interface ChatTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/**
+ * Tiny per-user text-capture flows (profile edit, deposit amount). A user in
+ * an active flow has their next text consumed by the flow instead of the AI.
+ */
+export class TextCaptureFlow {
+  private active = new Set<number>();
+  expect(userId: number): void {
+    this.active.add(userId);
+  }
+  isActive(userId: number): boolean {
+    return this.active.has(userId);
+  }
+  clear(userId: number): void {
+    this.active.delete(userId);
+  }
+}
+
+/** Everything the bot handlers need, injected once at startup. */
+export interface BotApp {
+  db: Db;
+  config: Config;
+  menu: MenuService;
+  cart: CartService;
+  orders: OrdersService;
+  businessHours: BusinessHoursService;
+  ai: AiService;
+  tokens: TokenService;
+  /** Bounded per-user AI conversation history (in-memory). */
+  history: Map<number, ChatTurn[]>;
+  /** Editable persona text (style only), loaded once at startup. */
+  persona: string;
+  customers: CustomersService;
+  loyalty: LoyaltyService;
+  /** Next text message is captured as a profile edit. */
+  profileEdit: TextCaptureFlow;
+  /** Next text message is captured as a wallet deposit amount. */
+  depositFlow: TextCaptureFlow;
+}
+
+const HISTORY_CAP = 300;
+
+export function pushHistory(app: BotApp, userId: number, turn: ChatTurn): void {
+  let list = app.history.get(userId);
+  if (!list) {
+    list = [];
+    app.history.set(userId, list);
+  }
+  list.push(turn);
+  if (list.length > 12) list.splice(0, list.length - 12);
+  if (app.history.size > HISTORY_CAP) {
+    const first = app.history.keys().next().value;
+    if (first !== undefined && first !== userId) app.history.delete(first);
+  }
+}

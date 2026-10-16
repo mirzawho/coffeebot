@@ -1,0 +1,24 @@
+# Single-host production deployment for coffeebot.
+# Usage:
+#   cp .env.example .env   # fill in BOT_TOKEN, ADMIN_IDS, ...
+#   docker compose up -d
+# Data (SQLite + product images) persists in the named volume "cafe-data" at /data.
+
+services:
+  coffeebot:
+    build: .
+    # To run a published image instead of building locally, replace the two
+    # lines above with: image: ghcr.io/<owner>/<repo>:latest
+    image: coffeebot:latest
+    container_name: coffeebot
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-3000}:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    # Healthcheck is baked into the image (hits /health).
+
+volumes:
+  cafe-data:
