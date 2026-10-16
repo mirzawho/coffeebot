@@ -28,6 +28,7 @@ export type AiActionType = "add" | "remove" | "clear" | "set_qty";
  *  - `cart_view`     — show the cart
  *  - `checkout`      — customer wants to complete the purchase
  *  - `order_status`  — customer asks about an order's status (answered deterministically)
+ *  - `profile_update`— customer states profile facts (name/phone/address); extracted fields follow
  *  - `clarification` — the model needs to ask a follow-up question
  */
 export type AiResponseType =
@@ -38,6 +39,7 @@ export type AiResponseType =
   | "cart_view"
   | "checkout"
   | "order_status"
+  | "profile_update"
   | "clarification";
 
 export interface AiAction {
@@ -54,12 +56,21 @@ export interface AiOffer {
   quantity: number;
 }
 
+/** Profile facts the model extracted from the customer's message. */
+export interface AiProfileFields {
+  fullName?: string;
+  phone?: string;
+  address?: string;
+}
+
 export interface AiResult {
   type: AiResponseType;
   reply: string;
   actions: AiAction[];
   /** Validated product targets for product_offer / price_check. */
   offers?: AiOffer[];
+  /** Extracted profile fields for profile_update (validated downstream). */
+  profileFields?: AiProfileFields;
   needsClarification: boolean;
 }
 
@@ -197,6 +208,23 @@ function validateOffers(raw: unknown, catalog: AiInput["catalog"]): AiOffer[] {
   return out;
 }
 
+/**
+ * Extract profile fields from the model's answer. Everything is length-capped
+ * here; semantic validation (phone format) happens in CustomersService.
+ */
+function validateProfileFields(raw: unknown): AiProfileFields | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const obj = raw as Record<string, unknown>;
+  const out: AiProfileFields = {};
+  const name = typeof obj.full_name === "string" ? obj.full_name.trim().slice(0, 80) : "";
+  if (name) out.fullName = name;
+  const phone = typeof obj.phone === "string" ? obj.phone.trim().slice(0, 20) : "";
+  if (phone) out.phone = phone;
+  const address = typeof obj.address === "string" ? obj.address.trim().slice(0, 300) : "";
+  if (address) out.address = address;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function validateResult(raw: unknown, catalog: AiInput["catalog"]): AiResult | null {
   if (typeof raw !== "object" || raw === null) return null;
   const obj = raw as Record<string, unknown>;
@@ -213,6 +241,7 @@ function validateResult(raw: unknown, catalog: AiInput["catalog"]): AiResult | n
   //  - offers only make sense for product_offer / price_check
   //  - a claimed type with no surviving payload degrades to clarification/chat
   const rawType = obj.type ?? obj.response_type;
+  const profileFields = validateProfileFields(obj.profile_fields ?? obj.profileFields);
   let type: AiResponseType;
   if (actions.length > 0) {
     type = "cart_action";
@@ -227,6 +256,9 @@ function validateResult(raw: unknown, catalog: AiInput["catalog"]): AiResult | n
     rawType === "order_status"
   ) {
     type = rawType;
+  } else if (rawType === "profile_update") {
+    // A claimed profile update with no extractable fields is just a chat.
+    type = profileFields ? "profile_update" : "chat";
   } else if (rawType === "clarification" || needsClarification) {
     type = "clarification";
   } else if (rawType === "product_offer" || rawType === "price_check") {
@@ -235,7 +267,7 @@ function validateResult(raw: unknown, catalog: AiInput["catalog"]): AiResult | n
   } else {
     type = "chat";
   }
-  return { type, reply, actions, offers, needsClarification };
+  return { type, reply, actions, offers, profileFields, needsClarification };
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +292,7 @@ const SYSTEM_PROMPT = `شما دستیار سفارش‌گیری یک کافه �
 - «cart_view»: مشتری سبد را می‌خواهد ببیند یا مجموع مبلغ را پرسیده («سبدم رو نشون بده»، «جمعش چقدر می‌شه؟»).
 - «checkout»: مشتری می‌خواهد خرید را نهایی کند («سفارشم رو ثبت کن»، «تسویه حساب»).
 - «order_status»: مشتری درباره وضعیت سفارشش پرسیده («سفارشم کجاست؟»). هرگز وضعیت را نگو؛ فقط همین type را برگردان.
+- «profile_update»: مشتری اطلاعات پروفایل خودش را اعلام می‌کند («من محمد محمدی هستم»، «شماره موبایلم ۰۹۰۱۲۳۴۵۶۷۸۹ است»، «آدرسم را ذخیره کن»). فیلدهای شناسایی‌شده را در profile_fields برگردان با کلیدهای full_name / phone / address (فقط فیلدهایی که در پیام آمده‌اند). شماره‌ها را همان‌طور که مشتری نوشته برگردان (فارسی یا انگلیسی).
 - «chat»: پاسخ گفتگویی (سلام، پیشنهاد، سؤال عمومی). بدون تغییر سبد.
 - «clarification»: محصول یا منظور مبهم است؛ سؤال کوتاه بپرس. اگر چند محصول با احتمال نزدیک است در offers همه را بیاور تا مشتری انتخاب کند.
 
@@ -273,6 +306,8 @@ const SYSTEM_PROMPT = `شما دستیار سفارش‌گیری یک کافه �
 {"type": "product_offer", "reply": "اسپرسو سینگل را برایت آماده می‌کنم؛ تأیید کن.", "actions": [], "offers": [{"product_id": 1, "variant_id": 2, "quantity": 1}]}
 {"type": "cart_action", "reply": "اضافه شد.", "actions": [{"type": "add", "product_id": 1, "variant_id": 2, "quantity": 1}], "offers": []}
 {"type": "cart_action", "reply": "تعداد به‌روز شد.", "actions": [{"type": "set_qty", "product_id": 1, "variant_id": 2, "quantity": 2}], "offers": []}
+{"type": "profile_update", "reply": "ثبت شد، محمد جان!", "actions": [], "offers": [], "profile_fields": {"full_name": "محمد محمدی"}}
+{"type": "profile_update", "reply": "شماره موبایل شما ثبت شد.", "actions": [], "offers": [], "profile_fields": {"phone": "۰۹۰۱۲۳۴۵۶۷۸۹"}}
 `;
 
 /**

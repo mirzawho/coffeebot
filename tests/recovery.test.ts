@@ -62,7 +62,7 @@ function placeOrderFor(userId: number, businessDateOverride?: string) {
   cart.addItem(userId, product.id, null, 1);
   orders.startCheckout(userId);
   orders.attachReceipt(userId, `file-${userId}`, userId);
-  orders.setDeliveryNotes(userId, null);
+  cart.setFulfillmentMethod(userId, "pickup");
   const conf = orders.confirmOrder(userId);
   if (!conf.ok) throw new Error("confirm failed");
   return conf.order;

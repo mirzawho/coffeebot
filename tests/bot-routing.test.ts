@@ -103,6 +103,7 @@ function buildApp(aiResult: AiResult | ((input: AiInput) => AiResult)): BotApp {
     loyalty: new LoyaltyService(db),
     profileEdit: new TextCaptureFlow(),
     depositFlow: new TextCaptureFlow(),
+    fulfillmentTimeFlow: new TextCaptureFlow(),
   };
 }
 
@@ -645,9 +646,113 @@ describe("checkout, payment, and receipt via conversation", () => {
 
     const all = ctx._replies.map((r) => r.text).join("\n");
     expect(all).toContain("160,000");
-    expect(all).toContain("603799"); // real card number from settings
+    // The customer picks a payment method before any card details are shown.
+    expect(all).toContain("روش پرداخت");
+    expect(all).toContain("موجودی کیف پول");
+    expect(app.cart.get(555)?.state).toBe("checkout_payment");
+    const buttons = callbacksOf(ctx._replies[ctx._replies.length - 1]!.opts?.reply_markup);
+    expect(buttons).toContain("pm:c");
+    // Wallet is not offered with an empty balance.
+    expect(buttons).not.toContain("pm:w");
+  });
+
+  test("choosing card-to-card shows the card details and asks for the receipt", async () => {
+    app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, app);
+    await bot._handlers.get("callback_query")!(makeCallbackCtx("co"));
+    const ctx = makeCallbackCtx("pm:c");
+    await bot._handlers.get("callback_query")!(ctx);
+
+    const all = ctx._replies.map((r) => r.text).join("\n");
+    expect(all).toContain("603799");
     expect(all).toContain("رسید");
     expect(app.cart.get(555)?.state).toBe("checkout_receipt");
+    expect(app.cart.get(555)?.paymentMethod).toBe("card_to_card");
+  });
+
+  test("choosing wallet shows the balance and skips the receipt stage", async () => {
+    app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
+    const dep = app.customers.createDeposit(555, 200000);
+    if (!dep.ok) throw new Error("deposit failed");
+    app.customers.approveDeposit(dep.deposit.id, 777);
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, app);
+    await bot._handlers.get("callback_query")!(makeCallbackCtx("co"));
+    const ctx = makeCallbackCtx("pm:w");
+    await bot._handlers.get("callback_query")!(ctx);
+
+    const all = ctx._replies.map((r) => r.text).join("\n");
+    expect(all).toContain("200,000"); // current balance
+    expect(all).toContain("40,000"); // balance after paying 160,000
+    // Wallet continues to the fulfillment question before final confirm.
+    expect(app.cart.get(555)?.state).toBe("checkout_fulfillment");
+    expect(app.cart.get(555)?.paymentMethod).toBe("wallet");
+  });
+
+  test("after payment the customer is asked delivery vs pickup, then the time", async () => {
+    app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
+    const dep = app.customers.createDeposit(555, 200000);
+    if (!dep.ok) throw new Error("deposit failed");
+    app.customers.approveDeposit(dep.deposit.id, 777);
+    // The customer has an address → both options are offered.
+    app.customers.saveProfile(555, { fullName: "علی", address: "تهران، ولیعصر" });
+    const bot = fakeBot();
+    registerMessageHandlers(bot, app);
+    registerCallbackHandlers(bot, app);
+    await bot._handlers.get("callback_query")!(makeCallbackCtx("co"));
+    await bot._handlers.get("callback_query")!(makeCallbackCtx("pm:w"));
+
+    // Wallet goes straight to the fulfillment question.
+    expect(app.cart.get(555)?.state).toBe("checkout_fulfillment");
+    const pick = makeCallbackCtx("fm:d");
+    await bot._handlers.get("callback_query")!(pick);
+    expect(app.cart.get(555)?.state).toBe("checkout_confirm");
+    expect(app.cart.get(555)?.fulfillmentMethod).toBe("delivery");
+    expect(pick._replies.some((r) => r.text.includes("چه زمانی"))).toBe(true);
+
+    // The time answer is captured, then the confirm summary shows both.
+    const timeCtx = fakeCtx("ساعت ۵ عصر");
+    await bot._handlers.get("message:text")!(timeCtx);
+    expect(app.cart.get(555)?.fulfillmentTime).toBe("ساعت ۵ عصر");
+    const summary = timeCtx._replies.map((r) => r.text).join("\n");
+    expect(summary).toContain("ارسال 🛵");
+    expect(summary).toContain("ساعت ۵ عصر");
+  });
+
+  test("delivery without a saved address is refused; pickup always works", async () => {
+    app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
+    const dep = app.customers.createDeposit(555, 200000);
+    if (!dep.ok) throw new Error("deposit failed");
+    app.customers.approveDeposit(dep.deposit.id, 777);
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, app);
+    await bot._handlers.get("callback_query")!(makeCallbackCtx("co"));
+    await bot._handlers.get("callback_query")!(makeCallbackCtx("pm:w"));
+
+    // No address → the delivery press is refused with an alert.
+    const pick = makeCallbackCtx("fm:d");
+    await bot._handlers.get("callback_query")!(pick);
+    expect(pick._answers.some((a) => (a.text ?? "").includes("آدرس"))).toBe(true);
+    expect(app.cart.get(555)?.state).toBe("checkout_fulfillment");
+
+    // Pickup works.
+    await bot._handlers.get("callback_query")!(makeCallbackCtx("fm:p"));
+    expect(app.cart.get(555)?.state).toBe("checkout_confirm");
+    expect(app.cart.get(555)?.fulfillmentMethod).toBe("pickup");
+  });
+
+  test("wallet choice with an insufficient balance is refused with an alert", async () => {
+    app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, app);
+    await bot._handlers.get("callback_query")!(makeCallbackCtx("co"));
+    const ctx = makeCallbackCtx("pm:w");
+    await bot._handlers.get("callback_query")!(ctx);
+
+    expect(ctx._answers.some((a) => (a.text ?? "").includes("کافی نیست"))).toBe(true);
+    // Still on the picker — the customer can pay by card instead.
+    expect(app.cart.get(555)?.state).toBe("checkout_payment");
   });
 
   test("empty cart checkout is rejected with an honest message", async () => {
@@ -661,9 +766,15 @@ describe("checkout, payment, and receipt via conversation", () => {
     expect(app.cart.get(555)?.state).toBe("browsing");
   });
 
-  test("checkout is refused when no payment method is configured", async () => {
+  test("checkout is refused when no payment method is usable", async () => {
     app = appWithSeededCart({ type: "checkout", reply: "ok", actions: [], needsClarification: false }).app;
-    updatePaymentSettings(db, { cardNumber: "", cardholderName: "", currency: "تومان" });
+    // Card-to-card switched off, and the wallet is empty — nothing can pay.
+    updatePaymentSettings(db, {
+      cardNumber: "603799",
+      cardholderName: "Ali",
+      currency: "تومان",
+      cardToCardEnabled: false,
+    });
     const bot = fakeBot();
     registerMessageHandlers(bot, app);
     const ctx = fakeCtx("سفارشم رو ثبت کن");
@@ -673,9 +784,90 @@ describe("checkout, payment, and receipt via conversation", () => {
     expect(app.cart.get(555)?.state).toBe("browsing");
   });
 
+  test("card-to-card switched off hides the button and refuses the choice", async () => {
+    app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
+    const dep = app.customers.createDeposit(555, 500000);
+    if (!dep.ok) throw new Error("deposit failed");
+    app.customers.approveDeposit(dep.deposit.id, 777);
+    updatePaymentSettings(db, {
+      cardNumber: "603799",
+      cardholderName: "Ali",
+      currency: "تومان",
+      cardToCardEnabled: false,
+    });
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, app);
+    const co = makeCallbackCtx("co");
+    await bot._handlers.get("callback_query")!(co);
+    const buttons = callbacksOf(co._replies[co._replies.length - 1]!.opts?.reply_markup);
+    expect(buttons).toContain("pm:w");
+    expect(buttons).not.toContain("pm:c");
+
+    // A stale card button must be refused server-side.
+    const stale = makeCallbackCtx("pm:c");
+    await bot._handlers.get("callback_query")!(stale);
+    expect(stale._answers.some((a) => (a.text ?? "").includes("غیرفعال"))).toBe(true);
+    expect(app.cart.get(555)?.state).toBe("checkout_payment");
+  });
+
+  test("wallet switched off hides the button even with a sufficient balance", async () => {
+    app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
+    const dep = app.customers.createDeposit(555, 500000);
+    if (!dep.ok) throw new Error("deposit failed");
+    app.customers.approveDeposit(dep.deposit.id, 777);
+    updatePaymentSettings(db, {
+      cardNumber: "603799",
+      cardholderName: "Ali",
+      currency: "تومان",
+      walletEnabled: false,
+    });
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, app);
+    const co = makeCallbackCtx("co");
+    await bot._handlers.get("callback_query")!(co);
+    const buttons = callbacksOf(co._replies[co._replies.length - 1]!.opts?.reply_markup);
+    expect(buttons).toContain("pm:c");
+    expect(buttons).not.toContain("pm:w");
+
+    const stale = makeCallbackCtx("pm:w");
+    await bot._handlers.get("callback_query")!(stale);
+    expect(stale._answers.some((a) => (a.text ?? "").includes("غیرفعال"))).toBe(true);
+    expect(app.cart.get(555)?.state).toBe("checkout_payment");
+  });
+
+  test("wallet top-up is refused while card-to-card is switched off", async () => {
+    app = buildApp({ type: "chat", reply: "x", actions: [], needsClarification: false });
+    updatePaymentSettings(db, {
+      cardNumber: "603799",
+      cardholderName: "Ali",
+      currency: "تومان",
+      cardToCardEnabled: false,
+    });
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, app);
+    const ctx = makeCallbackCtx("wdep");
+    await bot._handlers.get("callback_query")!(ctx);
+    expect(ctx._replies.some((r) => r.text.includes("غیرفعال"))).toBe(true);
+    // The amount-capture flow was never armed.
+    expect(app.depositFlow.isActive(555)).toBe(false);
+  });
+
+  test("text on the payment screen re-prompts for a payment method", async () => {
+    app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
+    app.orders.startCheckout(555);
+    const bot = fakeBot();
+    registerMessageHandlers(bot, app);
+    const ctx = fakeCtx("چطور پرداخت کنم؟");
+    await bot._handlers.get("message:text")!(ctx);
+    expect(ctx._replies[0]!.text).toContain("روش‌های پرداخت");
+    expect(app.cart.get(555)?.state).toBe("checkout_payment");
+    expect(aiInputs.length).toBe(0); // deterministic, never the AI
+  });
+
   test("text instead of a screenshot re-prompts for the receipt", async () => {
     app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
     app.orders.startCheckout(555);
+    app.orders.choosePaymentMethod(555, "card_to_card");
     const bot = fakeBot();
     registerMessageHandlers(bot, app);
     const ctx = fakeCtx("پرداخت رو انجام دادم");
@@ -687,14 +879,27 @@ describe("checkout, payment, and receipt via conversation", () => {
   test("a payment screenshot attaches the receipt and advances to delivery stage", async () => {
     app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
     app.orders.startCheckout(555);
+    app.orders.choosePaymentMethod(555, "card_to_card");
     const bot = fakeBot();
     registerMessageHandlers(bot, app);
     const ctx = makeMediaCtx("photo");
     await bot._handlers.get("message:photo")!(ctx);
 
-    expect(app.cart.get(555)?.state).toBe("checkout_delivery");
+    expect(app.cart.get(555)?.state).toBe("checkout_fulfillment");
     expect(app.cart.get(555)?.receiptFileId).toBe("receipt-file");
     expect(ctx._replies.some((r) => r.text.includes("رسید دریافت شد"))).toBe(true);
+  });
+
+  test("a screenshot sent straight from the payment screen is accepted", async () => {
+    app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
+    app.orders.startCheckout(555);
+    const bot = fakeBot();
+    registerMessageHandlers(bot, app);
+    const ctx = makeMediaCtx("photo");
+    await bot._handlers.get("message:photo")!(ctx);
+
+    expect(app.cart.get(555)?.paymentMethod).toBe("card_to_card");
+    expect(app.cart.get(555)?.state).toBe("checkout_fulfillment");
   });
 
   test("duplicate screenshots after the receipt stage are not re-attached", async () => {
@@ -735,16 +940,20 @@ describe("checkout, payment, and receipt via conversation", () => {
     app.cart.addItem(555, espId, null, 2);
     // 2. Start checkout via callback
     await bot._handlers.get("callback_query")!(makeCallbackCtx("co"));
+    expect(app.cart.get(555)?.state).toBe("checkout_payment");
+    // 3. Choose card-to-card
+    await bot._handlers.get("callback_query")!(makeCallbackCtx("pm:c"));
     expect(app.cart.get(555)?.state).toBe("checkout_receipt");
-    // 3. Send receipt screenshot
+    // 4. Send receipt screenshot
     await bot._handlers.get("message:photo")!(makeMediaCtx("photo"));
-    expect(app.cart.get(555)?.state).toBe("checkout_delivery");
-    // 4. Delivery notes via free text
-    const notesCtx = fakeCtx("طبقه دوم");
-    await bot._handlers.get("message:text")!(notesCtx);
+    expect(app.cart.get(555)?.state).toBe("checkout_fulfillment");
+    // 5. Fulfillment: pickup (no address saved) → time prompt → skip time
+    await bot._handlers.get("callback_query")!(makeCallbackCtx("fm:p"));
     expect(app.cart.get(555)?.state).toBe("checkout_confirm");
-    // 5. Final confirm with the one-shot token from the keyboard
-    const confirmData = callbacksOf(notesCtx._replies[0]!.opts?.reply_markup).find((c) =>
+    const timeCtx = fakeCtx("پیش‌فرض");
+    await bot._handlers.get("message:text")!(timeCtx);
+    // 6. Final confirm with the one-shot token from the keyboard
+    const confirmData = callbacksOf(timeCtx._replies[timeCtx._replies.length - 1]!.opts?.reply_markup).find((c) =>
       c?.startsWith("cf:"),
     )!;
     const confirmCtx = makeCallbackCtx(confirmData);
@@ -758,6 +967,8 @@ describe("checkout, payment, and receipt via conversation", () => {
     expect(latest!.items[0]!.quantity).toBe(2);
     expect(latest!.receiptFileId).toBe("receipt-file");
     expect(latest!.status).toBe("receipt_received_unverified");
+    expect(latest!.paymentMethod).toBe("card_to_card");
+    expect(latest!.paymentStatus).toBe("receipt_received");
     // Confirmation mentions the order number
     expect(confirmCtx._replies.some((r) => r.text.includes(latest!.orderNumber))).toBe(true);
     // Cart finalized
@@ -766,6 +977,45 @@ describe("checkout, payment, and receipt via conversation", () => {
     const dup = makeCallbackCtx(confirmData);
     await bot._handlers.get("callback_query")!(dup);
     expect(app.orders.listRecent(10).filter((o) => o.customerTelegramId === 555).length).toBe(1);
+  });
+
+  test("full wallet order charges the wallet and reports the remaining balance", async () => {
+    const menu = new MenuService(db);
+    const cat = menu.listCategories(false)[0]!;
+    const espId = menu.createProduct({ categoryId: cat.id, name: "اسپرسو", fixedPriceAmount: 80000 }).id;
+    app = buildApp({ type: "chat", reply: "x", actions: [], needsClarification: false });
+    const dep = app.customers.createDeposit(555, 200000);
+    if (!dep.ok) throw new Error("deposit failed");
+    app.customers.approveDeposit(dep.deposit.id, 777);
+    const bot = fakeBot();
+    registerMessageHandlers(bot, app);
+    registerCallbackHandlers(bot, app);
+
+    app.cart.addItem(555, espId, null, 2);
+    await bot._handlers.get("callback_query")!(makeCallbackCtx("co"));
+    const walletCtx = makeCallbackCtx("pm:w");
+    await bot._handlers.get("callback_query")!(walletCtx);
+    expect(app.cart.get(555)?.state).toBe("checkout_fulfillment");
+    // Fulfillment: pickup + default time → confirm keyboard.
+    await bot._handlers.get("callback_query")!(makeCallbackCtx("fm:p"));
+    const timeCtx = fakeCtx("پیش‌فرض");
+    await bot._handlers.get("message:text")!(timeCtx);
+
+    // Confirm with the one-shot token from the confirm keyboard.
+    const confirmData = callbacksOf(timeCtx._replies[timeCtx._replies.length - 1]!.opts?.reply_markup).find((c) =>
+      c?.startsWith("cf:"),
+    )!;
+    const confirmCtx = makeCallbackCtx(confirmData);
+    await bot._handlers.get("callback_query")!(confirmCtx);
+
+    const order = app.orders.latestOrderFor(555);
+    expect(order).not.toBeNull();
+    expect(order!.paymentMethod).toBe("wallet");
+    expect(order!.paymentStatus).toBe("paid");
+    expect(order!.receiptFileId).toBeNull();
+    expect(app.customers.getBalance(555)).toBe(40000);
+    // The confirmation reports the remaining balance.
+    expect(confirmCtx._replies.some((r) => r.text.includes("40,000"))).toBe(true);
   });
 
   test("cancel during checkout clears pending checkout state honestly", async () => {
@@ -777,12 +1027,13 @@ describe("checkout, payment, and receipt via conversation", () => {
     const bot = fakeBot();
     registerCallbackHandlers(bot, app);
     await bot._handlers.get("callback_query")!(makeCallbackCtx("co"));
-    expect(app.cart.get(555)?.state).toBe("checkout_receipt");
+    expect(app.cart.get(555)?.state).toBe("checkout_payment");
 
     const ctx = makeCallbackCtx("cx");
     await bot._handlers.get("callback_query")!(ctx);
     expect(app.cart.get(555)?.state).toBe("browsing");
     expect(app.cart.get(555)?.receiptFileId).toBeNull();
+    expect(app.cart.get(555)?.paymentMethod).toBeNull();
     // Cart items are preserved for a retry
     expect(app.cart.getTotals(555).lines.length).toBe(1);
   });
@@ -796,7 +1047,7 @@ describe("checkout, payment, and receipt via conversation", () => {
     app.cart.addItem(555, espId, null, 1);
     app.orders.startCheckout(555);
     app.orders.attachReceipt(555, "f", 1);
-    app.orders.setDeliveryNotes(555, null);
+    app.cart.setFulfillmentMethod(555, "pickup");
     const conf = app.orders.confirmOrder(555, "Cust");
     expect(conf.ok).toBe(true);
     if (!conf.ok) return;
@@ -919,7 +1170,7 @@ describe("bug fix: free-text reaches the AI pipeline", () => {
     await bot._handlers.get("message:photo")!(makeMediaCtx("photo"));
 
     expect(aiInputs.length).toBe(0); // AI was never consulted
-    expect(app.cart.get(555)?.state).toBe("checkout_delivery");
+    expect(app.cart.get(555)?.state).toBe("checkout_fulfillment");
   });
 
   test("a failing Telegram reply is not counted as delivered (no assistant history)", async () => {
@@ -995,7 +1246,7 @@ describe("customer flows through the bot", () => {
     };
   }
 
-  test("profile edit flow: menu → edit → save → shown back", async () => {
+  test("profile wizard: menu → edit → name → phone → address → save", async () => {
     app = buildApp({ type: "chat", reply: "x", actions: [], needsClarification: false });
     const bot = fakeBot();
     registerMessageHandlers(bot, app);
@@ -1003,15 +1254,105 @@ describe("customer flows through the bot", () => {
 
     await bot._handlers.get("callback_query")!(cbCtx("prof"));
     await bot._handlers.get("callback_query")!(cbCtx("profedit"));
-    // Next text is captured by the profile flow, not the AI.
-    const edit = flowCtx("علی | رضایی | ۰۹۱۲۱۲۳۴۵۶۷");
-    await bot._handlers.get("message:text")!(edit);
+    // Step 1: name — captured by the wizard, never the AI.
+    const name = flowCtx("علی رضایی");
+    await bot._handlers.get("message:text")!(name);
+    expect(name._replies.some((r) => r.text.includes("۲ از ۳"))).toBe(true);
+    // Step 2: phone — Persian digits are converted to English.
+    const phone = flowCtx("۰۹۱۲۱۲۳۴۵۶۷");
+    await bot._handlers.get("message:text")!(phone);
+    expect(phone._replies.some((r) => r.text.includes("۳ از ۳"))).toBe(true);
+    // Step 3: optional address.
+    const addr = flowCtx("تهران، خیابان ولیعصر");
+    await bot._handlers.get("message:text")!(addr);
 
     const p = app.customers.getProfile(555);
-    expect(p?.firstName).toBe("علی");
+    expect(p?.fullName).toBe("علی رضایی");
     expect(p?.phone).toBe("09121234567");
-    expect(edit._replies.some((r) => r.text.includes("پروفایل ذخیره شد"))).toBe(true);
+    expect(p?.address).toBe("تهران، خیابان ولیعصر");
+    expect(addr._replies.some((r) => r.text.includes("پروفایل ذخیره شد"))).toBe(true);
     expect(aiInputs.length).toBe(0); // captured, never reached the AI
+  });
+
+  test("profile wizard: invalid phone re-asks, address step can be skipped", async () => {
+    app = buildApp({ type: "chat", reply: "x", actions: [], needsClarification: false });
+    const bot = fakeBot();
+    registerMessageHandlers(bot, app);
+    registerCallbackHandlers(bot, app);
+
+    await bot._handlers.get("callback_query")!(cbCtx("profedit"));
+    await bot._handlers.get("message:text")!(flowCtx("محمد محمدی"));
+    // Bad phone stays on the phone step.
+    const bad = flowCtx("12345");
+    await bot._handlers.get("message:text")!(bad);
+    expect(bad._replies.some((r) => r.text.includes("معتبر نیست"))).toBe(true);
+    await bot._handlers.get("message:text")!(flowCtx("۰۹۱۲۳۴۵۶۷۸۹"));
+    // «رد» skips the address.
+    const skip = flowCtx("رد");
+    await bot._handlers.get("message:text")!(skip);
+
+    const p = app.customers.getProfile(555);
+    expect(p?.fullName).toBe("محمد محمدی");
+    expect(p?.phone).toBe("09123456789");
+    expect(p?.address).toBeNull();
+  });
+
+  test("AI profile update: «من محمد محمدی هستم» saves the full name", async () => {
+    app = buildApp({
+      type: "profile_update",
+      reply: "ثبت شد!",
+      actions: [],
+      profileFields: { fullName: "محمد محمدی" },
+      needsClarification: false,
+    });
+    const bot = fakeBot();
+    registerMessageHandlers(bot, app);
+
+    const ctx = fakeCtx("من محمد محمدی هستم");
+    await bot._handlers.get("message:text")!(ctx);
+
+    const p = app.customers.getProfile(555);
+    expect(p?.fullName).toBe("محمد محمدی");
+    expect(ctx._replies.some((r) => r.text.includes("پروفایل به‌روز شد"))).toBe(true);
+  });
+
+  test("AI profile update: Persian phone digits are normalized before saving", async () => {
+    app = buildApp({
+      type: "profile_update",
+      reply: "شماره شما ثبت شد.",
+      actions: [],
+      profileFields: { phone: "۰۹۰۱۲۳۴۵۶۷۸۹" },
+      needsClarification: false,
+    });
+    const bot = fakeBot();
+    registerMessageHandlers(bot, app);
+
+    const ctx = fakeCtx("شماره موبایل من ۰۹۰۱۲۳۴۵۶۷۸۹ هست");
+    await bot._handlers.get("message:text")!(ctx);
+
+    // ۰۹۰۱۲۳۴۵۶۷۸۹ is 12 digits — invalid, so nothing is saved and the
+    // backend error is surfaced honestly.
+    expect(ctx._replies.some((r) => r.text.includes("معتبر نیست"))).toBe(true);
+    expect(app.customers.getProfile(555)).toBeNull();
+  });
+
+  test("AI profile update: a valid phone saves and keeps the existing name", async () => {
+    app = buildApp({
+      type: "profile_update",
+      reply: "شماره شما ثبت شد.",
+      actions: [],
+      profileFields: { phone: "09123456789" },
+      needsClarification: false,
+    });
+    app.customers.saveProfile(555, { fullName: "محمد محمدی" });
+    const bot = fakeBot();
+    registerMessageHandlers(bot, app);
+
+    await bot._handlers.get("message:text")!(fakeCtx("شماره موبایلم 09123456789 است"));
+
+    const p = app.customers.getProfile(555);
+    expect(p?.fullName).toBe("محمد محمدی");
+    expect(p?.phone).toBe("09123456789");
   });
 
   test("deposit flow: menu → amount → pending request with payment info", async () => {
@@ -1040,7 +1381,7 @@ describe("customer flows through the bot", () => {
       app.cart.addItem(555, waterId, null, 1);
       app.orders.startCheckout(555);
       app.orders.attachReceipt(555, `f${i}`, i);
-      app.orders.setDeliveryNotes(555, null);
+      app.cart.setFulfillmentMethod(555, "pickup");
       const conf = app.orders.confirmOrder(555, "C");
       expect(conf.ok).toBe(true);
     }
@@ -1072,7 +1413,7 @@ describe("customer flows through the bot", () => {
       app.cart.addItem(555, waterId, null, 2);
       app.orders.startCheckout(555);
       app.orders.attachReceipt(555, `f${i}`, i);
-      app.orders.setDeliveryNotes(555, null);
+      app.cart.setFulfillmentMethod(555, "pickup");
       app.orders.confirmOrder(555, "C");
     }
     const usual = app.loyalty.usualFor(555);

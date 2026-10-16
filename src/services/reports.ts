@@ -27,7 +27,7 @@ export interface ReportText {
 
 /**
  * Build the Persian daily report text for a business date.
- * Includes an explicit notice that payment verification is not performed.
+ * Payment lines reflect the real method and admin review state.
  */
 export function buildDailyReportText(orders: Order[], businessDate: string): ReportText {
   const lines: string[] = [];
@@ -36,8 +36,6 @@ export function buildDailyReportText(orders: Order[], businessDate: string): Rep
   lines.push(`تعداد کل سفارش‌ها: ${toPersianDigits(String(orders.length))}`);
   if (orders.length === 0) {
     lines.push("امروز سفارشی ثبت نشده است.");
-    lines.push("—");
-    lines.push("⚠️ توجه: این سیستم پرداخت را تأیید نمی‌کند.");
     return { chunks: [lines.join("\n")], orderCount: 0 };
   }
   lines.push("");
@@ -55,11 +53,9 @@ export function buildDailyReportText(orders: Order[], businessDate: string): Rep
     }
     lines.push(`  جمع: ${formatAmount(o.totalAmount)} ${o.currency}`);
     if (o.deliveryNotes) lines.push(`  📦 تحویل: ${o.deliveryNotes}`);
-    lines.push(`  رسید پرداخت: ${o.receiptFileId ? "ارسال شده (تأییدنشده)" : "ندارد"}`);
+    lines.push(`  ${paymentLine(o)}`);
     lines.push("");
   }
-  lines.push("—");
-  lines.push("⚠️ توجه: این سیستم پرداخت را تأیید نمی‌کند؛ وضعیت سفارش‌ها «رسید دریافت‌شده — تأییدنشده» است.");
   const full = lines.join("\n");
 
   // Split into chunks while keeping order blocks together where possible.
@@ -93,8 +89,18 @@ export function buildOrderUpdateText(order: Order): { text: string; receiptFileI
   }
   lines.push(`جمع: ${formatAmount(order.totalAmount)} ${order.currency}`);
   if (order.deliveryNotes) lines.push(`تحویل: ${order.deliveryNotes}`);
-  lines.push("⚠️ پرداخت تأیید نشده است.");
+  lines.push(paymentLine(order));
   return { text: lines.join("\n"), receiptFileId: order.receiptFileId };
+}
+
+/** One-line payment summary: method + whether the money is actually settled. */
+export function paymentLine(order: Order): string {
+  if (order.paymentMethod === "wallet") {
+    return `💰 پرداخت: کیف پول — ${order.paymentStatus === "paid" ? "کسر شد" : "تأیید نشده"}`;
+  }
+  if (order.paymentStatus === "paid") return "💳 پرداخت: کارت به کارت — تأیید شده";
+  if (order.paymentStatus === "rejected") return "💳 پرداخت: کارت به کارت — رسید رد شده";
+  return `💳 پرداخت: کارت به کارت — ${order.receiptFileId ? "رسید دریافت شده، در انتظار تأیید" : "رسیدی ارسال نشده"}`;
 }
 
 export type ClaimOutcome =

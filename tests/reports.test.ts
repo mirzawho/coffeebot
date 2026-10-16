@@ -7,6 +7,7 @@ import { OrdersService } from "../src/services/orders";
 import { BusinessHoursService } from "../src/services/business-hours";
 import { ReportService, buildDailyReportText, buildOrderUpdateText } from "../src/services/reports";
 import { NotificationService } from "../src/services/notifications";
+import { CustomersService } from "../src/services/customers";
 import { updateReportSettings, updatePaymentSettings, getReportSettings } from "../src/services/settings";
 
 let db: Db;
@@ -16,6 +17,8 @@ let orders: OrdersService;
 let bh: BusinessHoursService;
 let notif: NotificationService;
 let reports: ReportService;
+let customers: CustomersService;
+let waterId: number;
 const ADMIN_IDS = new Set([111, 222]);
 
 beforeEach(() => {
@@ -26,6 +29,7 @@ beforeEach(() => {
   orders = new OrdersService(db, bh);
   notif = new NotificationService(db);
   reports = new ReportService(db, bh, notif, "Asia/Tehran");
+  customers = new CustomersService(db);
   updateReportSettings(
     db,
     { enabled: true, time: "18:30", sendEmpty: false, recipients: [111, 222] },
@@ -33,15 +37,16 @@ beforeEach(() => {
   );
   updatePaymentSettings(db, { cardNumber: "603799", cardholderName: "Ali", currency: "تومان" });
   const cat = menu.createCategory({ name: "نوشیدنی" });
-  menu.createProduct({ categoryId: cat.id, name: "آب", fixedPriceAmount: 15000 });
+  waterId = menu.createProduct({ categoryId: cat.id, name: "آب", fixedPriceAmount: 15000 }).id;
 });
 
 function placeOrder(userId: number, name = "Customer") {
   const product = menu.listProducts(undefined, false)[0]!;
   cart.addItem(userId, product.id, null, 1);
   orders.startCheckout(userId);
+  orders.choosePaymentMethod(userId, "card_to_card");
   orders.attachReceipt(userId, `file-${userId}`, userId);
-  orders.setDeliveryNotes(userId, null);
+  cart.setFulfillmentMethod(userId, "pickup");
   const conf = orders.confirmOrder(userId, name);
   if (!conf.ok) throw new Error("order failed: " + JSON.stringify(conf));
   return conf.order;
@@ -161,14 +166,39 @@ describe("late orders", () => {
 });
 
 describe("report text", () => {
-  test("contains order details and unverified-payment notice", () => {
+  test("contains order details and the real payment state", () => {
     const o = placeOrder(1, "Ali");
     const text = buildDailyReportText([o], o.businessDate);
     const joined = text.chunks.join("\n");
     expect(joined).toContain(o.orderNumber);
     expect(joined).toContain("آب");
-    expect(joined).toContain("تأیید");
+    // Card-to-card with a receipt: awaiting admin review, not "unverified".
+    expect(joined).toContain("کارت به کارت");
+    expect(joined).toContain("در انتظار تأیید");
     expect(text.orderCount).toBe(1);
+  });
+
+  test("a wallet order is reported as settled", () => {
+    const dep = customers.createDeposit(1, 50000);
+    if (!dep.ok) throw new Error("deposit failed");
+    customers.approveDeposit(dep.deposit.id, 777);
+    cart.addItem(1, waterId, null, 1);
+    orders.startCheckout(1);
+    orders.choosePaymentMethod(1, "wallet");
+    cart.setFulfillmentMethod(1, "pickup");
+    const conf = orders.confirmOrder(1, "Ali");
+    expect(conf.ok).toBe(true);
+    if (!conf.ok) return;
+    const joined = buildDailyReportText([conf.order], conf.order.businessDate).chunks.join("\n");
+    expect(joined).toContain("کیف پول");
+    expect(joined).toContain("کسر شد");
+  });
+
+  test("an approved card payment is reported as confirmed", () => {
+    const o = placeOrder(1, "Ali");
+    orders.markPaymentPaid(o.id, 777);
+    const joined = buildDailyReportText([orders.loadOrder(o.id)!], o.businessDate).chunks.join("\n");
+    expect(joined).toContain("تأیید شده");
   });
 
   test("empty report has explicit empty message", () => {
@@ -190,7 +220,7 @@ describe("report text", () => {
     const { text, receiptFileId } = buildOrderUpdateText(o);
     expect(text).toContain(o.orderNumber);
     expect(receiptFileId).toBe("file-1");
-    expect(text).toContain("تأیید");
+    expect(text).toContain("در انتظار تأیید");
   });
 });
 

@@ -3,7 +3,7 @@
 
 const SettingsPage = (() => {
   const { el, icons, toast, openSheet, closeSheet, field, textInput,
-    switchInput, loadingState, errorState, moneyWithCurrency, faDigits, esc } = Ui;
+    switchInput, switchField, loadingState, errorState, moneyWithCurrency, faDigits, esc } = Ui;
 
   const WEEKDAYS_FA = ["یکشنبه", "دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه", "شنبه"];
   // Persian week starts on شنبه (JS weekday 6), then 0..5.
@@ -30,8 +30,11 @@ const SettingsPage = (() => {
 
   function paymentSummary() {
     if (!payment) return "";
-    if (!payment.cardNumber) return "روش پرداخت تنظیم نشده";
-    return `کارت به‌نام ${payment.cardholderName || "—"} · ${payment.currency}`;
+    const methods = [];
+    if (payment.cardToCardEnabled) methods.push("کارت به کارت");
+    if (payment.walletEnabled) methods.push("کیف پول");
+    if (methods.length === 0) return "هیچ روش پرداختی فعال نیست";
+    return `${methods.join(" · ")} · ${payment.currency}`;
   }
 
   function reportSummary() {
@@ -175,10 +178,29 @@ const SettingsPage = (() => {
   // ---------- payments ----------
 
   function openPaymentSheet() {
+    const cardSw = switchField(
+      "پرداخت کارت به کارت",
+      payment.cardToCardEnabled,
+      "مشتری مبلغ را کارت به کارت می‌کند و رسید می‌فرستد",
+    );
+    const walletSw = switchField(
+      "پرداخت با کیف پول",
+      payment.walletEnabled,
+      "مشتری مبلغ سفارش را از موجودی کیف پولش می‌پردازد",
+    );
     const cardF = field("شماره کارت", textInput(payment.cardNumber, { maxlength: 32, inputmode: "numeric", placeholder: "فقط اعداد و خط تیره" }),
       { hint: "مشتری این شماره را برای کارت‌به‌کارت می‌بیند" });
     const nameF = field("به نام", textInput(payment.cardholderName, { maxlength: 100 }));
     const curF = field("واحد پول", textInput(payment.currency || "تومان", { maxlength: 16 }));
+
+    // Card details are only meaningful while card-to-card is on.
+    function syncCardFields() {
+      const on = cardSw.input.checked;
+      cardF.root.hidden = !on;
+      nameF.root.hidden = !on;
+    }
+    cardSw.input.addEventListener("change", syncCardFields);
+    syncCardFields();
 
     const formError = el("div", { class: "form-error" });
     formError.hidden = true;
@@ -187,6 +209,9 @@ const SettingsPage = (() => {
       "form",
       { novalidate: "" },
       formError,
+      el("div", { class: "card", style: "padding:4px 14px;margin-bottom:14px" },
+        el("div", { style: "border-bottom:1px solid var(--border)" }, cardSw.root),
+        walletSw.root),
       cardF.root,
       nameF.root,
       curF.root,
@@ -197,11 +222,14 @@ const SettingsPage = (() => {
       e.preventDefault();
       formError.hidden = true;
       cardF.setError(null);
+      saveBtn.disabled = true;
       try {
         payment = await Api.put("/api/admin/settings/payment", {
           cardNumber: cardF.input.value.trim(),
           cardholderName: nameF.input.value.trim(),
           currency: curF.input.value.trim() || "تومان",
+          cardToCardEnabled: cardSw.input.checked,
+          walletEnabled: walletSw.input.checked,
         });
         currency = payment.currency;
         ProductsPage.setData(currency);
@@ -210,11 +238,12 @@ const SettingsPage = (() => {
         renderSettingsPage();
       } catch (err) {
         const msg = err.message || "ذخیره انجام نشد";
-        if (msg.includes("کارت")) cardF.setError(msg);
+        if (msg.includes("شماره کارت")) cardF.setError(msg);
         else {
           formError.textContent = msg;
           formError.hidden = false;
         }
+        saveBtn.disabled = false;
       }
     });
 
@@ -369,14 +398,10 @@ const SettingsPage = (() => {
     const personaF = field("شخصیت دستیار", personaInput, {
       hint: "سبک پاسخ‌گویی (زبان، لحن، ایموجی). قوانین امنیتی و سفارش‌گیری همیشه در کد قفل هستند و از اینجا تغییر نمی‌کنند.",
     });
-    const enabledSw = switchInput(aiSettings.enabled);
-    const enabledF = field("پاسخ‌گویی متنی", enabledSw.root);
-    const greetSw = switchInput(aiSettings.personalizeGreeting);
-    const greetF = field("سلام شخصی‌سازی‌شده با نام مشتری", greetSw.root);
-    const usualSw = switchInput(aiSettings.suggestUsual);
-    const usualF = field("پیشنهاد سفارش‌های تکراری", usualSw.root);
-    const streamSw = switchInput(aiSettings.streaming);
-    const streamF = field("نمایش تدریجی پاسخ", streamSw.root);
+    const enabledSw = switchField("پاسخ‌گویی متنی", aiSettings.enabled, "پاسخ به پیام‌های متنی مشتری با هوش مصنوعی");
+    const greetSw = switchField("سلام شخصی‌سازی‌شده با نام مشتری", aiSettings.personalizeGreeting);
+    const usualSw = switchField("پیشنهاد سفارش‌های تکراری", aiSettings.suggestUsual);
+    const streamSw = switchField("نمایش تدریجی پاسخ", aiSettings.streaming);
     const lenSelect = el(
       "select",
       {},
@@ -394,12 +419,13 @@ const SettingsPage = (() => {
       "form",
       { novalidate: "" },
       formError,
-      enabledF.root,
+      el("div", { class: "card", style: "padding:4px 14px;margin-bottom:14px" },
+        el("div", { style: "border-bottom:1px solid var(--border)" }, enabledSw.root),
+        greetSw.root,
+        el("div", { style: "border-top:1px solid var(--border)" }, usualSw.root),
+        el("div", { style: "border-top:1px solid var(--border)" }, streamSw.root)),
       personaF.root,
       lenF.root,
-      greetF.root,
-      usualF.root,
-      streamF.root,
       el("div", { class: "form-actions" }, saveBtn, el("button", { class: "btn ghost", type: "button", text: "انصراف", onClick: closeSheet })),
     );
     form.addEventListener("submit", async (e) => {
@@ -428,10 +454,8 @@ const SettingsPage = (() => {
   }
 
   function openNotifSheet() {
-    const confirmSw = switchInput(notifSettings.notifyOrderConfirmed);
-    const confirmF = field("اطلاع به مشتری هنگام تأیید سفارش", confirmSw.root);
-    const ratingSw = switchInput(notifSettings.askDeliveryRating);
-    const ratingF = field("درخواست امتیاز پس از تحویل", ratingSw.root);
+    const confirmSw = switchField("اطلاع به مشتری هنگام تأیید سفارش", notifSettings.notifyOrderConfirmed);
+    const ratingSw = switchField("درخواست امتیاز پس از تحویل", notifSettings.askDeliveryRating);
     const formError = el("div", { class: "form-error" });
     formError.hidden = true;
     const saveBtn = el("button", { class: "btn", type: "submit", text: "ذخیره" });
@@ -439,8 +463,9 @@ const SettingsPage = (() => {
       "form",
       { novalidate: "" },
       formError,
-      confirmF.root,
-      ratingF.root,
+      el("div", { class: "card", style: "padding:4px 14px;margin-bottom:14px" },
+        el("div", { style: "border-bottom:1px solid var(--border)" }, confirmSw.root),
+        ratingSw.root),
       el("div", { class: "form-actions" }, saveBtn, el("button", { class: "btn ghost", type: "button", text: "انصراف", onClick: closeSheet })),
     );
     form.addEventListener("submit", async (e) => {

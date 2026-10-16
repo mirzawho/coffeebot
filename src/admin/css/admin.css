@@ -295,6 +295,8 @@ main#main {
   min-height: 46px;
 }
 .field textarea { min-height: 96px; resize: vertical; line-height: 1.7; }
+/* time values must read hh:mm, not flipped by the RTL paragraph direction */
+.field input[type="time"] { direction: ltr; text-align: right; }
 .field input:focus, .field select:focus, .field textarea:focus {
   outline: 2px solid var(--primary);
   outline-offset: -1px;
@@ -331,6 +333,7 @@ main#main {
 
 .switch {
   position: relative;
+  display: inline-block; /* labels are inline — without this, width/height are ignored and the track collapses */
   width: 48px;
   height: 28px;
   flex-shrink: 0;
@@ -348,7 +351,8 @@ main#main {
 .switch .track {
   position: absolute;
   inset: 0;
-  background: #d0d5dd;
+  background: #c3cad3;
+  border: 1px solid #b3bcc7;
   border-radius: 999px;
   transition: background 0.15s;
   pointer-events: none;
@@ -365,7 +369,7 @@ main#main {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
   transition: transform 0.15s;
 }
-.switch input:checked + .track { background: var(--primary); }
+.switch input:checked + .track { background: var(--primary); border-color: var(--primary); }
 .switch input:checked + .track::after { transform: translateX(-20px); }
 
 /* segmented availability control */
@@ -443,7 +447,9 @@ main#main {
   padding: 10px 12px;
   flex-wrap: wrap;
 }
-.filter-bar input[type="date"] {
+.filter-bar input[type="date"],
+.filter-bar input[type="search"],
+.filter-bar input[type="text"] {
   flex: 1;
   min-width: 130px;
   padding: 9px 12px;
@@ -455,6 +461,27 @@ main#main {
   min-height: 42px;
   font-size: 13.5px;
 }
+.filter-bar input:focus {
+  outline: 2px solid var(--primary);
+  outline-offset: -1px;
+  border-color: transparent;
+}
+.filter-bar .search-wrap {
+  position: relative;
+  flex: 1;
+  display: flex;
+  align-items: center;
+}
+.filter-bar .search-wrap input { width: 100%; }
+.filter-bar .search-wrap .search-icon {
+  position: absolute;
+  inset-inline-start: 10px;
+  color: var(--faint);
+  display: flex;
+  pointer-events: none;
+}
+.filter-bar .search-wrap .search-icon svg { width: 17px; height: 17px; }
+.filter-bar .search-wrap input { padding-inline-start: 34px; }
 .filter-bar .sep { color: var(--faint); font-size: 13px; }
 .filter-note {
   font-size: 12.5px;
@@ -490,6 +517,23 @@ main#main {
 }
 .profile-name { font-size: 16px; font-weight: 700; }
 .profile-sub { color: var(--muted); font-size: 13px; }
+
+/* customer detail stat tiles */
+.stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.stat-tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  box-shadow: var(--shadow);
+}
+.stat-tile .stat-value { font-size: 15px; font-weight: 700; }
+.stat-tile .stat-label { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
 
 /* usernames/@handles keep LTR order inside RTL text */
 .ltr { direction: ltr; unicode-bidi: isolate; display: inline-block; }
@@ -620,6 +664,41 @@ main#main {
 .sheet-menu .btn { justify-content: flex-start; min-height: 52px; font-size: 15px; }
 .sheet-menu .btn + .btn { margin-top: 10px; }
 .sheet-menu .btn svg { width: 20px; height: 20px; }
+
+/* segmented tabs (sheet content switcher) */
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-bottom: 14px;
+  overflow-x: auto;
+}
+.tabs button {
+  flex: 1;
+  min-width: max-content;
+  min-height: 38px;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  font: inherit;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  white-space: nowrap;
+  touch-action: manipulation;
+}
+.tabs button svg { width: 16px; height: 16px; }
+.tabs button.active { background: var(--surface); color: var(--primary); box-shadow: var(--shadow); }
+.tab-panel[hidden] { display: none; }
 
 /* desktop: center the sheet as a dialog */
 @media (min-width: 640px) {

@@ -10,9 +10,9 @@
 
   const PAGES = {
     reports: {
-      title: "گزارش‌ها",
+      title: "سفارش‌ها",
       icon: icons.chart,
-      label: "گزارش‌ها",
+      label: "سفارش‌ها",
       hasCreate: false,
       refresh: () => ReportsPage.refresh(),
     },
@@ -22,6 +22,13 @@
       label: "محصولات",
       hasCreate: true,
       refresh: () => ProductsPage.refresh(),
+    },
+    customers: {
+      title: "مشتریان",
+      icon: icons.users,
+      label: "مشتریان",
+      hasCreate: false,
+      refresh: () => CustomersPage.refresh(),
     },
     settings: {
       title: "تنظیمات",
@@ -126,6 +133,7 @@
     }
 
     ProductsPage.setData(state.me.currency);
+    CustomersPage.setData(state.me.currency);
     ReportsPage.init(state.me.businessDate);
     switchPage("reports");
   }

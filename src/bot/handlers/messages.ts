@@ -6,8 +6,10 @@ import {
   checkoutKeyboard,
   clearConfirmKeyboard,
   deliveryKeyboard,
+  fulfillmentKeyboard,
   mainMenu,
   offerKeyboard,
+  paymentMethodKeyboard,
 } from "../keyboards";
 import {
   AI_FALLBACK_TEXT,
@@ -17,6 +19,7 @@ import {
   HELP_TEXT,
   NO_ORDERS_TEXT,
   orderStatusText,
+  PAYMENT_CHOICE_PROMPT_TEXT,
   productCardText,
   RECEIPT_PROMPT_TEXT,
   RECEIPT_WRONG_STATE_TEXT,
@@ -25,11 +28,12 @@ import {
 } from "../format";
 import { MAX_AI_OFFERS, MAX_ITEM_QUANTITY, MAX_USER_MESSAGE_LENGTH } from "../../utils/ids";
 import { FALLBACK_REPLY, type AiResult } from "../../services/ollama";
-import { getAiSettings } from "../../services/settings";
+import { normalizePhone, MAX_ADDRESS_LENGTH } from "../../services/customers";
+import { cardToCardAvailable, getAiSettings } from "../../services/settings";
 import { validateReceipt } from "../receipt";
 import { isIdentityQuestion, buildIdentityReply } from "../identity";
 import { log } from "../../utils/logger";
-import { showHelp, showMainMenu, showCart, startCheckoutFlow } from "./callbacks";
+import { showHelp, showMainMenu, showCart, startCheckoutFlow, startProfileEdit, sendConfirmStage, sendFulfillmentChoice } from "./callbacks";
 import { withTypingIndicator, TelegramStreamer } from "../typing";
 import { walletKeyboard } from "../keyboards";
 import { formatMoney } from "../../utils/money";
@@ -40,6 +44,10 @@ export function registerMessageHandlers(bot: any, app: BotApp): void {
   bot.command("start", async (ctx: Context) => {
     app.cart.getOrCreate(ctx.from!.id);
     await ctx.reply(WELCOME_TEXT, { reply_markup: mainMenu() });
+    // First run: a customer without a saved profile is walked through it once.
+    if (!app.customers.isProfileComplete(ctx.from!.id)) {
+      await startProfileEdit(ctx, app);
+    }
   });
 
   bot.command("help", async (ctx: Context) => {
@@ -98,17 +106,26 @@ async function handleText(ctx: Context, app: BotApp, text: string): Promise<void
   if (text === "/cancel") {
     app.profileEdit.clear(userId);
     app.depositFlow.clear(userId);
+    app.fulfillmentTimeFlow.clear(userId);
   }
 
-  // Active text-capture flows take precedence (profile edit, deposit amount).
+  // Active text-capture flows take precedence (profile wizard, deposit amount,
+  // fulfillment time). The step is read before clearing so multi-field
+  // wizards know which question was last asked.
   if (app.profileEdit.isActive(userId)) {
+    const step = app.profileEdit.step(userId);
     app.profileEdit.clear(userId);
-    await applyProfileEdit(ctx, app, text);
+    await applyProfileEdit(ctx, app, text, step);
     return;
   }
   if (app.depositFlow.isActive(userId)) {
     app.depositFlow.clear(userId);
     await applyDepositAmount(ctx, app, text);
+    return;
+  }
+  if (app.fulfillmentTimeFlow.isActive(userId)) {
+    app.fulfillmentTimeFlow.clear(userId);
+    await applyFulfillmentTime(ctx, app, text);
     return;
   }
 
@@ -120,32 +137,39 @@ async function handleText(ctx: Context, app: BotApp, text: string): Promise<void
   }
 
   // Checkout states take precedence over AI.
+  if (cart.state === "checkout_payment") {
+    const { payment } = app.orders.getPaymentInstructions(userId);
+    await ctx.reply(PAYMENT_CHOICE_PROMPT_TEXT, {
+      reply_markup: paymentMethodKeyboard({
+        walletBalance: app.customers.getBalance(userId),
+        total: app.cart.getTotals(userId).total,
+        walletEnabled: payment.walletEnabled,
+        cardEnabled: cardToCardAvailable(payment),
+      }),
+    });
+    return;
+  }
+
   if (cart.state === "checkout_receipt") {
     await ctx.reply(RECEIPT_PROMPT_TEXT, { reply_markup: checkoutKeyboard(userId, "receipt", app.tokens) });
     return;
   }
 
-  if (cart.state === "checkout_delivery") {
+  if (cart.state === "checkout_fulfillment") {
+    await ctx.reply("برای انتخاب روش تحویل از دکمه‌ها استفاده کنید.", {
+      reply_markup: fulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+    });
+    return;
+  }
+
+  if (cart.state === "checkout_confirm") {
     const notes = text.slice(0, 500);
     const res = app.orders.setDeliveryNotes(userId, notes);
     if (!res.ok) {
       await ctx.reply(res.error);
       return;
     }
-    const totals = app.cart.getTotals(userId);
-    const { payment } = app.orders.getPaymentInstructions(userId);
-    const currency = payment.currency;
-    await ctx.reply(
-      confirmSummaryText(totals.lines, totals.total, currency, notes.trim() || null),
-      { reply_markup: checkoutKeyboard(userId, "confirm", app.tokens) },
-    );
-    return;
-  }
-
-  if (cart.state === "checkout_confirm") {
-    await ctx.reply("برای ثبت نهایی از دکمه «تأیید و ثبت نهایی» استفاده کنید.", {
-      reply_markup: checkoutKeyboard(userId, "confirm", app.tokens),
-    });
+    await sendConfirmStage(ctx, app);
     return;
   }
 
@@ -198,7 +222,7 @@ async function handleNaturalLanguage(ctx: Context, app: BotApp, text: string): P
         businessHours: app.businessHours.getHours(),
         checkoutState: cart.state,
         persona: aiSettings.persona,
-        customerFirstName: aiSettings.personalizeGreeting ? profile?.firstName ?? null : null,
+        customerFirstName: aiSettings.personalizeGreeting ? profile?.fullName ?? null : null,
         isOpenNow,
         afterHours,
         usualItems:
@@ -260,6 +284,13 @@ async function handleNaturalLanguage(ctx: Context, app: BotApp, text: string): P
       case "cart_action": {
         const lead = await streamer.finalize();
         await applyCartActions(ctx, app, result, lead);
+        break;
+      }
+      case "profile_update": {
+        // The model extracted profile facts; the backend re-validates them
+        // (phone pattern, lengths) before anything is saved.
+        const lead = await streamer.finalize();
+        await applyAiProfileUpdate(ctx, app, result, lead);
         break;
       }
       default: {
@@ -417,6 +448,50 @@ async function applyCartActions(ctx: Context, app: BotApp, result: AiResult, lea
   });
 }
 
+/**
+ * Apply AI-extracted profile fields conversationally («من محمد محمدی هستم»).
+ * Only fields present in the message are changed; the phone is normalized
+ * (Persian digits → English) and must match the mobile pattern.
+ */
+async function applyAiProfileUpdate(ctx: Context, app: BotApp, result: AiResult, lead = ""): Promise<void> {
+  const userId = ctx.from!.id;
+  const fields = result.profileFields ?? {};
+  const existing = app.customers.getProfile(userId);
+
+  // Name fallback chain: extracted → saved profile → Telegram sender name.
+  const senderName = [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ").trim();
+  const fullName = fields.fullName ?? existing?.fullName ?? senderName ?? "";
+  if (!fullName.trim()) {
+    await ctx.reply("برای ثبت شماره، ابتدا نام خود را بگویید (مثلاً «من محمد محمدی هستم»).");
+    return;
+  }
+
+  const input: { fullName: string; phone?: string | null; address?: string | null } = { fullName };
+  if (fields.phone !== undefined) input.phone = fields.phone;
+  if (fields.address !== undefined) input.address = fields.address;
+
+  const r = app.customers.saveProfile(userId, input);
+  if (!r.ok) {
+    const text = `${lead && lead !== FALLBACK_REPLY ? lead + "\n\n" : ""}⚠️ ${r.error}`;
+    await ctx.reply(text);
+    return;
+  }
+  if (ctx.from) {
+    app.customers.recordSender(userId, {
+      firstName: ctx.from.first_name,
+      lastName: ctx.from.last_name,
+      username: ctx.from.username,
+    });
+  }
+  const lines = [
+    `نام: ${r.profile.fullName}`,
+    r.profile.phone ? `موبایل: ${toPersianDigits(r.profile.phone)}` : null,
+    r.profile.address ? `آدرس: ${r.profile.address}` : null,
+  ].filter(Boolean);
+  const text = `${lead && lead !== FALLBACK_REPLY ? lead + "\n\n" : ""}✅ پروفایل به‌روز شد.\n${lines.join("\n")}`;
+  await ctx.reply(text, { reply_markup: mainMenu() });
+}
+
 interface ReceiptMedia {
   fileId: string;
   messageId: number;
@@ -456,7 +531,7 @@ async function handleReceiptMedia(
   const userId = ctx.from!.id;
   const cart = app.cart.getOrCreate(userId);
 
-  if (cart.state !== "checkout_receipt") {
+  if (cart.state !== "checkout_receipt" && cart.state !== "checkout_payment") {
     // Outside checkout, product images etc. are not used — be explicit.
     if (cart.state === "browsing") {
       await ctx.reply("برای ارسال رسید، ابتدا «تسویه حساب» را بزنید.", {
@@ -464,12 +539,12 @@ async function handleReceiptMedia(
       });
       return;
     }
-    // Delivery/confirm stages: the receipt is already recorded — a re-sent
+    // Fulfillment/confirm stages: the receipt is already recorded — a re-sent
     // or duplicate screenshot must not silently replace it.
     await ctx.reply(RECEIPT_WRONG_STATE_TEXT, {
       reply_markup:
-        cart.state === "checkout_delivery"
-          ? deliveryKeyboard()
+        cart.state === "checkout_fulfillment"
+          ? fulfillmentKeyboard(!!app.customers.getProfile(userId)?.address)
           : checkoutKeyboard(userId, "confirm", app.tokens),
     });
     return;
@@ -491,38 +566,120 @@ async function handleReceiptMedia(
     await ctx.reply(res.error);
     return;
   }
-  await ctx.reply("✅ رسید دریافت شد.", { reply_markup: deliveryKeyboard() });
-  await ctx.reply(DELIVERY_PROMPT_TEXT, {
-    reply_markup: deliveryKeyboard(),
-  });
+  await ctx.reply("✅ رسید دریافت شد.");
+  await sendFulfillmentChoice(ctx, app);
 }
 
-/** Parse "نام | نام خانوادگی | موبایل" and save the caller's profile. */
-async function applyProfileEdit(ctx: Context, app: BotApp, text: string): Promise<void> {
+/**
+ * Step-by-step profile wizard. Steps: name → phone → optional address.
+ * The phone must match the mobile pattern; Persian/Arabic digits are
+ * converted. /cancel aborts (handled by the command handler clearing flows).
+ */
+async function applyProfileEdit(ctx: Context, app: BotApp, text: string, step = "default"): Promise<void> {
   const userId = ctx.from!.id;
-  const parts = text.split("|").map((s) => s.trim());
-  if (parts.length < 2) {
+
+  if (step === "name") {
+    const name = text.trim().slice(0, MAX_PROFILE_NAME_LENGTH);
+    if (name.length < 2) {
+      await ctx.reply("نام واردشده کوتاه است. لطفاً نام و نام خانوادگی را کامل بفرستید:");
+      app.profileEdit.expect(userId, "name"); // stay on the same step
+      return;
+    }
+    wizardState.set(userId, { fullName: name });
+    app.profileEdit.expect(userId, "phone");
     await ctx.reply(
-      "قالب درست نیست. لطفاً در این قالب بفرستید:\nنام | نام خانوادگی | شماره موبایل",
+      [
+        "۲ از ۳ — شماره موبایل خود را بفرستید:",
+        "مثلاً ۰۹۱۲۳۴۵۶۷۸۹ (اعداد فارسی هم قابل قبول است)",
+        "",
+        "برای لغو /cancel را بفرستید.",
+      ].join("\n"),
     );
-    app.profileEdit.expect(userId); // stay in the flow for another try
     return;
   }
-  const [firstName, lastName, phone] = parts;
-  const r = app.customers.saveProfile(userId, {
-    firstName: firstName ?? "",
-    lastName: lastName || null,
-    phone: phone || null,
-  });
-  if (!r.ok) {
-    await ctx.reply(`${r.error}\n\nدوباره تلاش کنید یا /cancel را بفرستید.`);
-    app.profileEdit.expect(userId);
+
+  if (step === "phone") {
+    const saved = wizardState.get(userId) ?? {};
+    const phone = normalizePhone(text);
+    if (!phone) {
+      await ctx.reply(
+        "شماره موبایل معتبر نیست. لطفاً یک شماره ۱۱ رقمی مثل ۰۹۱۲۳۴۵۶۷۸۹ بفرستید:",
+      );
+      app.profileEdit.expect(userId, "phone"); // stay on the same step
+      return;
+    }
+    saved.phone = phone;
+    wizardState.set(userId, saved);
+    app.profileEdit.expect(userId, "address");
+    await ctx.reply(
+      [
+        "۳ از ۳ — آدرس محل تحویل را بنویسید (اختیاری):",
+        "اگر آدرس ندارید یا می‌خواهید حضوری تحویل بگیرید، «رد» بفرستید.",
+        "",
+        "برای لغو /cancel را بفرستید.",
+      ].join("\n"),
+    );
     return;
   }
-  await ctx.reply(
-    `✅ پروفایل ذخیره شد.\nنام: ${r.profile.firstName} ${r.profile.lastName ?? ""}\nموبایل: ${r.profile.phone ? toPersianDigits(r.profile.phone) : "—"}`,
-    { reply_markup: mainMenu() },
-  );
+
+  if (step === "address") {
+    const saved = wizardState.get(userId) ?? {};
+    const skip = /^(رد|نه|خیر|-|—|skip)$/i.test(text.trim());
+    const address = skip ? null : text.trim().slice(0, MAX_ADDRESS_LENGTH) || null;
+    wizardState.delete(userId);
+    const r = app.customers.saveProfile(userId, {
+      fullName: saved.fullName ?? "",
+      phone: saved.phone ?? null,
+      address,
+    });
+    if (!r.ok) {
+      await ctx.reply(`${r.error}\n\nدوباره تلاش کنید یا /cancel را بفرستید.`);
+      app.profileEdit.expect(userId, "address");
+      return;
+    }
+    // Keep the Telegram username in sync with the validated sender.
+    if (ctx.from) {
+      app.customers.recordSender(userId, {
+        firstName: ctx.from.first_name,
+        lastName: ctx.from.last_name,
+        username: ctx.from.username,
+      });
+    }
+    await ctx.reply(
+      [
+        "✅ پروفایل ذخیره شد.",
+        `نام: ${r.profile.fullName}`,
+        `موبایل: ${r.profile.phone ? toPersianDigits(r.profile.phone) : "—"}`,
+        r.profile.address ? `آدرس: ${r.profile.address}` : "آدرس: ثبت نشده",
+      ].join("\n"),
+      { reply_markup: mainMenu() },
+    );
+    return;
+  }
+
+  app.profileEdit.clear(userId);
+}
+
+/** Scratch state for the multi-step profile wizard (name/phone before save). */
+const wizardState = new Map<number, { fullName?: string; phone?: string }>();
+const MAX_PROFILE_NAME_LENGTH = 80;
+
+/**
+ * Capture the requested delivery/pickup time («ساعت ۵ عصر», «الان»).
+ * «پیش‌فرض»/skip leaves it empty — the café prepares the order ASAP.
+ */
+async function applyFulfillmentTime(ctx: Context, app: BotApp, text: string): Promise<void> {
+  const userId = ctx.from!.id;
+  const cart = app.cart.get(userId);
+  if (!cart || cart.state !== "checkout_confirm") {
+    await ctx.reply("این مرحله دیگر معتبر نیست؛ دوباره از «تسویه حساب» شروع کنید.", {
+      reply_markup: mainMenu(),
+    });
+    return;
+  }
+  const skip = /^(پیش‌فرض|پیشفرض|پیش فرض|الان نه|رد|نه|-|—|skip|default)$/i.test(text.trim());
+  app.cart.setFulfillmentTime(userId, skip ? null : text.trim());
+  await sendConfirmStage(ctx, app);
 }
 
 /** Parse a deposit amount, create the pending request, show payment instructions. */
@@ -537,9 +694,9 @@ async function applyDepositAmount(ctx: Context, app: BotApp, text: string): Prom
     return;
   }
   const { payment } = app.orders.getPaymentInstructions(userId);
-  if (!payment.cardNumber) {
+  if (!cardToCardAvailable(payment)) {
     await ctx.reply(
-      `درخواست شارژ #${r.deposit.id} ثبت شد، اما روش پرداخت هنوز تنظیم نشده است؛ بعداً دوباره تلاش کنید.`,
+      `درخواست شارژ #${r.deposit.id} ثبت شد، اما شارژ کیف پول در حال حاضر غیرفعال است؛ بعداً دوباره تلاش کنید.`,
       { reply_markup: walletKeyboard() },
     );
     return;

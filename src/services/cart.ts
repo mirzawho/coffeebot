@@ -3,15 +3,29 @@ import { nowIso, tx } from "../db/database";
 import { MAX_CART_ITEMS, MAX_ITEM_QUANTITY } from "../utils/ids";
 import { MenuService } from "./menu";
 
-export type CartState = "browsing" | "checkout_receipt" | "checkout_delivery" | "checkout_confirm";
+export type CartState =
+  | "browsing"
+  | "checkout_payment"
+  | "checkout_receipt"
+  | "checkout_fulfillment"
+  | "checkout_confirm";
+
+/** How the customer chose to pay. Null until they pick at checkout. */
+export type CartPaymentMethod = "card_to_card" | "wallet";
+
+/** How the order reaches the customer. */
+export type FulfillmentMethod = "delivery" | "pickup";
 
 export interface Cart {
   id: number;
   telegramId: number;
   state: CartState;
+  paymentMethod: CartPaymentMethod | null;
   receiptFileId: string | null;
   receiptMessageId: number | null;
   deliveryNotes: string | null;
+  fulfillmentMethod: FulfillmentMethod | null;
+  fulfillmentTime: string | null;
   checkoutTotalAmount: number | null;
 }
 
@@ -59,9 +73,12 @@ export class CartService {
       id: r.id,
       telegramId: r.telegram_id,
       state: r.state,
+      paymentMethod: r.payment_method ?? null,
       receiptFileId: r.receipt_file_id ?? null,
       receiptMessageId: r.receipt_message_id ?? null,
       deliveryNotes: r.delivery_notes ?? null,
+      fulfillmentMethod: r.fulfillment_method ?? null,
+      fulfillmentTime: r.fulfillment_time ?? null,
       checkoutTotalAmount: r.checkout_total_amount ?? null,
     };
   }
@@ -196,8 +213,9 @@ export class CartService {
       this.db.query("DELETE FROM cart_items WHERE cart_id = ?").run(cart.id);
       this.db
         .query(
-          `UPDATE carts SET state = 'browsing', receipt_file_id = NULL, receipt_message_id = NULL,
-           delivery_notes = NULL, checkout_total_amount = NULL, updated_at = ? WHERE id = ?`,
+          `UPDATE carts SET state = 'browsing', payment_method = NULL, receipt_file_id = NULL,
+           receipt_message_id = NULL, delivery_notes = NULL, checkout_total_amount = NULL,
+           updated_at = ? WHERE id = ?`,
         )
         .run(nowIso(), cart.id);
     })();
@@ -273,13 +291,44 @@ export class CartService {
     }
   }
 
+  /**
+   * Record the customer's payment choice. Wallet continues to the fulfillment
+   * question; card-to-card continues to the receipt step.
+   */
+  setPaymentMethod(telegramId: number, method: CartPaymentMethod): void {
+    this.getOrCreate(telegramId);
+    const next = method === "wallet" ? "checkout_fulfillment" : "checkout_receipt";
+    this.db
+      .query(
+        `UPDATE carts SET payment_method = ?, state = ?, updated_at = ? WHERE telegram_id = ?`,
+      )
+      .run(method, next, nowIso(), telegramId);
+  }
+
   setReceipt(telegramId: number, fileId: string, messageId: number): void {
     this.getOrCreate(telegramId);
     this.db
       .query(
-        "UPDATE carts SET receipt_file_id = ?, receipt_message_id = ?, state = 'checkout_delivery', updated_at = ? WHERE telegram_id = ?",
+        "UPDATE carts SET receipt_file_id = ?, receipt_message_id = ?, state = 'checkout_fulfillment', updated_at = ? WHERE telegram_id = ?",
       )
       .run(fileId, messageId, nowIso(), telegramId);
+  }
+
+  /** Record the fulfillment choice (delivery vs pickup) and ask the time next. */
+  setFulfillmentMethod(telegramId: number, method: FulfillmentMethod): void {
+    this.getOrCreate(telegramId);
+    this.db
+      .query(
+        "UPDATE carts SET fulfillment_method = ?, state = 'checkout_confirm', updated_at = ? WHERE telegram_id = ?",
+      )
+      .run(method, nowIso(), telegramId);
+  }
+
+  /** Record the requested delivery/pickup time (free text, capped). */
+  setFulfillmentTime(telegramId: number, time: string | null): void {
+    this.db
+      .query("UPDATE carts SET fulfillment_time = ?, updated_at = ? WHERE telegram_id = ?")
+      .run(time === null ? null : time.trim().slice(0, 100) || null, nowIso(), telegramId);
   }
 
   setDeliveryNotes(telegramId: number, notes: string | null): void {
@@ -301,8 +350,10 @@ export class CartService {
     if (!cart) return;
     this.db
       .query(
-        `UPDATE carts SET state = 'browsing', receipt_file_id = NULL, receipt_message_id = NULL,
-         delivery_notes = NULL, checkout_total_amount = NULL, updated_at = ? WHERE id = ?`,
+        `UPDATE carts SET state = 'browsing', payment_method = NULL, receipt_file_id = NULL,
+         receipt_message_id = NULL, delivery_notes = NULL, fulfillment_method = NULL,
+         fulfillment_time = NULL, checkout_total_amount = NULL,
+         updated_at = ? WHERE id = ?`,
       )
       .run(nowIso(), cart.id);
   }

@@ -136,6 +136,14 @@ export class Scheduler {
       return;
     }
 
+    if (n.kind === "wallet_adjustment") {
+      // Admin changed the customer's balance: tell them what and why.
+      const notice = JSON.parse(n.payload) as { text?: string };
+      if (!notice.text) throw new Error("wallet_adjustment payload missing text");
+      await this.deps.bot.api.sendMessage(n.recipientId, notice.text);
+      return;
+    }
+
     if (n.kind === "order_update") {
       if (!payload.orderId) throw new Error("order_update payload missing orderId");
       const order = this.deps.orders.loadOrder(payload.orderId);

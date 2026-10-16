@@ -1,11 +1,12 @@
 import type { Db } from "../db/database";
 import { nowIso, tx } from "../db/database";
 import { formatOrderNumber, MAX_DELIVERY_NOTES_LENGTH } from "../utils/ids";
+import { formatMoney } from "../utils/money";
 import { BusinessHoursService } from "./business-hours";
-import { CartService, type CartLine } from "./cart";
+import { CartService, type CartLine, type FulfillmentMethod } from "./cart";
 import { MenuService } from "./menu";
 import { CustomersService } from "./customers";
-import { getCurrency, getPaymentSettings, type PaymentSettings } from "./settings";
+import { cardToCardAvailable, getCurrency, getPaymentSettings, type PaymentSettings } from "./settings";
 
 export type FulfillmentStatus = "pending" | "confirmed" | "delivered" | "cancelled";
 export type PaymentMethod = "card_to_card" | "wallet";
@@ -32,6 +33,8 @@ export interface Order {
   currency: string;
   receiptFileId: string | null;
   deliveryNotes: string | null;
+  fulfillmentMethod: FulfillmentMethod;
+  deliveryTime: string | null;
   status: string;
   fulfillmentStatus: FulfillmentStatus;
   paymentMethod: PaymentMethod;
@@ -39,6 +42,8 @@ export interface Order {
   confirmedBy: number | null;
   confirmedAt: string | null;
   deliveredAt: string | null;
+  paymentReviewedBy: number | null;
+  paymentReviewedAt: string | null;
   createdAt: string;
   items: OrderItem[];
 }
@@ -51,8 +56,12 @@ export type ConfirmResult =
   | { ok: false; reason: "error"; error: string };
 
 export type StartCheckoutResult =
-  | { ok: true; lines: CartLine[]; total: number; payment: PaymentSettings }
+  | { ok: true; lines: CartLine[]; total: number; payment: PaymentSettings; walletBalance: number }
   | { ok: false; reason: "empty" | "invalid_items" | "payment_unconfigured"; error: string };
+
+export type ChoosePaymentResult =
+  | { ok: true; method: PaymentMethod; total: number; balance: number }
+  | { ok: false; error: string };
 
 export class OrdersService {
   private menu: MenuService;
@@ -68,12 +77,18 @@ export class OrdersService {
     this.customers = new CustomersService(db);
   }
 
+  /**
+   * Live cart totals + payment settings for display. The after-hours rule is
+   * applied here too, so a total shown to the customer always matches the
+   * amount that will actually be charged at confirm time.
+   */
   getPaymentInstructions(telegramId: number): {
     payment: PaymentSettings;
     total: number;
     lines: CartLine[];
   } {
-    const totals = this.carts.getTotals(telegramId);
+    const afterHours = !this.businessHours.isOpenAt(new Date());
+    const totals = this.carts.getTotals(telegramId, afterHours);
     return {
       payment: getPaymentSettings(this.db),
       total: totals.total,
@@ -94,10 +109,12 @@ export class OrdersService {
       const resolved = this.menu.resolvePrice(line.productId, line.variantId);
       if (!resolved.ok) return { ok: false, reason: "invalid_items", error: resolved.error };
     }
-    // Without a configured payment method the customer would be led through a
-    // fake payment flow — refuse before entering any checkout state.
+    // At least one payment route must be usable, otherwise the customer would
+    // be led through a fake payment flow — refuse before entering any state.
     const payment = getPaymentSettings(this.db);
-    if (!payment.cardNumber) {
+    const walletBalance = this.customers.getBalance(telegramId);
+    const walletUsable = payment.walletEnabled && walletBalance > 0;
+    if (!cardToCardAvailable(payment) && !walletUsable) {
       return {
         ok: false,
         reason: "payment_unconfigured",
@@ -106,19 +123,64 @@ export class OrdersService {
       };
     }
     this.carts.setCheckoutTotal(telegramId, totals.total);
-    this.carts.setState(telegramId, "checkout_receipt");
+    this.carts.setState(telegramId, "checkout_payment");
     return {
       ok: true,
       lines: totals.lines,
       total: totals.total,
       payment,
+      walletBalance,
     };
   }
 
+  /**
+   * Record the customer's payment choice. Wallet is charged later, at confirm
+   * time (inside the order transaction); card-to-card moves on to the receipt
+   * step. The total is revalidated so a stale choice cannot lock in an old price.
+   */
+  choosePaymentMethod(telegramId: number, method: PaymentMethod): ChoosePaymentResult {
+    const cart = this.carts.get(telegramId);
+    if (!cart || cart.state !== "checkout_payment") {
+      return { ok: false, error: "در این مرحله امکان انتخاب روش پرداخت نیست" };
+    }
+    const afterHours = !this.businessHours.isOpenAt(new Date());
+    const totals = this.carts.getTotals(telegramId, afterHours);
+    if (totals.lines.length === 0) {
+      this.carts.resetCheckout(telegramId);
+      return { ok: false, error: "سبد خرید شما خالی است" };
+    }
+    const balance = this.customers.getBalance(telegramId);
+    const payment = getPaymentSettings(this.db);
+    if (method === "wallet") {
+      if (!payment.walletEnabled) {
+        return { ok: false, error: "پرداخت با کیف پول توسط مدیر غیرفعال شده است" };
+      }
+      if (balance < totals.total) {
+        return {
+          ok: false,
+          error: `موجودی کیف پول کافی نیست.\nموجودی: ${formatMoney(balance, getCurrency(this.db))}\nمبلغ سفارش: ${formatMoney(totals.total, getCurrency(this.db))}`,
+        };
+      }
+    } else if (!cardToCardAvailable(payment)) {
+      return { ok: false, error: "پرداخت کارت به کارت توسط مدیر غیرفعال شده است" };
+    }
+    this.carts.setCheckoutTotal(telegramId, totals.total);
+    this.carts.setPaymentMethod(telegramId, method);
+    return { ok: true, method, total: totals.total, balance };
+  }
+
+  /**
+   * Attach the card-to-card receipt. Accepting it while the customer is still
+   * on the payment-choice screen implicitly selects card-to-card, so a
+   * screenshot sent straight after «تسویه حساب» is never rejected.
+   */
   attachReceipt(telegramId: number, fileId: string, messageId: number): { ok: true } | { ok: false; error: string } {
     const cart = this.carts.get(telegramId);
-    if (!cart || cart.state !== "checkout_receipt") {
+    if (!cart || (cart.state !== "checkout_receipt" && cart.state !== "checkout_payment")) {
       return { ok: false, error: "در این مرحله امکان ثبت رسید نیست؛ ابتدا فرایند پرداخت را شروع کنید" };
+    }
+    if (cart.state === "checkout_payment") {
+      this.carts.setPaymentMethod(telegramId, "card_to_card");
     }
     this.carts.setReceipt(telegramId, fileId, messageId);
     return { ok: true };
@@ -126,7 +188,7 @@ export class OrdersService {
 
   setDeliveryNotes(telegramId: number, notes: string | null): { ok: true } | { ok: false; error: string } {
     const cart = this.carts.get(telegramId);
-    if (!cart || cart.state !== "checkout_delivery") {
+    if (!cart || cart.state !== "checkout_confirm") {
       return { ok: false, error: "در این مرحله امکان ثبت اطلاعات تحویل نیست" };
     }
     if (notes !== null) {
@@ -145,16 +207,33 @@ export class OrdersService {
    * Confirm and create the order. Prices are recomputed here (with the
    * after-hours rule applied); if they drifted from the checkout snapshot the
    * caller must show the new amounts and confirm again.
-   * `payWithWallet` charges the customer's wallet atomically on success.
+   *
+   * The payment method comes from the customer's checkout choice; `payWithWallet`
+   * overrides it for callers that already know (tests, admin tooling). A wallet
+   * order is charged atomically inside the same transaction as the order row.
    */
   confirmOrder(
     telegramId: number,
     customerName?: string | null,
-    payWithWallet = false,
+    payWithWallet?: boolean,
   ): ConfirmResult {
     const cart = this.carts.get(telegramId);
     if (!cart || cart.state !== "checkout_confirm") {
       return { ok: false, reason: "error", error: "سفارش آماده تأیید نیست؛ فرایند پرداخت را از ابتدا انجام دهید" };
+    }
+    const useWallet = payWithWallet ?? cart.paymentMethod === "wallet";
+    // A method switched off by the admin must not be honoured, even if the
+    // customer reached the confirm stage before the switch was flipped.
+    const payment = getPaymentSettings(this.db);
+    if (useWallet && !payment.walletEnabled) {
+      return { ok: false, reason: "error", error: "پرداخت با کیف پول توسط مدیر غیرفعال شده است" };
+    }
+    if (!useWallet && !cardToCardAvailable(payment)) {
+      return { ok: false, reason: "error", error: "پرداخت کارت به کارت توسط مدیر غیرفعال شده است" };
+    }
+    // Card-to-card orders must carry the receipt the customer sent.
+    if (!useWallet && !cart.receiptFileId) {
+      return { ok: false, reason: "error", error: "رسید پرداخت را ارسال کنید" };
     }
     this.carts.pruneInvalidItems(telegramId);
     const afterHours = !this.businessHours.isOpenAt(new Date());
@@ -180,7 +259,7 @@ export class OrdersService {
       this.carts.setCheckoutTotal(telegramId, totals.total);
       return { ok: false, reason: "price_changed", total: totals.total, lines: totals.lines };
     }
-    if (payWithWallet && this.customers.getBalance(telegramId) < totals.total) {
+    if (useWallet && this.customers.getBalance(telegramId) < totals.total) {
       return { ok: false, reason: "error", error: "موجودی کیف پول کافی نیست" };
     }
 
@@ -201,8 +280,8 @@ export class OrdersService {
           .query(
             `INSERT INTO orders (order_number, customer_telegram_id, customer_name, business_date,
              total_amount, currency, receipt_file_id, delivery_notes, status,
-             fulfillment_status, payment_method, payment_status, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'receipt_received_unverified', 'pending', ?, ?, ?)`,
+             fulfillment_status, payment_method, payment_status, fulfillment_method, delivery_time, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'receipt_received_unverified', 'pending', ?, ?, ?, ?, ?)`,
           )
           .run(
             orderNumber,
@@ -211,16 +290,18 @@ export class OrdersService {
             businessDate,
             totals.total,
             currency,
-            payWithWallet ? null : cart.receiptFileId,
+            useWallet ? null : cart.receiptFileId,
             cart.deliveryNotes,
-            payWithWallet ? "wallet" : "card_to_card",
-            payWithWallet ? "paid" : "receipt_received",
+            useWallet ? "wallet" : "card_to_card",
+            useWallet ? "paid" : "receipt_received",
+            cart.fulfillmentMethod ?? "pickup",
+            cart.fulfillmentTime,
             createdAt,
           );
         const orderId = Number(res.lastInsertRowid);
 
         // Wallet charge: idempotent per order; rolls back the whole order on failure.
-        if (payWithWallet) {
+        if (useWallet) {
           const pay = this.customers.payOrderFromWallet(telegramId, orderId, totals.total);
           if (!pay.ok) throw new Error(pay.error);
           this.db
@@ -248,8 +329,10 @@ export class OrdersService {
         this.db.query("DELETE FROM cart_items WHERE cart_id = ?").run(cart.id);
         this.db
           .query(
-            `UPDATE carts SET state = 'browsing', receipt_file_id = NULL, receipt_message_id = NULL,
-             delivery_notes = NULL, checkout_total_amount = NULL, updated_at = ? WHERE id = ?`,
+            `UPDATE carts SET state = 'browsing', payment_method = NULL, receipt_file_id = NULL,
+             receipt_message_id = NULL, delivery_notes = NULL, fulfillment_method = NULL,
+             fulfillment_time = NULL, checkout_total_amount = NULL,
+             updated_at = ? WHERE id = ?`,
           )
           .run(nowIso(), cart.id);
 
@@ -331,6 +414,8 @@ export class OrdersService {
       currency: r.currency,
       receiptFileId: r.receipt_file_id ?? null,
       deliveryNotes: r.delivery_notes ?? null,
+      fulfillmentMethod: r.fulfillment_method ?? "pickup",
+      deliveryTime: r.delivery_time ?? null,
       status: r.status,
       fulfillmentStatus: r.fulfillment_status ?? "pending",
       paymentMethod: r.payment_method ?? "card_to_card",
@@ -338,6 +423,8 @@ export class OrdersService {
       confirmedBy: r.confirmed_by ?? null,
       confirmedAt: r.confirmed_at ?? null,
       deliveredAt: r.delivered_at ?? null,
+      paymentReviewedBy: r.payment_reviewed_by ?? null,
+      paymentReviewedAt: r.payment_reviewed_at ?? null,
       createdAt: r.created_at,
       items,
     };
@@ -458,6 +545,58 @@ export class OrdersService {
         return { ok: true as const, order: current, already: true };
       }
       return { ok: false as const, error: "این سفارش در وضعیت تحویل نیست" };
+    });
+  }
+
+  // ---------- payment review ----------
+
+  /**
+   * Admin approves a card-to-card payment: the receipt is accepted and the
+   * order is marked paid. Only orders that actually carry a receipt can be
+   * approved — a wallet order is already paid at creation time. Idempotent.
+   */
+  markPaymentPaid(orderId: number, adminId: number):
+    | { ok: true; order: Order; already: boolean }
+    | { ok: false; error: string } {
+    return tx(this.db, () => {
+      const current = this.loadOrder(orderId);
+      if (!current) return { ok: false as const, error: "سفارش یافت نشد" };
+      if (current.paymentStatus === "paid") {
+        return { ok: true as const, order: current, already: true };
+      }
+      if (current.paymentMethod !== "card_to_card" || !current.receiptFileId) {
+        return { ok: false as const, error: "این سفارش رسید کارت به کارت ندارد" };
+      }
+      this.db
+        .query(
+          `UPDATE orders SET payment_status = 'paid', payment_reviewed_by = ?, payment_reviewed_at = ?
+           WHERE id = ? AND payment_status != 'paid'`,
+        )
+        .run(adminId, nowIso(), orderId);
+      return { ok: true as const, order: this.loadOrder(orderId)!, already: false };
+    });
+  }
+
+  /** Admin rejects a card-to-card receipt (wrong amount, unreadable, unpaid). */
+  markPaymentRejected(orderId: number, adminId: number):
+    | { ok: true; order: Order; already: boolean }
+    | { ok: false; error: string } {
+    return tx(this.db, () => {
+      const current = this.loadOrder(orderId);
+      if (!current) return { ok: false as const, error: "سفارش یافت نشد" };
+      if (current.paymentStatus === "rejected") {
+        return { ok: true as const, order: current, already: true };
+      }
+      if (current.paymentStatus === "paid") {
+        return { ok: false as const, error: "پرداخت این سفارش قبلاً تأیید شده است" };
+      }
+      this.db
+        .query(
+          `UPDATE orders SET payment_status = 'rejected', payment_reviewed_by = ?, payment_reviewed_at = ?
+           WHERE id = ? AND payment_status != 'paid'`,
+        )
+        .run(adminId, nowIso(), orderId);
+      return { ok: true as const, order: this.loadOrder(orderId)!, already: false };
     });
   }
 

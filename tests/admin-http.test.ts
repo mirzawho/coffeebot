@@ -198,7 +198,7 @@ describe("customer orders appear in the admin workflow", () => {
     const co = app.orders.startCheckout(555);
     expect(co.ok).toBe(true);
     app.orders.attachReceipt(555, "receipt-file", 1);
-    app.orders.setDeliveryNotes(555, null);
+    cart.setFulfillmentMethod(555, "pickup");
     const conf = app.orders.confirmOrder(555, "Cust");
     expect(conf.ok).toBe(true);
     if (!conf.ok) return;

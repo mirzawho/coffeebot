@@ -89,6 +89,7 @@ async function main(): Promise<void> {
     loyalty,
     profileEdit: new TextCaptureFlow(),
     depositFlow: new TextCaptureFlow(),
+    fulfillmentTimeFlow: new TextCaptureFlow(),
   };
 
   const bot = createBot(botApp);
@@ -107,6 +108,8 @@ async function main(): Promise<void> {
     uploadsDir,
     customers,
     loyalty,
+    // Used only to resolve receipt file_ids into image bytes for the panel.
+    bot,
   };
 
   const httpServer = createHttpServer(apiApp);

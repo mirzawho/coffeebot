@@ -12,6 +12,7 @@ import {
   adminDisplayName,
   getAdminProfiles,
   getAiSettings,
+  getCurrency,
   getNotificationSettings,
   getPaymentSettings,
   getReportSettings,
@@ -22,7 +23,7 @@ import {
   updateReportSettings,
   getSetting,
 } from "../../services/settings";
-import { parseAmountInput } from "../../utils/money";
+import { formatMoney, parseAmountInput } from "../../utils/money";
 import { formatJalaliFa, isValidDate } from "../../utils/dates";
 import { log } from "../../utils/logger";
 import type { Order } from "../../services/orders";
@@ -128,6 +129,38 @@ const ORDER_STATUS_LABELS: Record<string, string> = {
   receipt_received_unverified: "رسید دریافت شده",
 };
 
+const FULFILLMENT_LABELS: Record<string, string> = {
+  pending: "در انتظار آماده‌سازی",
+  confirmed: "تأیید شده",
+  delivered: "تحویل شده",
+  cancelled: "لغو شده",
+};
+
+const PAYMENT_STATUS_LABELS: Record<string, string> = {
+  unverified: "تأیید نشده",
+  receipt_received: "رسید دریافت شده",
+  paid: "پرداخت شده",
+  rejected: "رسید رد شده",
+};
+
+const PAYMENT_METHOD_LABELS: Record<string, string> = {
+  card_to_card: "کارت به کارت",
+  wallet: "کیف پول",
+};
+
+const FULFILLMENT_METHOD_LABELS: Record<string, string> = {
+  delivery: "ارسال 🛵",
+  pickup: "تحویل حضوری 🏪",
+};
+
+/** Persian labels for wallet ledger kinds. */
+const WALLET_TX_LABELS: Record<string, string> = {
+  deposit: "واریز به کیف پول",
+  order_payment: "پرداخت سفارش",
+  refund: "بازگشت وجه",
+  adjustment: "تنظیم موجودی",
+};
+
 /** Admin-facing order shape: no DB ids, no Telegram ids. `statusLabel` is what
  * the UI shows; the raw `status` stays for API compatibility/consumers. */
 function orderDto(o: Order, timezone: string) {
@@ -141,7 +174,15 @@ function orderDto(o: Order, timezone: string) {
     currency: o.currency,
     status: o.status,
     statusLabel: ORDER_STATUS_LABELS[o.status] ?? "ثبت شده",
+    fulfillmentLabel: FULFILLMENT_LABELS[o.fulfillmentStatus] ?? "ثبت شده",
+    paymentLabel: PAYMENT_STATUS_LABELS[o.paymentStatus] ?? "—",
+    paymentMethodLabel: PAYMENT_METHOD_LABELS[o.paymentMethod] ?? "—",
+    paymentStatus: o.paymentStatus,
+    paymentMethod: o.paymentMethod,
     deliveryNotes: o.deliveryNotes,
+    fulfillmentMethod: o.fulfillmentMethod,
+    fulfillmentMethodLabel: FULFILLMENT_METHOD_LABELS[o.fulfillmentMethod] ?? "—",
+    deliveryTime: o.deliveryTime,
     hasReceipt: !!o.receiptFileId,
     items: o.items.map((it) => ({
       productName: it.productName,
@@ -162,6 +203,25 @@ function isoToLocalTime(iso: string, timezone: string): string {
     hourCycle: "h23",
   });
   return fmt.format(new Date(iso));
+}
+
+/** "YYYY-MM-DD HH:MM" of an ISO instant in the cafe's timezone. */
+function isoToLocalDateTime(iso: string, timezone: string): string {
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  });
+  // en-GB renders DD/MM/YYYY — rebuild as YYYY-MM-DD HH:MM.
+  const p: Record<string, string> = {};
+  for (const part of fmt.formatToParts(new Date(iso))) {
+    if (part.type !== "literal") p[part.type] = part.value;
+  }
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
 }
 
 function localDate(app: ApiApp, now = new Date()): string {
@@ -442,6 +502,9 @@ route("PUT", "/api/admin/settings/payment", async ({ app, req }) => {
         cardNumber: String(body.cardNumber ?? ""),
         cardholderName: String(body.cardholderName ?? ""),
         currency: String(body.currency ?? ""),
+        cardToCardEnabled:
+          body.cardToCardEnabled !== undefined ? !!body.cardToCardEnabled : undefined,
+        walletEnabled: body.walletEnabled !== undefined ? !!body.walletEnabled : undefined,
       }),
     );
   } catch (err) {
@@ -602,7 +665,7 @@ route("GET", "/api/admin/wallet/deposits", ({ app, url }) => {
         createdAt: d.createdAt,
         customer: {
           telegramId: d.telegramId,
-          name: profile ? [profile.firstName, profile.lastName].filter(Boolean).join(" ") : null,
+          name: profile?.fullName ?? null,
           phone: profile?.phone ?? null,
         },
       };
@@ -630,7 +693,41 @@ route("POST", "/api/admin/wallet/deposits/:id/reject", ({ app, user, params }) =
   return json({ ok: true });
 });
 
-// customer detail (admin)
+// customer list + detail (admin)
+
+/**
+ * Customer directory for the panel: profile, wallet balance, order stats.
+ * Telegram ids are values here, never display labels (the UI shows names).
+ */
+route("GET", "/api/admin/customers", ({ app, url }) => {
+  const q = (url.searchParams.get("q") ?? "").trim();
+  const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 100, 1), 500);
+  const rows = app.customers.listCustomerRows(limit);
+  const tz = app.config.timezone;
+  const filtered = q
+    ? rows.filter((r) => {
+        const name = r.fullName ?? "";
+        return (
+          name.includes(q) ||
+          (r.phone ?? "").includes(q) ||
+          (r.username ?? "").toLowerCase().includes(q.toLowerCase())
+        );
+      })
+    : rows;
+  return json(
+    filtered.map((r) => ({
+      // The id is the route parameter for opening detail, not rendered text.
+      id: r.telegramId,
+      name: r.fullName,
+      username: r.username,
+      phone: r.phone,
+      balance: r.balance,
+      orderCount: r.orderCount,
+      orderValue: r.orderValue,
+      lastActiveAt: r.lastActiveAt ? isoToLocalDateTime(r.lastActiveAt, tz) : null,
+    })),
+  );
+});
 
 route("GET", "/api/admin/customers/:id", ({ app, params }) => {
   const telegramId = num(params.id);
@@ -644,23 +741,75 @@ route("GET", "/api/admin/customers/:id", ({ app, params }) => {
     profile: summary.profile
       ? {
           telegramId: summary.profile.telegramId,
-          firstName: summary.profile.firstName,
-          lastName: summary.profile.lastName,
+          fullName: summary.profile.fullName,
           phone: summary.profile.phone,
+          address: summary.profile.address,
+          username: summary.profile.username,
         }
       : null,
     orders,
     deposits: deposits.map((d) => ({
-      id: d.id,
       amount: d.amount,
       status: d.status,
       hasReceipt: !!d.receiptFileId,
-      createdAt: d.createdAt,
+      time: isoToLocalDateTime(d.createdAt, app.config.timezone),
     })),
-    transactions,
+    transactions: transactions.map((t) => ({
+      amount: t.amount,
+      kindLabel: WALLET_TX_LABELS[t.kind] ?? "—",
+      balanceAfter: t.balanceAfter,
+      note: t.note,
+      time: isoToLocalDateTime(t.createdAt, app.config.timezone),
+    })),
     ratings,
   });
 });
+
+/**
+ * Manual wallet adjustment (correction, promo credit, comp). The amount is a
+ * signed integer; the server re-validates against balance/limit rules and the
+ * admin actor is recorded in the ledger for audit.
+ *
+ * The customer is told about the change through the durable notification queue
+ * (kind `wallet_adjustment`), keyed by the ledger transaction id so a retried
+ * request can never send the same notice twice.
+ */
+route("POST", "/api/admin/customers/:id/wallet", async ({ app, user, params, req }) => {
+  const telegramId = num(params.id);
+  const body = await readJson(req);
+  if (!body) return badRequest("JSON نامعتبر است");
+  const amount = Number(body.amount);
+  if (!Number.isInteger(amount) || amount === 0) {
+    return badRequest("مبلغ باید عدد صحیح غیرصفر باشد");
+  }
+  if (Math.abs(amount) > 100_000_000) return badRequest("مبلغ بیش از حد مجاز است");
+  const r = app.customers.adjustBalance(telegramId, amount, body.note ?? null, user.id);
+  if (!r.ok) return badRequest(r.error);
+
+  const currency = getCurrency(app.db);
+  const text = walletAdjustmentText(amount, r.balance, currency, body.note ?? null);
+  app.notifications.enqueue("wallet_adjustment", `wallet_tx_${r.txId}`, [telegramId], { text });
+
+  return json({ ok: true, balance: r.balance, notified: true });
+});
+
+/** Customer-facing message for an admin wallet change. */
+export function walletAdjustmentText(
+  amount: number,
+  balanceAfter: number,
+  currency: string,
+  note: string | null,
+): string {
+  const cleanNote = note ? String(note).trim().slice(0, 200) : "";
+  const lines = [
+    amount > 0 ? "💰 کیف پول شما افزایش یافت." : "💰 کیف پول شما کاهش یافت.",
+    "",
+    `${amount > 0 ? "مبلغ افزوده‌شده" : "مبلغ کسرشده"}: ${formatMoney(Math.abs(amount), currency)}`,
+    `موجودی جدید: ${formatMoney(balanceAfter, currency)}`,
+  ];
+  if (cleanNote) lines.push(`توضیح: ${cleanNote}`);
+  return lines.join("\n");
+}
 
 // order lifecycle actions (admin)
 
@@ -698,6 +847,79 @@ route("POST", "/api/admin/orders/:ref/deliver", ({ app, user, params }) => {
       r.order.customerTelegramId,
       `order_rated_${r.order.orderNumber}`,
       `🎉 سفارش ${r.order.orderNumber} تحویل داده شد. لطفاً به تجربه‌تان امتیاز دهید.`,
+    );
+  }
+  return json({ ok: true, already: r.already, order: orderDto(r.order, app.config.timezone) });
+});
+
+/**
+ * The card-to-card receipt for an order, as a Telegram file_id. The Mini App
+ * cannot fetch Telegram files itself, so the panel asks the server and the
+ * server hands back only the opaque id (never a bot token or file URL).
+ */
+route("GET", "/api/admin/orders/:ref/receipt", ({ app, params }) => {
+  const order = app.orders.findByNumber(decodeURIComponent(params.ref));
+  if (!order || !order.receiptFileId) return json({ error: "رسیدی ثبت نشده است" }, 404);
+  return json({ fileId: order.receiptFileId });
+});
+
+/**
+ * Stream the receipt image itself. Telegram file URLs embed the bot token, so
+ * they must never reach the browser — the server resolves the file_id and
+ * proxies the bytes. Admin-only (the route table authenticates every request).
+ */
+route("GET", "/api/admin/orders/:ref/receipt/image", async ({ app, params }) => {
+  const order = app.orders.findByNumber(decodeURIComponent(params.ref));
+  if (!order || !order.receiptFileId) return json({ error: "رسیدی ثبت نشده است" }, 404);
+  if (!app.bot) return json({ error: "دریافت تصویر رسید در دسترس نیست" }, 503);
+  try {
+    const file = await app.bot.api.getFile(order.receiptFileId);
+    if (!file.file_path) return json({ error: "فایل رسید یافت نشد" }, 404);
+    const res = await fetch(
+      `https://api.telegram.org/file/bot${app.config.botToken}/${file.file_path}`,
+    );
+    if (!res.ok || !res.body) return json({ error: "دریافت تصویر رسید ناموفق بود" }, 502);
+    return new Response(res.body, {
+      headers: {
+        "content-type": res.headers.get("content-type") ?? "image/jpeg",
+        "cache-control": "private, max-age=300",
+      },
+    });
+  } catch (err) {
+    log.warn("receipt image fetch failed", { order: order.orderNumber, err: String(err) });
+    return json({ error: "دریافت تصویر رسید ناموفق بود" }, 502);
+  }
+});
+
+/** Admin approves a card-to-card payment (receipt accepted → order paid). */
+route("POST", "/api/admin/orders/:ref/payment/approve", ({ app, user, params }) => {
+  const order = app.orders.findByNumber(decodeURIComponent(params.ref));
+  if (!order) return badRequest("سفارش یافت نشد");
+  const r = app.orders.markPaymentPaid(order.id, user.id);
+  if (!r.ok) return badRequest(r.error);
+  if (!r.already) {
+    notifyCustomer(
+      app,
+      r.order.customerTelegramId,
+      `payment_approved_${r.order.orderNumber}`,
+      `✅ پرداخت سفارش ${r.order.orderNumber} تأیید شد.`,
+    );
+  }
+  return json({ ok: true, already: r.already, order: orderDto(r.order, app.config.timezone) });
+});
+
+/** Admin rejects a card-to-card receipt (wrong amount, unreadable, unpaid). */
+route("POST", "/api/admin/orders/:ref/payment/reject", ({ app, user, params }) => {
+  const order = app.orders.findByNumber(decodeURIComponent(params.ref));
+  if (!order) return badRequest("سفارش یافت نشد");
+  const r = app.orders.markPaymentRejected(order.id, user.id);
+  if (!r.ok) return badRequest(r.error);
+  if (!r.already) {
+    notifyCustomer(
+      app,
+      r.order.customerTelegramId,
+      `payment_rejected_${r.order.orderNumber}`,
+      `⚠️ رسید پرداخت سفارش ${r.order.orderNumber} تأیید نشد. لطفاً با کافه تماس بگیرید.`,
     );
   }
   return json({ ok: true, already: r.already, order: orderDto(r.order, app.config.timezone) });

@@ -6,6 +6,10 @@ export interface PaymentSettings {
   cardNumber: string;
   cardholderName: string;
   currency: string;
+  /** Admin switch: card-to-card checkout + wallet top-ups are offered. */
+  cardToCardEnabled: boolean;
+  /** Admin switch: paying an order from the wallet balance is offered. */
+  walletEnabled: boolean;
 }
 
 export interface ReportSettings {
@@ -41,12 +45,30 @@ export function getPaymentSettings(db: Db): PaymentSettings {
     cardNumber: getSetting(db, "card_number"),
     cardholderName: getSetting(db, "cardholder_name"),
     currency: getSetting(db, "currency") || "تومان",
+    // Both default to ON so an existing installation keeps working unchanged.
+    cardToCardEnabled: getSetting(db, "payment_card_enabled") !== "0",
+    walletEnabled: getSetting(db, "payment_wallet_enabled") !== "0",
   };
+}
+
+/**
+ * True when card-to-card is both switched on AND has a card number to pay to.
+ * Every card flow (checkout, wallet top-up) must gate on this, never on the
+ * raw toggle — a switch alone cannot receive money.
+ */
+export function cardToCardAvailable(payment: PaymentSettings): boolean {
+  return payment.cardToCardEnabled && !!payment.cardNumber;
 }
 
 export function updatePaymentSettings(
   db: Db,
-  input: { cardNumber: string; cardholderName: string; currency: string },
+  input: {
+    cardNumber: string;
+    cardholderName: string;
+    currency: string;
+    cardToCardEnabled?: boolean;
+    walletEnabled?: boolean;
+  },
 ): PaymentSettings {
   const cardNumber = String(input.cardNumber ?? "").trim();
   const cardholderName = String(input.cardholderName ?? "").trim();
@@ -59,10 +81,22 @@ export function updatePaymentSettings(
   if (cardholderName.length > 100) throw new Error("نام دارنده کارت بیش از حد مجاز طولانی است");
   if (!currency || currency.length > 16) throw new Error("واحد پول نامعتبر است");
 
+  // Refuse a state that would leave the cafe unable to take any money.
+  const cardToCardEnabled = input.cardToCardEnabled ?? getPaymentSettings(db).cardToCardEnabled;
+  const walletEnabled = input.walletEnabled ?? getPaymentSettings(db).walletEnabled;
+  if (!cardToCardEnabled && !walletEnabled) {
+    throw new Error("حداقل یکی از روش‌های پرداخت باید فعال باشد");
+  }
+  if (cardToCardEnabled && !cardNumber) {
+    throw new Error("برای فعال بودن کارت به کارت، شماره کارت را وارد کنید");
+  }
+
   setSetting(db, "card_number", cardNumber);
   setSetting(db, "cardholder_name", cardholderName);
   setSetting(db, "currency", currency);
-  return { cardNumber, cardholderName, currency };
+  setSetting(db, "payment_card_enabled", cardToCardEnabled ? "1" : "0");
+  setSetting(db, "payment_wallet_enabled", walletEnabled ? "1" : "0");
+  return { cardNumber, cardholderName, currency, cardToCardEnabled, walletEnabled };
 }
 
 export function getReportSettings(db: Db): ReportSettings {

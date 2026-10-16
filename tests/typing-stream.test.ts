@@ -271,6 +271,7 @@ function buildApp(aiResult: AiResult | ((input: AiInput) => AiResult), persona =
     loyalty: new LoyaltyService(db),
     profileEdit: new TextCaptureFlow(),
     depositFlow: new TextCaptureFlow(),
+    fulfillmentTimeFlow: new TextCaptureFlow(),
   };
 }
 

@@ -7,26 +7,33 @@ import {
   checkoutKeyboard,
   clearConfirmKeyboard,
   deliveryKeyboard,
+  fulfillmentKeyboard,
   mainMenu,
+  paymentMethodKeyboard,
   productKeyboard,
   productsKeyboard,
 } from "../keyboards";
 import {
   cartText,
   confirmSummaryText,
+  fulfillmentPromptText,
+  FULFILLMENT_TIME_PROMPT_TEXT,
   HELP_TEXT,
   orderConfirmedText,
   orderSummaryText,
+  paymentChoiceText,
   paymentText,
   productDetailText,
   RECEIPT_PROMPT_TEXT,
   STALE_TEXT,
+  walletPaymentSummaryText,
   WELCOME_TEXT,
 } from "../format";
 import { formatMoney, formatAmount } from "../../utils/money";
 import { toPersianDigits } from "../../utils/dates";
 import { MAX_ITEM_QUANTITY } from "../../utils/ids";
 import { log } from "../../utils/logger";
+import { cardToCardAvailable } from "../../services/settings";
 import { walletKeyboard, ratingKeyboard } from "../keyboards";
 import { NO_ORDERS_TEXT, customerOrderDetailText, FULFILLMENT_LABELS } from "../format";
 
@@ -143,6 +150,10 @@ export async function startCheckoutFlow(ctx: Context, app: BotApp): Promise<void
   const cart = app.cart.getOrCreate(userId);
   if (cart.state !== "browsing") {
     // Resume an in-progress checkout instead of erroring.
+    if (cart.state === "checkout_payment") {
+      await sendPaymentChoice(ctx, app);
+      return;
+    }
     if (cart.state === "checkout_receipt") {
       await ctx.reply(orderSummaryFromCart(app, userId), {
         reply_markup: checkoutKeyboard(userId, "receipt", app.tokens),
@@ -151,10 +162,8 @@ export async function startCheckoutFlow(ctx: Context, app: BotApp): Promise<void
       await ctx.reply(RECEIPT_PROMPT_TEXT);
       return;
     }
-    if (cart.state === "checkout_delivery") {
-      await ctx.reply("لطفاً اطلاعات تحویل را بنویسید یا رد کنید.", {
-        reply_markup: deliveryKeyboard(),
-      });
+    if (cart.state === "checkout_fulfillment") {
+      await sendFulfillmentChoice(ctx, app);
       return;
     }
     if (cart.state === "checkout_confirm") {
@@ -168,8 +177,30 @@ export async function startCheckoutFlow(ctx: Context, app: BotApp): Promise<void
     return;
   }
   await ctx.reply(orderSummaryText(result.lines, result.total, result.payment.currency));
-  await ctx.reply(paymentText(result.payment, result.total));
-  await ctx.reply(RECEIPT_PROMPT_TEXT, { reply_markup: checkoutKeyboard(userId, "receipt", app.tokens) });
+  await sendPaymentChoice(ctx, app);
+}
+
+/** Payment-method picker (wallet balance + card-to-card). */
+async function sendPaymentChoice(ctx: Context, app: BotApp): Promise<void> {
+  const userId = ctx.from!.id;
+  const totals = app.cart.getTotals(userId);
+  const { payment } = app.orders.getPaymentInstructions(userId);
+  const balance = app.customers.getBalance(userId);
+  const cardEnabled = cardToCardAvailable(payment);
+  await ctx.reply(
+    paymentChoiceText(totals.total, payment.currency, balance, {
+      walletEnabled: payment.walletEnabled,
+      cardEnabled,
+    }),
+    {
+      reply_markup: paymentMethodKeyboard({
+        walletBalance: balance,
+        total: totals.total,
+        walletEnabled: payment.walletEnabled,
+        cardEnabled,
+      }),
+    },
+  );
 }
 
 function orderSummaryFromCart(app: BotApp, userId: number): string {
@@ -186,17 +217,30 @@ function paymentForCart(app: BotApp, userId: number): string {
   return paymentText(payment, totals.total);
 }
 
-async function sendConfirmStage(ctx: Context, app: BotApp): Promise<void> {
+export async function sendConfirmStage(ctx: Context, app: BotApp): Promise<void> {
   const userId = ctx.from!.id;
   const cart = app.cart.get(userId);
   const totals = app.cart.getTotals(userId);
   const { payment } = app.orders.getPaymentInstructions(userId);
   const currency = payment.currency;
   const balance = app.customers.getBalance(userId);
-  const summary = confirmSummaryText(totals.lines, totals.total, currency, cart?.deliveryNotes ?? null);
+  const summary = confirmSummaryText(totals.lines, totals.total, currency, cart?.deliveryNotes ?? null, {
+    method: cart?.fulfillmentMethod ?? null,
+    time: cart?.fulfillmentTime ?? null,
+  });
   const walletLine = balance > 0 ? `\n\n💰 موجودی کیف پول: ${formatMoney(balance, currency)}` : "";
   await ctx.reply(summary + walletLine, {
-    reply_markup: checkoutKeyboard(userId, "confirm", app.tokens, balance),
+    reply_markup: checkoutKeyboard(userId, "confirm", app.tokens),
+  });
+}
+
+/** Delivery-vs-pickup question, shown after payment/receipt. */
+export async function sendFulfillmentChoice(ctx: Context, app: BotApp): Promise<void> {
+  const userId = ctx.from!.id;
+  const profile = app.customers.getProfile(userId);
+  const hasAddress = !!profile?.address;
+  await ctx.reply(fulfillmentPromptText(hasAddress, profile?.address ?? null), {
+    reply_markup: fulfillmentKeyboard(hasAddress),
   });
 }
 
@@ -400,9 +444,56 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
     return;
   }
 
+  if (data === "pm:w" || data === "pm:c") {
+    // Payment-method choice. The server revalidates the balance / card config
+    // and the current total, so a stale button can never lock in an old price.
+    const method = data === "pm:w" ? "wallet" : "card_to_card";
+    const res = app.orders.choosePaymentMethod(userId, method);
+    if (!res.ok) {
+      await ctx.answerCallbackQuery({ text: res.error, show_alert: true });
+      return;
+    }
+    if (method === "wallet") {
+      // Wallet is charged at final confirm; first ask how the order is received.
+      await ctx.reply(walletPaymentSummaryText(res.total, app.orders.getPaymentInstructions(userId).payment.currency, res.balance));
+      await sendFulfillmentChoice(ctx, app);
+      return;
+    }
+    await ctx.reply(paymentForCart(app, userId));
+    await ctx.reply(RECEIPT_PROMPT_TEXT, {
+      reply_markup: checkoutKeyboard(userId, "receipt", app.tokens),
+    });
+    return;
+  }
+
+  if (data === "fm:d" || data === "fm:p") {
+    // Fulfillment choice: delivery (needs a saved address) or pickup. The
+    // server revalidates the state; delivery without an address is refused.
+    const method = data === "fm:d" ? "delivery" : "pickup";
+    const cart = app.cart.get(userId);
+    if (!cart || cart.state !== "checkout_fulfillment") {
+      await ctx.answerCallbackQuery({ text: STALE_TEXT, show_alert: true });
+      return;
+    }
+    if (method === "delivery") {
+      const profile = app.customers.getProfile(userId);
+      if (!profile?.address) {
+        await ctx.answerCallbackQuery({
+          text: "ابتدا آدرس خود را در پروفایل ثبت کنید",
+          show_alert: true,
+        });
+        return;
+      }
+    }
+    app.cart.setFulfillmentMethod(userId, method);
+    app.fulfillmentTimeFlow.expect(userId, "time");
+    await ctx.reply(FULFILLMENT_TIME_PROMPT_TEXT);
+    return;
+  }
+
   if (data === "skip") {
     const cart = app.cart.get(userId);
-    if (!cart || cart.state !== "checkout_delivery") {
+    if (!cart || cart.state !== "checkout_confirm") {
       await ctx.answerCallbackQuery({ text: STALE_TEXT, show_alert: true });
       return;
     }
@@ -423,6 +514,7 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
       return;
     }
     const name = ctx.from?.first_name ? `${ctx.from.first_name}${ctx.from.last_name ? " " + ctx.from.last_name : ""}` : null;
+    // The payment method comes from the cart (chosen at the payment stage).
     const result = app.orders.confirmOrder(userId, name);
     if (!result.ok) {
       if (result.reason === "price_changed") {
@@ -437,42 +529,22 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
       });
       return;
     }
-    await ctx.reply(orderConfirmedText(result.order), { reply_markup: mainMenu() });
-    return;
-  }
-
-  if (data.startsWith("wp:")) {
-    // wp:<tok> — pay for the order from the customer's wallet.
-    const tok = data.slice(3);
-    if (!app.tokens.consume(userId, tok, "wp")) {
-      await ctx.answerCallbackQuery({ text: "سفارش قبلاً ثبت شد", show_alert: true });
-      return;
-    }
-    const cart = app.cart.get(userId);
-    if (!cart || cart.state !== "checkout_confirm") {
-      await ctx.answerCallbackQuery({ text: STALE_TEXT, show_alert: true });
-      return;
-    }
-    const name = ctx.from?.first_name ? `${ctx.from.first_name}${ctx.from.last_name ? " " + ctx.from.last_name : ""}` : null;
-    const result = app.orders.confirmOrder(userId, name, true);
-    if (!result.ok) {
-      if (result.reason === "price_changed") {
-        await ctx.reply(
-          `⚠️ قیمت برخی اقلام تغییر کرده است.\nمبلغ جدید: ${formatMoney(result.total, app.orders.getPaymentInstructions(userId).payment.currency)}\n\nلطفاً دوباره تأیید کنید.`,
-          { reply_markup: checkoutKeyboard(userId, "confirm", app.tokens) },
-        );
-        return;
-      }
-      await ctx.reply(result.reason === "empty" ? "سبد خرید شما خالی است." : result.error, {
-        reply_markup: mainMenu(),
+    // Record the customer's Telegram identity so the admin panel can show a
+    // name/username and link to their chat.
+    if (ctx.from) {
+      app.customers.recordSender(userId, {
+        firstName: ctx.from.first_name,
+        lastName: ctx.from.last_name,
+        username: ctx.from.username,
       });
-      return;
     }
     const balance = app.customers.getBalance(userId);
-    await ctx.reply(
-      `${orderConfirmedText(result.order)}\n\n💰 پرداخت از کیف پول انجام شد.\nموجودی باقی‌مانده: ${formatMoney(balance, app.orders.getPaymentInstructions(userId).payment.currency)}`,
-      { reply_markup: mainMenu() },
-    );
+    const currency = app.orders.getPaymentInstructions(userId).payment.currency;
+    const walletLine =
+      result.order.paymentMethod === "wallet"
+        ? `\n\n💰 پرداخت از کیف پول انجام شد.\nموجودی باقی‌مانده: ${formatMoney(balance, currency)}`
+        : "";
+    await ctx.reply(orderConfirmedText(result.order) + walletLine, { reply_markup: mainMenu() });
     return;
   }
 
@@ -547,9 +619,9 @@ async function showProfile(ctx: Context, app: BotApp): Promise<void> {
   const text = p
     ? [
         "👤 پروفایل شما:",
-        `نام: ${p.firstName}`,
-        p.lastName ? `نام خانوادگی: ${p.lastName}` : "نام خانوادگی: —",
+        `نام: ${p.fullName}`,
         p.phone ? `موبایل: ${toPersianDigits(p.phone)}` : "موبایل: — (تکمیل کنید)",
+        p.address ? `آدرس: ${p.address}` : "آدرس: — (اختیاری)",
       ].join("\n")
     : "👤 هنوز پروفایلی نساخته‌اید.";
   await ctx.reply(text, {
@@ -557,24 +629,27 @@ async function showProfile(ctx: Context, app: BotApp): Promise<void> {
   });
 }
 
-/** Ask for profile fields as "نام | نام خانوادگی | موبایل" in one message. */
-async function startProfileEdit(ctx: Context, app: BotApp): Promise<void> {
+/**
+ * Step-by-step profile wizard: name → phone → optional address. Each answer is
+ * validated as it arrives; the phone must match the mobile pattern (Persian
+ * digits are converted). /cancel aborts at any step.
+ */
+export async function startProfileEdit(ctx: Context, app: BotApp): Promise<void> {
   const userId = ctx.from!.id;
   const p = app.customers.getProfile(userId);
-  app.profileEdit.expect(userId);
-  const example = p
-    ? `${p.firstName} | ${p.lastName ?? ""} | ${p.phone ?? "09123456789"}`
-    : "علی | رضایی | 09123456789";
+  app.profileEdit.expect(userId, "name");
   await ctx.reply(
     [
-      "✏️ اطلاعات پروفایل را در یک پیام بفرستید:",
-      "نام | نام خانوادگی | شماره موبایل",
+      "✏️ ویرایش پروفایل",
       "",
-      `مثال: ${example}`,
-      "نام و موبایل الزامی است. برای لغو /cancel را بفرستید.",
-    ].join("\n"),
+      "۱ از ۳ — نام و نام خانوادگی خود را بفرستید:",
+      p?.fullName ? `نام فعلی: ${p.fullName}` : "",
+      "",
+      "برای لغو /cancel را بفرستید.",
+    ]
+      .filter(Boolean)
+      .join("\n"),
   );
-  void app;
 }
 
 async function showWallet(ctx: Context, app: BotApp): Promise<void> {
@@ -609,16 +684,22 @@ async function showWalletHistory(ctx: Context, app: BotApp): Promise<void> {
 
 async function startDeposit(ctx: Context, app: BotApp): Promise<void> {
   const userId = ctx.from!.id;
-  app.depositFlow.expect(userId);
   const { payment } = app.orders.getPaymentInstructions(userId);
+  // Top-ups are paid by card, so they follow the card-to-card switch.
+  if (!cardToCardAvailable(payment)) {
+    await ctx.reply(
+      "شارژ کیف پول در حال حاضر غیرفعال است؛ برای هماهنگی با کافه تماس بگیرید.",
+      { reply_markup: walletKeyboard() },
+    );
+    return;
+  }
+  app.depositFlow.expect(userId);
   await ctx.reply(
     [
       "💰 مبلغ شارژ را به تومان بفرستید (فقط عدد). مثلاً:",
       "۱۰۰۰۰۰",
       "",
-      payment.cardNumber
-        ? `پس از انتخاب مبلغ، کارت به کارت کنید:\nشماره کارت: ${payment.cardNumber}\nبه نام: ${payment.cardholderName || "—"}`
-        : "روش پرداخت هنوز تنظیم نشده است.",
+      `پس از انتخاب مبلغ، کارت به کارت کنید:\nشماره کارت: ${payment.cardNumber}\nبه نام: ${payment.cardholderName || "—"}`,
     ].join("\n"),
   );
 }

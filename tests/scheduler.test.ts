@@ -43,7 +43,7 @@ function placeOrder(userId: number, name = "Customer") {
   cart.addItem(userId, product.id, null, 1);
   orders.startCheckout(userId);
   orders.attachReceipt(userId, `file-${userId}`, userId);
-  orders.setDeliveryNotes(userId, null);
+  cart.setFulfillmentMethod(userId, "pickup");
   const conf = orders.confirmOrder(userId, name);
   if (!conf.ok) throw new Error("order failed");
   return conf.order;

@@ -7,12 +7,13 @@ import { OrdersService } from "../src/services/orders";
 import { BusinessHoursService } from "../src/services/business-hours";
 import { CustomersService, normalizePhone } from "../src/services/customers";
 import { LoyaltyService } from "../src/services/loyalty";
-import { updatePaymentSettings, getAiSettings, updateAiSettings, getNotificationSettings, updateNotificationSettings } from "../src/services/settings";
+import { updatePaymentSettings, getPaymentSettings, cardToCardAvailable, getAiSettings, updateAiSettings, getNotificationSettings, updateNotificationSettings } from "../src/services/settings";
 import { handleAdminApi } from "../src/api/routes/admin";
 import { signInitData } from "../src/api/middleware/auth";
 import { loadConfig } from "../src/config";
 import { ReportService } from "../src/services/reports";
 import { NotificationService } from "../src/services/notifications";
+import { Scheduler } from "../src/scheduler";
 
 let db: Db;
 let menu: MenuService;
@@ -42,24 +43,24 @@ beforeEach(() => {
 
 describe("customer profile", () => {
   test("creates and associates a profile with the Telegram id", () => {
-    const r = customers.saveProfile(555, { firstName: "علی", lastName: "رضایی", phone: "09121234567" });
+    const r = customers.saveProfile(555, { fullName: "علی رضایی", phone: "09121234567" });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.profile.telegramId).toBe(555);
-    expect(r.profile.firstName).toBe("علی");
+    expect(r.profile.fullName).toBe("علی رضایی");
     expect(customers.getProfile(666)).toBeNull(); // isolated per user
   });
 
   test("updates an existing profile", () => {
-    customers.saveProfile(555, { firstName: "علی" });
-    const r = customers.saveProfile(555, { firstName: "علی", phone: "09121234567" });
+    customers.saveProfile(555, { fullName: "علی رضایی" });
+    const r = customers.saveProfile(555, { fullName: "علی رضایی", phone: "09121234567" });
     expect(r.ok).toBe(true);
     expect(customers.getProfile(555)?.phone).toBe("09121234567");
   });
 
   test("rejects empty name and invalid phone", () => {
-    expect(customers.saveProfile(555, { firstName: "" }).ok).toBe(false);
-    const r = customers.saveProfile(555, { firstName: "x", phone: "123" });
+    expect(customers.saveProfile(555, { fullName: "" }).ok).toBe(false);
+    const r = customers.saveProfile(555, { fullName: "x", phone: "123" });
     expect(r.ok).toBe(false);
   });
 
@@ -68,6 +69,16 @@ describe("customer profile", () => {
     expect(normalizePhone("+989121234567")).toBe("09121234567");
     expect(normalizePhone("9121234567")).toBe("09121234567");
     expect(normalizePhone("garbage")).toBeNull();
+  });
+
+  test("saves and clears an optional address", () => {
+    customers.saveProfile(555, { fullName: "علی رضایی", phone: "09121234567", address: "تهران، خیابان ولیعصر" });
+    expect(customers.getProfile(555)?.address).toBe("تهران، خیابان ولیعصر");
+    // Omitting address keeps it; explicit null clears it.
+    customers.saveProfile(555, { fullName: "علی رضایی" });
+    expect(customers.getProfile(555)?.address).toBe("تهران، خیابان ولیعصر");
+    customers.saveProfile(555, { fullName: "علی رضایی", address: null });
+    expect(customers.getProfile(555)?.address).toBeNull();
   });
 });
 
@@ -141,7 +152,7 @@ describe("wallet order payment", () => {
     cart.addItem(userId, waterId, null, 2);
     orders.startCheckout(userId);
     orders.attachReceipt(userId, "f", 1);
-    orders.setDeliveryNotes(userId, null);
+    cart.setFulfillmentMethod(userId, "pickup");
     return orders.confirmOrder(userId, "Cust", payWithWallet);
   }
 
@@ -236,7 +247,7 @@ describe("after-hours pricing", () => {
     cart.addItem(555, waterId, null, 2);
     orders.startCheckout(555);
     orders.attachReceipt(555, "f", 1);
-    orders.setDeliveryNotes(555, null);
+    cart.setFulfillmentMethod(555, "pickup");
     const conf = orders.confirmOrder(555, "Cust");
     expect(conf.ok).toBe(true);
     if (!conf.ok) return;
@@ -278,7 +289,7 @@ describe("order lifecycle", () => {
     cart.addItem(555, waterId, null, 1);
     orders.startCheckout(555);
     orders.attachReceipt(555, "f", 1);
-    orders.setDeliveryNotes(555, null);
+    cart.setFulfillmentMethod(555, "pickup");
     const conf = orders.confirmOrder(555, "Cust");
     if (!conf.ok) throw new Error("order failed");
     return conf.order.id;
@@ -336,7 +347,7 @@ describe("loyalty", () => {
     cart.addItem(userId, waterId, null, 1);
     orders.startCheckout(userId);
     orders.attachReceipt(userId, `f-${userId}`, 1);
-    orders.setDeliveryNotes(userId, null);
+    cart.setFulfillmentMethod(userId, "pickup");
     const conf = orders.confirmOrder(userId, "C");
     expect(conf.ok).toBe(true);
   }
@@ -357,7 +368,7 @@ describe("loyalty", () => {
     cart.addItem(555, waterId, null, 1);
     orders.startCheckout(555);
     orders.attachReceipt(555, "f", 1);
-    orders.setDeliveryNotes(555, null);
+    cart.setFulfillmentMethod(555, "pickup");
     const conf = orders.confirmOrder(555, "C") as any;
     const id = conf.order.id;
     const r = loyalty.saveRating(id, 555, 5, "عالی");
@@ -448,7 +459,7 @@ describe("admin order lifecycle API", () => {
     cart.addItem(555, waterId, null, 1);
     orders.startCheckout(555);
     orders.attachReceipt(555, "f", 1);
-    orders.setDeliveryNotes(555, null);
+    cart.setFulfillmentMethod(555, "pickup");
     const conf = orders.confirmOrder(555, "Cust");
     if (!conf.ok) throw new Error("order failed");
     return { id: conf.order.id, orderNumber: conf.order.orderNumber };
@@ -500,6 +511,81 @@ describe("admin order lifecycle API", () => {
     expect(b.outstanding).toBe(15000);
   });
 
+  test("customer list merges profiles, wallets, and order-only customers", async () => {
+    // 555: profile + order; 666: order without any saved profile.
+    customers.saveProfile(555, { fullName: "علی رضایی", phone: "09121234567" });
+    place();
+    cart.addItem(666, waterId, null, 1);
+    orders.startCheckout(666);
+    orders.attachReceipt(666, "f-666", 1);
+    cart.setFulfillmentMethod(666, "pickup");
+    const conf2 = orders.confirmOrder(666, "Customer2");
+    expect(conf2.ok).toBe(true);
+
+    const r = await call("GET", "/api/admin/customers");
+    expect(r.status).toBe(200);
+    const byId = new Map((r.body as any[]).map((c: any) => [c.id, c]));
+    expect(byId.size).toBe(2);
+    expect(byId.get(555)!.name).toBe("علی رضایی");
+    expect(byId.get(555)!.phone).toBe("09121234567");
+    expect(byId.get(555)!.orderCount).toBe(1);
+    expect(byId.get(555)!.orderValue).toBe(15000);
+    // Order-only customer appears with a null name for the UI to fall back on.
+    expect(byId.get(666)!.name).toBeNull();
+    expect(byId.get(666)!.orderCount).toBe(1);
+
+    // Server-side search by name and by phone.
+    const byName = await call("GET", "/api/admin/customers?q=رضایی");
+    expect(byName.body.map((c: any) => c.id)).toEqual([555]);
+    const byPhone = await call("GET", "/api/admin/customers?q=09121234567");
+    expect(byPhone.body.map((c: any) => c.id)).toEqual([555]);
+    const none = await call("GET", "/api/admin/customers?q=ندارد");
+    expect(none.body).toEqual([]);
+  });
+
+  test("customer list shows wallet balance without raw internals in labels", async () => {
+    const dep = customers.createDeposit(555, 40000);
+    if (!dep.ok) throw new Error("deposit failed");
+    await call("POST", `/api/admin/wallet/deposits/${dep.deposit.id}/approve`);
+    customers.saveProfile(555, { fullName: "علی" });
+
+    const r = await call("GET", "/api/admin/customers");
+    const row = r.body.find((c: any) => c.id === 555);
+    expect(row.balance).toBe(40000);
+    // The list payload carries no service-internal fields.
+    expect(row.telegramId).toBeUndefined();
+    expect(row.id).toBe(555);
+  });
+
+  test("customer detail labels wallet transactions and order statuses in Persian", async () => {
+    const dep = customers.createDeposit(555, 40000);
+    if (!dep.ok) throw new Error("deposit failed");
+    await call("POST", `/api/admin/wallet/deposits/${dep.deposit.id}/approve`);
+    // Pay an order from the wallet so the ledger records a debit.
+    cart.addItem(555, waterId, null, 1);
+    orders.startCheckout(555);
+    orders.attachReceipt(555, "f", 1);
+    cart.setFulfillmentMethod(555, "pickup");
+    const conf = orders.confirmOrder(555, "Cust", true);
+    expect(conf.ok).toBe(true);
+    if (!conf.ok) return;
+    await call("POST", `/api/admin/orders/${conf.order.orderNumber}/confirm`);
+
+    const detail = await call("GET", "/api/admin/customers/555");
+    const b = detail.body as any;
+    const txKinds = b.transactions.map((t: any) => t.kindLabel);
+    expect(txKinds).toContain("واریز به کیف پول");
+    expect(txKinds).toContain("پرداخت سفارش");
+    for (const t of b.transactions) {
+      expect(t.kind).toBeUndefined(); // raw enum never leaves the API
+      expect(t.time).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+    }
+    const o = b.orders[0];
+    expect(o.fulfillmentLabel).toBe("تأیید شده");
+    expect(o.paymentMethodLabel).toBe("کیف پول");
+    expect(o.paymentLabel).toBeTruthy();
+  });
+
   test("customer notifications enqueue on confirm/deliver and respect toggles", async () => {
     const { orderNumber } = place();
     await call("POST", `/api/admin/orders/${orderNumber}/confirm`);
@@ -512,5 +598,541 @@ describe("admin order lifecycle API", () => {
     await call("POST", `/api/admin/orders/${second.orderNumber}/confirm`);
     rows = db.query("SELECT * FROM notifications WHERE kind = 'customer_notice'").all() as any[];
     expect(rows.some((r) => r.ref_key === `order_confirmed_${second.orderNumber}`)).toBe(false);
+  });
+
+  test("admin can credit and debit a customer wallet via the API", async () => {
+    customers.saveProfile(555, { fullName: "علی" });
+    const credit = await call("POST", "/api/admin/customers/555/wallet", {
+      amount: 50000,
+      note: "تخفیف همکاری",
+    });
+    expect(credit.status).toBe(200);
+    expect(credit.body.balance).toBe(50000);
+
+    const debit = await call("POST", "/api/admin/customers/555/wallet", { amount: -20000 });
+    expect(debit.status).toBe(200);
+    expect(debit.body.balance).toBe(30000);
+
+    // Ledger records both, with Persian kind labels and the admin actor.
+    const detail = await call("GET", "/api/admin/customers/555");
+    const kinds = detail.body.transactions.map((t: any) => t.kindLabel);
+    expect(kinds).toContain("تنظیم موجودی");
+    expect(detail.body.balance).toBe(30000);
+    // Rows are append-only: two distinct adjustments, both present.
+    const adjustments = detail.body.transactions.filter((t: any) => t.kindLabel === "تنظیم موجودی");
+    expect(adjustments.length).toBe(2);
+  });
+
+  test("a wallet adjustment queues exactly one notice for the customer", async () => {
+    customers.saveProfile(555, { fullName: "علی" });
+    const r = await call("POST", "/api/admin/customers/555/wallet", {
+      amount: 50000,
+      note: "تخفیف همکاری",
+    });
+    expect(r.status).toBe(200);
+    expect((r.body as any).notified).toBe(true);
+
+    const rows = db
+      .query("SELECT * FROM notifications WHERE kind = 'wallet_adjustment'")
+      .all() as any[];
+    expect(rows.length).toBe(1);
+    expect(rows[0].recipient_id).toBe(555);
+    const payload = JSON.parse(rows[0].payload);
+    expect(payload.text).toContain("افزایش");
+    expect(payload.text).toContain("50,000");
+    expect(payload.text).toContain("تخفیف همکاری");
+    // The ref key is the ledger transaction id, so it is unique per change.
+    expect(rows[0].ref_key).toMatch(/^wallet_tx_\d+$/);
+  });
+
+  test("a debit notice reports the reduction and the new balance", async () => {
+    customers.saveProfile(555, { fullName: "علی" });
+    await call("POST", "/api/admin/customers/555/wallet", { amount: 50000 });
+    await call("POST", "/api/admin/customers/555/wallet", { amount: -20000, note: "اصلاح" });
+
+    const rows = db
+      .query("SELECT * FROM notifications WHERE kind = 'wallet_adjustment' ORDER BY id")
+      .all() as any[];
+    expect(rows.length).toBe(2);
+    const second = JSON.parse(rows[1].payload);
+    expect(second.text).toContain("کاهش");
+    expect(second.text).toContain("20,000");
+    expect(second.text).toContain("30,000"); // balance after
+    expect(second.text).toContain("اصلاح");
+  });
+
+  test("a rejected adjustment queues no notice", async () => {
+    customers.saveProfile(555, { fullName: "علی" });
+    const r = await call("POST", "/api/admin/customers/555/wallet", { amount: -99999 });
+    expect(r.status).toBe(400); // balance would go negative
+    const rows = db
+      .query("SELECT * FROM notifications WHERE kind = 'wallet_adjustment'")
+      .all() as any[];
+    expect(rows.length).toBe(0);
+  });
+
+  test("the wallet notice is delivered to the customer by the scheduler", async () => {
+    customers.saveProfile(555, { fullName: "علی" });
+    await call("POST", "/api/admin/customers/555/wallet", { amount: 50000, note: "هدیه" });
+
+    const sent: { chatId: number; text: string }[] = [];
+    const scheduler = new Scheduler({
+      db,
+      bot: {
+        api: {
+          sendMessage: async (chatId: number, text: string) => {
+            sent.push({ chatId, text });
+          },
+        },
+      } as any,
+      reports: apiApp.reports,
+      notifications: apiApp.notifications,
+      businessHours: bh,
+      orders,
+    });
+    await scheduler.tick();
+
+    expect(sent.length).toBe(1);
+    expect(sent[0]!.chatId).toBe(555);
+    expect(sent[0]!.text).toContain("50,000");
+    expect(sent[0]!.text).toContain("هدیه");
+    // Delivered exactly once.
+    const row = db.query("SELECT status FROM notifications WHERE kind = 'wallet_adjustment'").get() as any;
+    expect(row.status).toBe("sent");
+  });
+
+  test("wallet adjustment rejects invalid amounts and unknown customers", async () => {
+    customers.saveProfile(555, { fullName: "علی" });
+    const zero = await call("POST", "/api/admin/customers/555/wallet", { amount: 0 });
+    expect(zero.status).toBe(400);
+    const overdraw = await call("POST", "/api/admin/customers/555/wallet", { amount: -99999 });
+    expect(overdraw.status).toBe(400); // balance would go negative
+    const unknown = await call("POST", "/api/admin/customers/424242/wallet", { amount: 1000 });
+    expect(unknown.status).toBe(400);
+  });
+
+  test("recordSender stores the Telegram username on the profile", () => {
+    customers.recordSender(555, { firstName: "علی", lastName: "رضایی", username: "ali_dev" });
+    const p = customers.getProfile(555);
+    expect(p!.fullName).toBe("علی رضایی");
+    expect(p!.username).toBe("ali_dev");
+    // A later order-only identity upsert must not clobber the saved phone.
+    customers.saveProfile(555, { fullName: "علی رضایی", phone: "09121234567" });
+    customers.recordSender(555, { firstName: "علی", username: "ali_dev" });
+    expect(customers.getProfile(555)!.phone).toBe("09121234567");
+  });
+
+  test("customer list and detail expose username for the chat link", async () => {
+    customers.recordSender(555, { firstName: "علی", lastName: "رضایی", username: "ali_dev" });
+    const list = await call("GET", "/api/admin/customers");
+    const row = list.body.find((c: any) => c.id === 555);
+    expect(row.username).toBe("ali_dev");
+    // Search by username works.
+    const byU = await call("GET", "/api/admin/customers?q=ali_dev");
+    expect(byU.body.map((c: any) => c.id)).toContain(555);
+    const detail = await call("GET", "/api/admin/customers/555");
+    expect(detail.body.profile.username).toBe("ali_dev");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Admin payment review (card-to-card receipts)
+// ---------------------------------------------------------------------------
+
+describe("admin payment review API", () => {
+  let apiApp: any;
+  const ADMIN = { id: 777, first_name: "Admin" };
+  const NOW_S = () => Math.floor(Date.now() / 1000);
+
+  function headers(): Record<string, string> {
+    return {
+      "content-type": "application/json",
+      "x-telegram-init-data": signInitData("123456:TEST-ADM-TOKEN", ADMIN as any, NOW_S()),
+    };
+  }
+
+  async function call(method: string, path: string, body?: unknown) {
+    return handleAdminApi(
+      new Request(`http://localhost${path}`, {
+        method,
+        headers: headers(),
+        body: body === undefined ? undefined : JSON.stringify(body),
+      }),
+      apiApp,
+    ).then(async (r) => ({ status: r!.status, body: await r!.json() }));
+  }
+
+  beforeEach(() => {
+    const config = loadConfig({
+      BOT_TOKEN: "123456:TEST-ADM-TOKEN",
+      ADMIN_IDS: "777",
+      TIMEZONE: "Asia/Tehran",
+      APP_BASE_URL: "https://cafe.example.com",
+    });
+    apiApp = {
+      config,
+      db,
+      menu,
+      orders,
+      businessHours: bh,
+      reports: new ReportService(db, bh, new NotificationService(db), "Asia/Tehran"),
+      notifications: new NotificationService(db),
+      uploadsDir: "/tmp/cafe-uploads-test",
+      customers,
+      loyalty,
+    };
+  });
+
+  /** Place a card-to-card order with a receipt, exactly like the bot does. */
+  function placeCardOrder(): { orderNumber: string } {
+    cart.addItem(555, waterId, null, 1);
+    orders.startCheckout(555);
+    orders.choosePaymentMethod(555, "card_to_card");
+    orders.attachReceipt(555, "receipt-file", 1);
+    cart.setFulfillmentMethod(555, "pickup");
+    const conf = orders.confirmOrder(555, "Cust");
+    if (!conf.ok) throw new Error("order failed");
+    return { orderNumber: conf.order.orderNumber };
+  }
+
+  test("approving a receipt marks the order paid and is idempotent", async () => {
+    const { orderNumber } = placeCardOrder();
+    const r = await call("POST", `/api/admin/orders/${orderNumber}/payment/approve`);
+    expect(r.status).toBe(200);
+    expect((r.body as any).already).toBe(false);
+    expect((r.body as any).order.paymentStatus).toBe("paid");
+    expect((r.body as any).order.paymentLabel).toBe("پرداخت شده");
+
+    const again = await call("POST", `/api/admin/orders/${orderNumber}/payment/approve`);
+    expect(again.status).toBe(200);
+    expect((again.body as any).already).toBe(true);
+
+    const o = orders.findByNumber(orderNumber)!;
+    expect(o.paymentStatus).toBe("paid");
+    expect(o.paymentReviewedBy).toBe(777);
+    expect(o.paymentReviewedAt).not.toBeNull();
+  });
+
+  test("rejecting a receipt records the decision without marking it paid", async () => {
+    const { orderNumber } = placeCardOrder();
+    const r = await call("POST", `/api/admin/orders/${orderNumber}/payment/reject`);
+    expect(r.status).toBe(200);
+    expect((r.body as any).order.paymentStatus).toBe("rejected");
+    expect((r.body as any).order.paymentLabel).toBe("رسید رد شده");
+    // A rejected payment can still be approved later (admin re-checked it).
+    const approve = await call("POST", `/api/admin/orders/${orderNumber}/payment/approve`);
+    expect(approve.status).toBe(200);
+    expect((approve.body as any).order.paymentStatus).toBe("paid");
+  });
+
+  test("a paid order cannot be rejected", async () => {
+    const { orderNumber } = placeCardOrder();
+    await call("POST", `/api/admin/orders/${orderNumber}/payment/approve`);
+    const r = await call("POST", `/api/admin/orders/${orderNumber}/payment/reject`);
+    expect(r.status).toBe(400);
+    expect(orders.findByNumber(orderNumber)!.paymentStatus).toBe("paid");
+  });
+
+  test("a wallet order has no receipt to review", async () => {
+    const dep = customers.createDeposit(555, 50000);
+    if (!dep.ok) throw new Error("deposit failed");
+    customers.approveDeposit(dep.deposit.id, 777);
+    cart.addItem(555, waterId, null, 1);
+    orders.startCheckout(555);
+    orders.choosePaymentMethod(555, "wallet");
+    cart.setFulfillmentMethod(555, "pickup");
+    const conf = orders.confirmOrder(555, "Cust");
+    expect(conf.ok).toBe(true);
+    if (!conf.ok) return;
+
+    // Already paid at creation: approving is a no-op, never a second charge.
+    const r = await call("POST", `/api/admin/orders/${conf.order.orderNumber}/payment/approve`);
+    expect(r.status).toBe(200);
+    expect((r.body as any).already).toBe(true);
+    expect(customers.getBalance(555)).toBe(50000 - 15000);
+    // And there is no receipt to fetch.
+    const receipt = await call("GET", `/api/admin/orders/${conf.order.orderNumber}/receipt`);
+    expect(receipt.status).toBe(404);
+  });
+
+  test("the receipt endpoint returns the file id, never a bot token", async () => {
+    const { orderNumber } = placeCardOrder();
+    const r = await call("GET", `/api/admin/orders/${orderNumber}/receipt`);
+    expect(r.status).toBe(200);
+    expect((r.body as any).fileId).toBe("receipt-file");
+    expect(JSON.stringify(r.body)).not.toContain("TEST-ADM-TOKEN");
+  });
+
+  test("the receipt image is proxied server-side (the bot token never reaches the browser)", async () => {
+    const { orderNumber } = placeCardOrder();
+    const requested: string[] = [];
+    apiApp.bot = {
+      api: {
+        getFile: async (fileId: string) => {
+          expect(fileId).toBe("receipt-file");
+          return { file_path: "photos/receipt.jpg" };
+        },
+      },
+    };
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string) => {
+      requested.push(String(url));
+      return new Response(new Uint8Array([1, 2, 3]), {
+        headers: { "content-type": "image/jpeg" },
+      });
+    }) as unknown as typeof fetch;
+    try {
+      const res = await handleAdminApi(
+        new Request(`http://localhost/api/admin/orders/${orderNumber}/receipt/image`, {
+          headers: headers(),
+        }),
+        apiApp,
+      );
+      expect(res!.status).toBe(200);
+      expect(res!.headers.get("content-type")).toBe("image/jpeg");
+      // The upstream URL carries the token; the response body/headers must not.
+      expect(requested[0]).toContain("TEST-ADM-TOKEN");
+      const headerDump: string[] = [];
+      res!.headers.forEach((v, k) => headerDump.push(`${k}: ${v}`));
+      expect(headerDump.join("\n")).not.toContain("TEST-ADM-TOKEN");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("a failing receipt image fetch degrades to a 502, never a crash", async () => {
+    const { orderNumber } = placeCardOrder();
+    apiApp.bot = { api: { getFile: async () => ({ file_path: "photos/receipt.jpg" }) } };
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response("nope", { status: 500 })) as unknown as typeof fetch;
+    try {
+      const res = await handleAdminApi(
+        new Request(`http://localhost/api/admin/orders/${orderNumber}/receipt/image`, {
+          headers: headers(),
+        }),
+        apiApp,
+      );
+      expect(res!.status).toBe(502);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("the receipt image route is unavailable without a bot (no crash)", async () => {
+    const { orderNumber } = placeCardOrder();
+    const res = await handleAdminApi(
+      new Request(`http://localhost/api/admin/orders/${orderNumber}/receipt/image`, {
+        headers: headers(),
+      }),
+      apiApp,
+    );
+    expect(res!.status).toBe(503);
+  });
+
+  test("payment approval notifies the customer exactly once", async () => {
+    const { orderNumber } = placeCardOrder();
+    await call("POST", `/api/admin/orders/${orderNumber}/payment/approve`);
+    const rows = db
+      .query("SELECT * FROM notifications WHERE kind = 'customer_notice'")
+      .all() as any[];
+    expect(rows.filter((r) => r.ref_key === `payment_approved_${orderNumber}`).length).toBe(1);
+    // A repeated approval must not enqueue a second notice.
+    await call("POST", `/api/admin/orders/${orderNumber}/payment/approve`);
+    const after = db
+      .query("SELECT * FROM notifications WHERE kind = 'customer_notice'")
+      .all() as any[];
+    expect(after.filter((r) => r.ref_key === `payment_approved_${orderNumber}`).length).toBe(1);
+  });
+
+  test("order DTO exposes the payment method and status for the panel", async () => {
+    const { orderNumber } = placeCardOrder();
+    const list = await call("GET", "/api/admin/orders");
+    const o = (list.body as any[]).find((x) => x.orderNumber === orderNumber);
+    expect(o.paymentMethod).toBe("card_to_card");
+    expect(o.paymentMethodLabel).toBe("کارت به کارت");
+    expect(o.paymentStatus).toBe("receipt_received");
+    expect(o.hasReceipt).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Payment method switches (admin)
+// ---------------------------------------------------------------------------
+
+describe("payment method switches", () => {
+  let apiApp: any;
+  const ADMIN = { id: 777, first_name: "Admin" };
+  const NOW_S = () => Math.floor(Date.now() / 1000);
+
+  function headers(): Record<string, string> {
+    return {
+      "content-type": "application/json",
+      "x-telegram-init-data": signInitData("123456:TEST-ADM-TOKEN", ADMIN as any, NOW_S()),
+    };
+  }
+
+  async function call(method: string, path: string, body?: unknown) {
+    return handleAdminApi(
+      new Request(`http://localhost${path}`, {
+        method,
+        headers: headers(),
+        body: body === undefined ? undefined : JSON.stringify(body),
+      }),
+      apiApp,
+    ).then(async (r) => ({ status: r!.status, body: await r!.json() }));
+  }
+
+  beforeEach(() => {
+    const config = loadConfig({
+      BOT_TOKEN: "123456:TEST-ADM-TOKEN",
+      ADMIN_IDS: "777",
+      TIMEZONE: "Asia/Tehran",
+      APP_BASE_URL: "https://cafe.example.com",
+    });
+    apiApp = {
+      config,
+      db,
+      menu,
+      orders,
+      businessHours: bh,
+      reports: new ReportService(db, bh, new NotificationService(db), "Asia/Tehran"),
+      notifications: new NotificationService(db),
+      uploadsDir: "/tmp/cafe-uploads-test",
+      customers,
+      loyalty,
+    };
+  });
+
+  test("both methods default to enabled", () => {
+    const p = getPaymentSettings(db);
+    expect(p.cardToCardEnabled).toBe(true);
+    expect(p.walletEnabled).toBe(true);
+  });
+
+  test("switches persist and are returned by the API", async () => {
+    const r = await call("PUT", "/api/admin/settings/payment", {
+      cardNumber: "603799",
+      cardholderName: "Ali",
+      currency: "تومان",
+      cardToCardEnabled: false,
+      walletEnabled: true,
+    });
+    expect(r.status).toBe(200);
+    expect((r.body as any).cardToCardEnabled).toBe(false);
+    expect((r.body as any).walletEnabled).toBe(true);
+    expect(getPaymentSettings(db).cardToCardEnabled).toBe(false);
+  });
+
+  test("refuses to disable both methods at once", async () => {
+    const r = await call("PUT", "/api/admin/settings/payment", {
+      cardNumber: "603799",
+      cardholderName: "Ali",
+      currency: "تومان",
+      cardToCardEnabled: false,
+      walletEnabled: false,
+    });
+    expect(r.status).toBe(400);
+    // Nothing was written — the cafe can still take money.
+    expect(getPaymentSettings(db).cardToCardEnabled).toBe(true);
+    expect(getPaymentSettings(db).walletEnabled).toBe(true);
+  });
+
+  test("refuses to enable card-to-card without a card number", async () => {
+    const r = await call("PUT", "/api/admin/settings/payment", {
+      cardNumber: "",
+      cardholderName: "",
+      currency: "تومان",
+      cardToCardEnabled: true,
+    });
+    expect(r.status).toBe(400);
+    expect(getPaymentSettings(db).cardNumber).toBe("603799"); // unchanged
+  });
+
+  test("a partial update leaves the other switch untouched", async () => {
+    await call("PUT", "/api/admin/settings/payment", {
+      cardNumber: "603799",
+      cardholderName: "Ali",
+      currency: "تومان",
+      walletEnabled: false,
+    });
+    const p = getPaymentSettings(db);
+    expect(p.walletEnabled).toBe(false);
+    expect(p.cardToCardEnabled).toBe(true);
+  });
+
+  test("checkout refuses a wallet order once the switch is off", () => {
+    const dep = customers.createDeposit(555, 50000);
+    if (!dep.ok) throw new Error("deposit failed");
+    customers.approveDeposit(dep.deposit.id, 777);
+    updatePaymentSettings(db, {
+      cardNumber: "603799",
+      cardholderName: "Ali",
+      currency: "تومان",
+      walletEnabled: false,
+    });
+    cart.addItem(555, waterId, null, 1);
+    orders.startCheckout(555);
+    const pick = orders.choosePaymentMethod(555, "wallet");
+    expect(pick.ok).toBe(false);
+    if (pick.ok) return;
+    expect(pick.error).toContain("غیرفعال");
+    // The balance is untouched and the customer can still pay by card.
+    expect(customers.getBalance(555)).toBe(50000);
+    expect(orders.choosePaymentMethod(555, "card_to_card").ok).toBe(true);
+  });
+
+  test("a wallet order already at the confirm stage is refused after the switch flips", () => {
+    const dep = customers.createDeposit(555, 50000);
+    if (!dep.ok) throw new Error("deposit failed");
+    customers.approveDeposit(dep.deposit.id, 777);
+    cart.addItem(555, waterId, null, 1);
+    orders.startCheckout(555);
+    expect(orders.choosePaymentMethod(555, "wallet").ok).toBe(true);
+    // Admin disables wallet payment while the customer is confirming.
+    updatePaymentSettings(db, {
+      cardNumber: "603799",
+      cardholderName: "Ali",
+      currency: "تومان",
+      walletEnabled: false,
+    });
+    const conf = orders.confirmOrder(555, "Cust");
+    expect(conf.ok).toBe(false);
+    expect(customers.getBalance(555)).toBe(50000); // never charged
+    expect(orders.listForCustomer(555).length).toBe(0);
+  });
+
+  test("checkout refuses card-to-card once the switch is off", () => {
+    // A funded wallet keeps checkout reachable so the card choice is the thing
+    // under test, not the "nothing can pay" guard.
+    const dep = customers.createDeposit(555, 50000);
+    if (!dep.ok) throw new Error("deposit failed");
+    customers.approveDeposit(dep.deposit.id, 777);
+    updatePaymentSettings(db, {
+      cardNumber: "603799",
+      cardholderName: "Ali",
+      currency: "تومان",
+      cardToCardEnabled: false,
+    });
+    cart.addItem(555, waterId, null, 1);
+    const co = orders.startCheckout(555);
+    expect(co.ok).toBe(true);
+    const pick = orders.choosePaymentMethod(555, "card_to_card");
+    expect(pick.ok).toBe(false);
+    if (pick.ok) return;
+    expect(pick.error).toContain("غیرفعال");
+    // Wallet payment is still available.
+    expect(orders.choosePaymentMethod(555, "wallet").ok).toBe(true);
+  });
+
+  test("deposits are refused while card-to-card is off (top-ups are paid by card)", () => {
+    updatePaymentSettings(db, {
+      cardNumber: "603799",
+      cardholderName: "Ali",
+      currency: "تومان",
+      cardToCardEnabled: false,
+    });
+    // The service still records the request; the bot refuses to start the flow.
+    // What matters here is that the availability helper reports it unusable.
+    expect(cardToCardAvailable(getPaymentSettings(db))).toBe(false);
   });
 });

@@ -18,6 +18,7 @@ import type { TokenService } from "./tokens";
  *  clr          clear-cart confirmation prompt
  *  clry:<tok>   confirmed clear
  *  co           start checkout
+ *  pm:w / pm:c  choose wallet / card-to-card payment
  *  skip         skip delivery notes
  *  cf:<tok>     final confirm
  *  cx           cancel checkout
@@ -139,24 +140,56 @@ export function checkoutKeyboard(
   telegramId: number,
   stage: "receipt" | "confirm",
   tokens: TokenService,
-  walletBalance?: number,
 ): InlineKeyboard {
   if (stage === "receipt") {
     return new InlineKeyboard().text("🛒 سبد خرید", "cart").text("❌ انصراف از خرید", "cx");
   }
   const tok = tokens.mint(telegramId, "cf");
-  const kb = new InlineKeyboard().text("✅ تأیید و ثبت نهایی", `cf:${tok}`);
-  // Offer wallet payment when the balance is enough to cover the order.
-  if (walletBalance !== undefined && walletBalance > 0) {
-    const wtok = tokens.mint(telegramId, "wp");
-    kb.text(`💰 پرداخت از کیف پول`, `wp:${wtok}`);
+  return new InlineKeyboard()
+    .text("✅ تأیید و ثبت نهایی", `cf:${tok}`)
+    .row()
+    .text("🛒 سبد خرید", "cart")
+    .text("❌ انصراف", "cx");
+}
+
+/**
+ * Payment-method picker shown right after «تسویه حساب». Each button appears
+ * only when that method is both enabled by the admin and actually usable
+ * (wallet balance covers the order / a card number is configured). The server
+ * revalidates everything on press.
+ */
+export function paymentMethodKeyboard(opts: {
+  walletBalance: number;
+  total: number;
+  walletEnabled: boolean;
+  cardEnabled: boolean;
+}): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  if (opts.walletEnabled && opts.walletBalance >= opts.total) {
+    kb.text("💰 پرداخت از کیف پول", "pm:w").row();
   }
-  kb.text("🛒 سبد خرید", "cart").row().text("❌ انصراف", "cx");
+  if (opts.cardEnabled) {
+    kb.text("💳 کارت به کارت", "pm:c").row();
+  }
+  kb.text("🛒 سبد خرید", "cart").text("❌ انصراف", "cx");
   return kb;
 }
 
 export function deliveryKeyboard(): InlineKeyboard {
-  return new InlineKeyboard().text("⏭ بدون اطلاعات تحویل", "skip").text("🛒 سبد خرید", "cart");
+  return new InlineKeyboard().text("⏭ بدون یادداشت", "skip").text("🛒 سبد خرید", "cart");
+}
+
+/**
+ * Fulfillment picker after payment: delivery (if the customer has an address)
+ * or pickup. The delivery button is only rendered when an address exists —
+ * the server revalidates on press anyway.
+ */
+export function fulfillmentKeyboard(hasAddress: boolean): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  if (hasAddress) kb.text("🛵 ارسال به آدرس من", "fm:d").row();
+  kb.text("🏪 خودم می‌آم تحویل بگیرم", "fm:p").row();
+  kb.text("❌ انصراف", "cx");
+  return kb;
 }
 
 /** Wallet main view: deposit, history, back. */

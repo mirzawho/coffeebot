@@ -19,10 +19,13 @@ export const HELP_TEXT = `راهنما:
   «یه اسپرسو سینگل می‌خوام» / «تعداد کاپوچینو رو دو تا کن» / «اسپرسو رو حذف کن»
   «قیمت کاپوچینو چنده؟» / «سفارشم کجاست؟»
 • با دکمه‌های سبد خرید تعداد را تغییر دهید یا قلمی را حذف کنید.
-• در «تسویه حساب» خلاصه سفارش را ببینید، رسید پرداخت را ارسال کنید و تأیید کنید.
+• در «تسویه حساب» روش پرداخت را انتخاب کنید:
+  💰 کیف پول — اگر موجودی کافی باشد، مبلغ بلافاصله کسر می‌شود.
+  💳 کارت به کارت — مبلغ را کارت به کارت کنید و تصویر رسید را بفرستید؛
+     پس از تأیید مدیر، پرداخت ثبت می‌شود.
 • ساعات کاری را رعایت کنید؛ سفارش‌های خارج از ساعات کاری به اولین روز کاری بعدی منتقل می‌شوند.
 
-پرداخت توسط ربات تأیید نمی‌شود؛ فقط رسید دریافت و ثبت می‌شود.`;
+پرداخت کارت به کارت توسط ربات تأیید نمی‌شود؛ رسید دریافت و برای بررسی به مدیر ارجاع می‌شود.`;
 
 export function productDetailText(p: Product, currency: string): string {
   const parts: string[] = [];
@@ -159,8 +162,53 @@ export function paymentText(payment: PaymentSettings, total: number): string {
   return parts.join("\n");
 }
 
+/** Payment-method picker prompt, with the live wallet balance. */
+export function paymentChoiceText(
+  total: number,
+  currency: string,
+  walletBalance: number,
+  opts: { walletEnabled: boolean; cardEnabled: boolean },
+): string {
+  const parts: string[] = [
+    "💳 روش پرداخت را انتخاب کنید:",
+    "",
+    `مبلغ قابل پرداخت: ${formatMoney(total, currency)}`,
+  ];
+  if (opts.walletEnabled) {
+    parts.push(`💰 موجودی کیف پول شما: ${formatMoney(walletBalance, currency)}`);
+  }
+  if (opts.walletEnabled && walletBalance < total) {
+    parts.push(
+      opts.cardEnabled
+        ? "موجودی کیف پول برای این سفارش کافی نیست؛ لطفاً کارت به کارت کنید یا کیف پول را شارژ کنید."
+        : "موجودی کیف پول برای این سفارش کافی نیست؛ لطفاً کیف پول را شارژ کنید.",
+    );
+  }
+  return parts.join("\n");
+}
+
+/** Shown when the customer picks wallet payment, before final confirmation. */
+export function walletPaymentSummaryText(
+  total: number,
+  currency: string,
+  balance: number,
+): string {
+  return [
+    "💰 پرداخت از کیف پول",
+    "",
+    `مبلغ سفارش: ${formatMoney(total, currency)}`,
+    `موجودی فعلی: ${formatMoney(balance, currency)}`,
+    `موجودی پس از پرداخت: ${formatMoney(balance - total, currency)}`,
+    "",
+    "برای کسر مبلغ از کیف پول، سفارش را تأیید کنید.",
+  ].join("\n");
+}
+
 export const RECEIPT_PROMPT_TEXT =
   "📤 لطفاً تصویر رسید پرداخت (عکس یا فایل تصویری) را ارسال کنید.";
+
+export const PAYMENT_CHOICE_PROMPT_TEXT =
+  "💳 لطفاً یکی از روش‌های پرداخت زیر را انتخاب کنید.";
 
 export const RECEIPT_WRONG_STATE_TEXT =
   "رسید شما قبلاً دریافت شده است؛ در این مرحله نیازی به ارسال دوباره نیست.";
@@ -169,30 +217,69 @@ export const UNSUPPORTED_TEXT =
   "فعلاً فقط پیام متنی رو می‌تونم پردازش کنم. لطفاً درخواستت رو به‌صورت متن بنویس. 😊";
 
 export const DELIVERY_PROMPT_TEXT =
-  "📦 در صورت تمایل اطلاعات تحویل را بنویسید (مثلاً طبقه، شرکت، زمان تحویل یا یادداشت).\nیا با دکمه زیر بدون اطلاعات تحویل ادامه دهید.";
+  "📦 در صورت تمایل یادداشت تحویل بنویسید (مثلاً طبقه، شرکت یا توضیح خاص).\nیا با دکمه زیر بدون یادداشت ادامه دهید.";
+
+export const FULFILLMENT_PROMPT_TEXT =
+  "🛵 سفارش را برایتان ارسال کنیم یا خودتان تحویل می‌گیرید؟";
+
+export function fulfillmentPromptText(hasAddress: boolean, address: string | null): string {
+  return hasAddress
+    ? `${FULFILLMENT_PROMPT_TEXT}\n\n📍 آدرس ثبت‌شده شما: ${address}`
+    : `${FULFILLMENT_PROMPT_TEXT}\n\n(آدرسی ثبت نکرده‌اید؛ برای ارسال، ابتدا پروفایل را کامل کنید.)`;
+}
+
+export const FULFILLMENT_TIME_PROMPT_TEXT =
+  "⏰ چه زمانی تحویل بگیرید؟ (مثلاً «ساعت ۵ عصر» یا «الان»)\nیا «پیش‌فرض» بفرستید تا در اولین فرصت آماده شود.";
+
+export function fulfillmentLabel(method: "delivery" | "pickup" | null): string {
+  return method === "delivery" ? "ارسال 🛵" : "تحویل حضوری 🏪";
+}
 
 export function confirmSummaryText(
   lines: CartLine[],
   total: number,
   currency: string,
   deliveryNotes: string | null,
+  fulfillment?: { method: "delivery" | "pickup" | null; time: string | null },
 ): string {
   const parts = [orderSummaryText(lines, total, currency)];
-  if (deliveryNotes) parts.push(`\n📦 تحویل: ${deliveryNotes}`);
+  if (fulfillment && fulfillment.method) {
+    const timePart = fulfillment.time ? ` — ${fulfillment.time}` : "";
+    parts.push(`\n🛵 روش تحویل: ${fulfillmentLabel(fulfillment.method)}${timePart}`);
+  }
+  if (deliveryNotes) parts.push(`\n📦 یادداشت: ${deliveryNotes}`);
   parts.push("");
   parts.push("آیا سفارش نهایی شود؟");
   return parts.join("\n");
 }
 
 export function orderConfirmedText(order: Order): string {
+  const fulfill =
+    order.fulfillmentMethod === "delivery"
+      ? `روش تحویل: ارسال 🛵${order.deliveryTime ? ` — ${order.deliveryTime}` : ""}`
+      : "روش تحویل: تحویل حضوری 🏪";
+  if (order.paymentMethod === "wallet") {
+    return [
+      "✅ سفارش شما با موفقیت ثبت شد.",
+      "",
+      `شماره سفارش: ${order.orderNumber}`,
+      `مبلغ: ${formatMoney(order.totalAmount, order.currency)}`,
+      "روش پرداخت: کیف پول 💰 (پرداخت انجام شد)",
+      fulfill,
+      "",
+      "سفارش شما در نوبت آماده‌سازی است.",
+    ].join("\n");
+  }
   return [
     "✅ سفارش شما با موفقیت ثبت شد.",
     "",
     `شماره سفارش: ${order.orderNumber}`,
     `مبلغ: ${formatMoney(order.totalAmount, order.currency)}`,
+    "روش پرداخت: کارت به کارت 💳",
+    fulfill,
     "",
-    "وضعیت: رسید دریافت شده (تأیید پرداخت انجام نشده است).",
-    "پس از بررسی، سفارش آماده‌سازی می‌شود.",
+    "وضعیت: رسید دریافت شده (در انتظار تأیید پرداخت توسط مدیر).",
+    "پس از تأیید پرداخت، سفارش آماده‌سازی می‌شود.",
   ].join("\n");
 }
 

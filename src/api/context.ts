@@ -20,4 +20,9 @@ export interface ApiApp {
   uploadsDir: string;
   customers: CustomersService;
   loyalty: LoyaltyService;
+  /**
+   * Telegram bot, used only to resolve receipt file_ids into image bytes for
+   * the admin panel. Optional so tests can build an ApiApp without a network.
+   */
+  bot?: { api: { getFile(fileId: string): Promise<{ file_path?: string }> } };
 }

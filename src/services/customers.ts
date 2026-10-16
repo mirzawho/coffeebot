@@ -14,9 +14,11 @@ import { log } from "../utils/logger";
 
 export interface CustomerProfile {
   telegramId: number;
-  firstName: string;
-  lastName: string | null;
+  /** Single display name (the bot edits it as one field). Mirrors first_name. */
+  fullName: string;
   phone: string | null;
+  address: string | null;
+  username: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -55,6 +57,7 @@ export const MAX_WALLET_BALANCE = 100_000_000;
 export const MAX_DEPOSIT_AMOUNT = 10_000_000;
 export const MAX_PHONE_LENGTH = 20;
 export const MAX_NAME_LENGTH = 80;
+export const MAX_ADDRESS_LENGTH = 300;
 
 /** Normalize a phone number: keep leading + and digits; Persian digits converted. */
 export function normalizePhone(raw: string): string | null {
@@ -85,23 +88,56 @@ export class CustomersService {
     if (!r) return null;
     return {
       telegramId: r.telegram_id,
-      firstName: r.first_name,
-      lastName: r.last_name ?? null,
+      fullName: (r.full_name ?? r.first_name ?? "").trim(),
       phone: r.phone ?? null,
+      address: r.address ?? null,
+      username: r.username ?? null,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
     };
   }
 
+  /**
+   * Capture Telegram identity seen on a validated update. Upserts a profile
+   * row (a customer's first order may be their first ever touch) with the
+   * sender's real name/username. An explicit profile edit is authoritative, so
+   * existing non-empty name fields are never overwritten — only blanks are
+   * filled. The username is always refreshed (it isn't user-editable).
+   */
+  recordSender(
+    telegramId: number,
+    sender: { firstName?: string | null; lastName?: string | null; username?: string | null },
+  ): void {
+    const fullName =
+      [sender.firstName, sender.lastName]
+        .filter(Boolean)
+        .join(" ")
+        .trim()
+        .slice(0, MAX_NAME_LENGTH) || null;
+    const username = String(sender.username ?? "").trim().slice(0, 64) || null;
+    if (!fullName && !username) return;
+    const now = nowIso();
+    this.db
+      .query(
+        `INSERT INTO customer_profiles (telegram_id, first_name, full_name, username, created_at, updated_at)
+         VALUES (?, COALESCE(?, ''), ?, ?, ?, ?)
+         ON CONFLICT(telegram_id) DO UPDATE SET
+           first_name = CASE WHEN customer_profiles.first_name = '' THEN COALESCE(excluded.first_name, customer_profiles.first_name) ELSE customer_profiles.first_name END,
+           full_name = COALESCE(customer_profiles.full_name, excluded.first_name),
+           username = COALESCE(excluded.username, customer_profiles.username),
+           updated_at = excluded.updated_at`,
+      )
+      .run(telegramId, fullName, fullName, username, now, now);
+  }
+
   /** Create or update the caller's own profile. Returns the saved profile. */
   saveProfile(
     telegramId: number,
-    input: { firstName: string; lastName?: string | null; phone?: string | null },
+    input: { fullName: string; phone?: string | null; address?: string | null },
   ): { ok: true; profile: CustomerProfile } | { ok: false; error: string } {
-    const firstName = String(input.firstName ?? "").trim();
-    const lastName = String(input.lastName ?? "").trim() || null;
-    if (!firstName) return { ok: false, error: "نام را وارد کنید" };
-    if (firstName.length > MAX_NAME_LENGTH || (lastName ?? "").length > MAX_NAME_LENGTH) {
+    const fullName = String(input.fullName ?? "").trim();
+    if (!fullName) return { ok: false, error: "نام را وارد کنید" };
+    if (fullName.length > MAX_NAME_LENGTH) {
       return { ok: false, error: "نام بیش از حد مجاز طولانی است" };
     }
     let phone: string | null = null;
@@ -111,16 +147,21 @@ export class CustomersService {
         return { ok: false, error: "شماره موبایل معتبر نیست (مثلاً 09123456789)" };
       }
     }
+    const address =
+      input.address === undefined
+        ? (this.getProfile(telegramId)?.address ?? null)
+        : String(input.address ?? "").trim().slice(0, MAX_ADDRESS_LENGTH) || null;
     const now = nowIso();
     this.db
       .query(
-        `INSERT INTO customer_profiles (telegram_id, first_name, last_name, phone, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO customer_profiles (telegram_id, first_name, full_name, phone, address, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(telegram_id) DO UPDATE SET first_name = excluded.first_name,
-           last_name = excluded.last_name, phone = COALESCE(excluded.phone, customer_profiles.phone),
+           full_name = excluded.full_name, phone = COALESCE(excluded.phone, customer_profiles.phone),
+           address = excluded.address,
            updated_at = excluded.updated_at`,
       )
-      .run(telegramId, firstName, lastName, phone, now, now);
+      .run(telegramId, fullName, fullName, phone, address, now, now);
     return { ok: true, profile: this.getProfile(telegramId)! };
   }
 
@@ -254,7 +295,7 @@ export class CustomersService {
     }
     // A profile row is required by the FK; create a minimal one if absent.
     if (!this.getProfile(telegramId)) {
-      this.saveProfile(telegramId, { firstName: "مشتری" });
+      this.saveProfile(telegramId, { fullName: "مشتری" });
     }
     const now = nowIso();
     const res = this.db
@@ -421,6 +462,48 @@ export class CustomersService {
   }
 
   /**
+   * Manual admin adjustment of a customer's wallet (correction, promo credit,
+   * comp, …). Idempotency is the caller's job here — unlike deposits/orders
+   * there is no natural key, so each call is a distinct ledger entry.
+   */
+  adjustBalance(
+    telegramId: number,
+    amount: number,
+    note: string | null,
+    adminId: number,
+  ): { ok: true; balance: number; txId: number } | { ok: false; error: string } {
+    if (!Number.isInteger(amount) || amount === 0) {
+      return { ok: false, error: "مبلغ باید عدد صحیح غیرصفر باشد" };
+    }
+    if (!this.getProfile(telegramId)) {
+      return { ok: false, error: "مشتری یافت نشد" };
+    }
+    const cleanNote = note ? String(note).trim().slice(0, 200) || null : null;
+    try {
+      // No natural key for manual rows, so use a per-customer monotonic refId to
+      // keep the ledger's UNIQUE(kind, ref_type, ref_id, telegram_id) satisfied.
+      const seq = (
+        this.db
+          .query(
+            "SELECT COALESCE(MAX(ref_id), 0) + 1 AS n FROM wallet_transactions WHERE telegram_id = ? AND kind = 'adjustment'",
+          )
+          .get(telegramId) as { n: number }
+      ).n;
+      const r = this.applyLedger(telegramId, amount, "adjustment", "order", seq, {
+        createdBy: adminId,
+        note: cleanNote,
+      });
+      if (!r.applied) return { ok: false, error: "این تراکنش قبلاً ثبت شده است" };
+      return { ok: true, balance: r.tx.balanceAfter, txId: r.tx.id };
+    } catch (err) {
+      const msg = String((err as any)?.message ?? err);
+      if (msg === "WALLET_INSUFFICIENT") return { ok: false, error: "موجودی کیف پول کافی نیست" };
+      if (msg === "WALLET_LIMIT") return { ok: false, error: "موجودی کیف پول از حد مجاز بیشتر می‌شود" };
+      return { ok: false, error: "ثبت تراکنش انجام نشد" };
+    }
+  }
+
+  /**
    * Admin customer detail. Distinguishes order value from money actually paid:
    * paidTotal sums wallet-funded orders + card orders the admin marked paid.
    * Refunds are excluded from paidTotal (a refunded order is no longer "paid").
@@ -460,5 +543,61 @@ export class CustomersService {
       paidTotal: netPaid,
       outstanding: Math.max(0, agg.v - netPaid),
     };
+  }
+
+  /**
+   * Admin customer list, most recently active first. Merges three sources —
+   * saved profiles, wallets, and order history — so a customer who ordered
+   * without ever saving a profile still appears (nameless until they do).
+   */
+  listCustomerRows(limit = 100): {
+    telegramId: number;
+    fullName: string | null;
+    phone: string | null;
+    username: string | null;
+    balance: number;
+    orderCount: number;
+    orderValue: number;
+    lastActiveAt: string | null;
+  }[] {
+    const rows = this.db
+      .query(
+        `SELECT tg,
+                MAX(full_name) AS full_name,
+                MAX(phone) AS phone, MAX(username) AS username,
+                MAX(balance) AS balance,
+                MAX(cnt) AS order_count, MAX(val) AS order_value,
+                MAX(last_at) AS last_at
+         FROM (
+           SELECT p.telegram_id AS tg,
+                  TRIM(COALESCE(p.full_name, TRIM(COALESCE(p.first_name, '') || ' ' || COALESCE(p.last_name, '')))) AS full_name,
+                  p.phone, p.username,
+                  COALESCE(w.balance, 0) AS balance,
+                  0 AS cnt, 0 AS val, p.created_at AS last_at
+           FROM customer_profiles p
+           LEFT JOIN wallets w ON w.telegram_id = p.telegram_id
+           UNION ALL
+           SELECT telegram_id, NULL, NULL, NULL, balance, 0, 0, updated_at
+           FROM wallets
+           UNION ALL
+           SELECT customer_telegram_id, NULL, NULL, NULL, NULL,
+                  COUNT(*), SUM(total_amount), MAX(created_at)
+           FROM orders GROUP BY customer_telegram_id
+         )
+         GROUP BY tg
+         ORDER BY last_at DESC
+         LIMIT ?`,
+      )
+      .all(limit) as any[];
+    return rows.map((r) => ({
+      telegramId: r.tg,
+      fullName: (r.full_name ?? "").trim() || null,
+      phone: r.phone ?? null,
+      username: r.username ?? null,
+      balance: r.balance ?? 0,
+      orderCount: r.order_count ?? 0,
+      orderValue: r.order_value ?? 0,
+      lastActiveAt: r.last_at ?? null,
+    }));
   }
 }

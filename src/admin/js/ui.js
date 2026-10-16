@@ -47,6 +47,7 @@ const Ui = (() => {
   const icons = {
     refresh: svg('<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>'),
     plus: svg('<path d="M12 5v14"/><path d="M5 12h14"/>'),
+    minus: svg('<path d="M5 12h14"/>'),
     chart: svg('<path d="M3 3v18h18"/><rect x="7" y="11" width="3" height="6"/><rect x="12" y="7" width="3" height="10"/><rect x="17" y="13" width="3" height="4"/>'),
     cup: svg('<path d="M17 8h1a3 3 0 0 1 0 6h-1"/><path d="M3 8h14v6a5 5 0 0 1-5 5H8a5 5 0 0 1-5-5V8z"/><path d="M6 2v2"/><path d="M10 2v2"/><path d="M14 2v2"/>'),
     gear: svg('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>'),
@@ -60,6 +61,12 @@ const Ui = (() => {
     check: svg('<path d="M20 6L9 17l-5-5"/>'),
     slash: svg('<circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/>'),
     trash: svg('<path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>'),
+    users: svg('<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>'),
+    wallet: svg('<path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4z"/>'),
+    phone: svg('<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/>'),
+    search: svg('<circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/>'),
+    send: svg('<path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/>'),
+    order: svg('<path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><path d="M3 6h18"/><path d="M16 10a4 4 0 0 1-8 0"/>'),
   };
 
   // ---------- toast ----------
@@ -224,6 +231,18 @@ const Ui = (() => {
     return { root, input };
   }
 
+  /** Full-width settings row: label on the right, switch pushed to the left edge. */
+  function switchField(label, checked, sub) {
+    const sw = switchInput(checked);
+    const root = el(
+      "div",
+      { class: "switch-row" },
+      el("div", { class: "switch-label" }, label, sub ? el("div", { class: "switch-sub", text: sub }) : null),
+      sw.root,
+    );
+    return { root, input: sw.input };
+  }
+
   /** Two-option segmented control. Returns { root, value(), set(v) }. */
   function segmented(options, value) {
     let current = value;
@@ -249,6 +268,47 @@ const Ui = (() => {
     return { root, value: () => current, set };
   }
 
+  /**
+   * Tab switcher over a set of panels. `tabs` = [{ key, label, icon, build }],
+   * `build()` is called lazily on first activation and its element cached.
+   * Returns the root element to mount.
+   */
+  function tabs(tabDefs, initialKey) {
+    let active = null;
+    const panels = new Map();
+    const buttons = new Map();
+    const tabBar = el("div", { class: "tabs", role: "tablist" });
+    const panelWrap = el("div", {});
+
+    function activate(key) {
+      active = key;
+      for (const [k, btn] of buttons) btn.classList.toggle("active", k === key);
+      for (const [k, panel] of panels) panel.hidden = k !== key;
+      const def = tabDefs.find((t) => t.key === key);
+      if (def && !panels.has(key)) {
+        const panel = el("div", { class: "tab-panel" });
+        panels.set(key, panel);
+        panelWrap.appendChild(panel);
+        panel.appendChild(def.build());
+      }
+    }
+
+    for (const def of tabDefs) {
+      const btn = el(
+        "button",
+        { type: "button", role: "tab", onClick: () => activate(def.key) },
+        def.icon ? el("span", { html: def.icon }) : null,
+        def.label,
+      );
+      buttons.set(def.key, btn);
+      tabBar.appendChild(btn);
+    }
+
+    const root = el("div", {}, tabBar, panelWrap);
+    activate(initialKey ?? tabDefs[0]?.key);
+    return root;
+  }
+
   return {
     faDigits,
     money,
@@ -269,6 +329,8 @@ const Ui = (() => {
     numberInput,
     parseDigits,
     switchInput,
+    switchField,
+    tabs,
     segmented,
   };
 })();

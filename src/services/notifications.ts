@@ -2,7 +2,11 @@ import type { Db } from "../db/database";
 import { nowIso } from "../db/database";
 import { log } from "../utils/logger";
 
-export type NotificationKind = "daily_report" | "order_update" | "customer_notice";
+export type NotificationKind =
+  | "daily_report"
+  | "order_update"
+  | "customer_notice"
+  | "wallet_adjustment";
 export type NotificationStatus = "pending" | "sending" | "sent" | "failed";
 
 export interface NotificationRow {

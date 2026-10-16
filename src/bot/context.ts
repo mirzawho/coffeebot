@@ -15,16 +15,20 @@ export interface ChatTurn {
 }
 
 /**
- * Tiny per-user text-capture flows (profile edit, deposit amount). A user in
- * an active flow has their next text consumed by the flow instead of the AI.
+ * Named per-user capture flows. A user in an active flow has their next text
+ * consumed by the flow instead of the AI. `step` lets multi-field wizards
+ * (profile edit, checkout fulfillment) know which question was last asked.
  */
 export class TextCaptureFlow {
-  private active = new Set<number>();
-  expect(userId: number): void {
-    this.active.add(userId);
+  private active = new Map<number, string>();
+  expect(userId: number, step = "default"): void {
+    this.active.set(userId, step);
   }
   isActive(userId: number): boolean {
     return this.active.has(userId);
+  }
+  step(userId: number): string {
+    return this.active.get(userId) ?? "default";
   }
   clear(userId: number): void {
     this.active.delete(userId);
@@ -47,10 +51,12 @@ export interface BotApp {
   persona: string;
   customers: CustomersService;
   loyalty: LoyaltyService;
-  /** Next text message is captured as a profile edit. */
+  /** Multi-step profile wizard (name → phone → address). */
   profileEdit: TextCaptureFlow;
   /** Next text message is captured as a wallet deposit amount. */
   depositFlow: TextCaptureFlow;
+  /** Next text message is captured as the delivery/pickup time. */
+  fulfillmentTimeFlow: TextCaptureFlow;
 }
 
 const HISTORY_CAP = 300;
