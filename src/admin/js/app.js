@@ -83,6 +83,10 @@
       if (typeof tg.setHeaderColor === "function") tg.setHeaderColor("#ffffff");
     }
 
+    // Gate ALL API traffic on Telegram init: no request leaves before the SDK
+    // has injected initData (or the 3s wait has expired with a warning).
+    await Api.whenReady();
+
     // Diagnostics: the two failure modes below look identical in the UI but
     // have very different causes, so log which one we are in.
     if (!Api.isTelegram()) {

@@ -66,13 +66,15 @@ const Api = (() => {
   }
 
   /**
-   * Bounded wait for the Telegram SDK to inject initData. Some clients populate
-   * window.Telegram.WebApp.initData asynchronously after telegram-web-app.js
-   * loads; without this gate the first request can race ahead of the SDK and go
-   * out with an empty header. Resolves immediately when the page is not inside
-   * Telegram (plain-browser dev fallback) or once initData is present.
+   * Telegram Init Awaiter. Bounded wait for the Telegram SDK to inject
+   * initData: some clients populate window.Telegram.WebApp.initData
+   * asynchronously after telegram-web-app.js loads, so the first request can
+   * otherwise race ahead of the SDK and go out with an empty header. Calls
+   * ready(), then polls every 100ms for up to 3s. Resolves immediately when
+   * the page is not inside Telegram (plain-browser dev fallback) or once
+   * initData is present; logs a clear warning on timeout.
    */
-  function whenTelegramReady(timeoutMs = 2000) {
+  function whenTelegramReady(timeoutMs = 3000) {
     const tg = webApp();
     if (!tg || (typeof tg.initData === "string" && tg.initData)) return Promise.resolve();
     if (typeof tg.ready === "function") tg.ready();
@@ -80,8 +82,19 @@ const Api = (() => {
       const started = Date.now();
       const timer = setInterval(() => {
         const t = webApp();
-        if ((t && typeof t.initData === "string" && t.initData) || Date.now() - started >= timeoutMs) {
+        if (t && typeof t.initData === "string" && t.initData) {
           clearInterval(timer);
+          resolve();
+          return;
+        }
+        if (Date.now() - started >= timeoutMs) {
+          clearInterval(timer);
+          console.warn(
+            `[api] Telegram initData still empty after ${timeoutMs}ms — ` +
+              (t
+                ? "the SDK loaded but never injected initData. Reopen the panel from inside the bot."
+                : "the Telegram SDK did not load at all (window.Telegram missing). Check the network/CDN for telegram-web-app.js."),
+          );
           resolve();
         }
       }, 100);
@@ -124,7 +137,16 @@ const Api = (() => {
     // Read at request time, never cached at module load — initData is injected
     // asynchronously by the Telegram SDK.
     const token = initData();
-    if (token) headers[HEADER] = token;
+    if (token) {
+      headers[HEADER] = token;
+    } else {
+      // Interceptor-equivalent warning: a request without this header can only
+      // end in the 401 "missing x-telegram-init-data".
+      console.warn(
+        `⚠️ Warning: Sending API request with EMPTY ${HEADER}! ` +
+          `method=${method} path=${path} insideTelegram=${!!webApp()}`,
+      );
+    }
     let payload;
     if (body !== undefined) {
       headers["content-type"] = "application/json";
@@ -195,5 +217,6 @@ const Api = (() => {
     del: (p) => request("DELETE", p),
     initData,
     isTelegram,
+    whenReady: telegramReady,
   };
 })();
