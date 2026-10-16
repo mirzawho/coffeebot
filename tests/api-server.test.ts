@@ -11,6 +11,7 @@ import { ReportService } from "../src/services/reports";
 import { NotificationService } from "../src/services/notifications";
 import { createHttpServer } from "../src/api/server";
 import { signInitData } from "../src/api/middleware/auth";
+import { botState } from "../src/bot/state";
 import type { ApiApp } from "../src/api/context";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -158,8 +159,38 @@ describe("framing headers allow Telegram to embed the Mini App", () => {
   });
 
   test("health endpoint stays unauthenticated JSON", async () => {
-    const res = await fetch(`${base}/health`);
-    expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toContain("application/json");
+    // botState is process-global and other test files (bot-startup) leave it in
+    // a failed state, which makes /health answer 503. Pin it so this test
+    // asserts the endpoint's contract rather than cross-file test ordering.
+    const saved = { ...botState };
+    botState.running = true;
+    botState.failed = false;
+    botState.lastError = null;
+    try {
+      const res = await fetch(`${base}/health`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      const body = await res.json();
+      expect(body.ok).toBe(true);
+      expect(body.bot.status).toBe("running");
+    } finally {
+      Object.assign(botState, saved);
+    }
+  });
+
+  test("health reports 503 when the bot has permanently failed", async () => {
+    const saved = { ...botState };
+    botState.running = false;
+    botState.failed = true;
+    botState.lastError = "401: Unauthorized";
+    try {
+      const res = await fetch(`${base}/health`);
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body.ok).toBe(false);
+      expect(body.bot.status).toBe("failed");
+    } finally {
+      Object.assign(botState, saved);
+    }
   });
 });
