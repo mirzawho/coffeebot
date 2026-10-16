@@ -79,6 +79,25 @@ async function readJson(req: Request): Promise<any> {
 function authenticate(req: Request, app: ApiApp): TelegramUser {
   const initData = extractInitData(req, { allowQuery: app.config.allowInitDataQuery });
   if (!initData) {
+    // Diagnostic: distinguish "header never sent by the client" from "header
+    // lost in transit" (redirect, nginx proxy_set_header inheritance, CORS
+    // preflight). Headers are redacted — only presence/absence and initData
+    // candidates are logged, never their values.
+    const headerKeys: string[] = [];
+    req.headers.forEach((_v, k) => headerKeys.push(k));
+    const auth = req.headers.get("authorization");
+    log.warn("admin request without initData", {
+      method: req.method,
+      url: req.url,
+      origin: req.headers.get("origin") || null,
+      referer: req.headers.get("referer") || null,
+      forwardedFor: req.headers.get("x-forwarded-for") || null,
+      forwardedProto: req.headers.get("x-forwarded-proto") || null,
+      hasInitDataHeader: !!req.headers.get("x-telegram-init-data"),
+      hasAuthorization: !!auth,
+      allowQuery: app.config.allowInitDataQuery,
+      headerKeys,
+    });
     // Actionable message: the Mini App shows this verbatim, so it must tell the
     // operator what to do rather than just naming the missing header.
     throw new AuthError(

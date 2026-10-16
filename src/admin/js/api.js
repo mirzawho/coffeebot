@@ -5,6 +5,25 @@ const Api = (() => {
   const HEADER = "x-telegram-init-data";
   const MAX_RETRIES = 2;
 
+  /**
+   * API base URL. Empty string = same-origin relative paths — the production
+   * setup: panel and API share one origin, so no CORS and no redirect.
+   * Override with window.ADMIN_API_BASE_URL for split deployments. It must be
+   * the absolute https origin WITHOUT a trailing slash: a wrong value makes
+   * fetch() follow a redirect, and redirects drop custom headers (301/302 also
+   * rewrite POST to GET), which surfaces as "missing x-telegram-init-data".
+   */
+  function baseUrl() {
+    let base = typeof window.ADMIN_API_BASE_URL === "string" ? window.ADMIN_API_BASE_URL.trim() : "";
+    if (!base) return "";
+    base = base.replace(/\/+$/, "");
+    if (/^http:\/\//i.test(base) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(base)) {
+      console.warn(`[api] ADMIN_API_BASE_URL must be https in production (got "${base}") — forcing https.`);
+      base = "https://" + base.slice(7);
+    }
+    return base;
+  }
+
   /** Telegram WebApp object, or null when the page is not inside Telegram. */
   function webApp() {
     return (window.Telegram && window.Telegram.WebApp) || null;
@@ -46,6 +65,35 @@ const Api = (() => {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  /**
+   * Bounded wait for the Telegram SDK to inject initData. Some clients populate
+   * window.Telegram.WebApp.initData asynchronously after telegram-web-app.js
+   * loads; without this gate the first request can race ahead of the SDK and go
+   * out with an empty header. Resolves immediately when the page is not inside
+   * Telegram (plain-browser dev fallback) or once initData is present.
+   */
+  function whenTelegramReady(timeoutMs = 2000) {
+    const tg = webApp();
+    if (!tg || (typeof tg.initData === "string" && tg.initData)) return Promise.resolve();
+    if (typeof tg.ready === "function") tg.ready();
+    return new Promise((resolve) => {
+      const started = Date.now();
+      const timer = setInterval(() => {
+        const t = webApp();
+        if ((t && typeof t.initData === "string" && t.initData) || Date.now() - started >= timeoutMs) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, 100);
+    });
+  }
+
+  let readyPromise = null;
+  function telegramReady() {
+    if (!readyPromise) readyPromise = whenTelegramReady();
+    return readyPromise;
+  }
+
   /** Human-readable Persian message for a failed response. */
   function messageFor(status, data) {
     const serverMsg = data && typeof data.error === "string" ? data.error : "";
@@ -68,7 +116,13 @@ const Api = (() => {
   }
 
   async function request(method, path, body, attempt = 0) {
+    // First request waits (bounded) for the Telegram SDK so the header is never
+    // empty because of a startup race.
+    await telegramReady();
+
     const headers = {};
+    // Read at request time, never cached at module load — initData is injected
+    // asynchronously by the Telegram SDK.
     const token = initData();
     if (token) headers[HEADER] = token;
     let payload;
@@ -79,7 +133,7 @@ const Api = (() => {
 
     let res;
     try {
-      res = await fetch(path, {
+      res = await fetch(baseUrl() + path, {
         method,
         headers,
         body: payload,
@@ -93,6 +147,16 @@ const Api = (() => {
       err.status = 0;
       err.cause = networkErr;
       throw err;
+    }
+
+    // A redirect strips custom headers (and 301/302 rewrite POST to GET), so a
+    // redirected request can never authenticate. Surface it loudly instead of
+    // letting it masquerade as a missing-header bug.
+    if (res.redirected) {
+      console.warn(
+        `[api] ${method} ${path} was redirected to ${res.url} — the ${HEADER} header was dropped by the redirect. ` +
+          "Fix the API base URL (https, no trailing slash) and nginx (no internal redirects) so requests go out directly.",
+      );
     }
 
     let data = null;
