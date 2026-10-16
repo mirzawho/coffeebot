@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { SECURITY_HEADERS, clientIp } from "../src/api/server";
+import { SECURITY_HEADERS, securityHeaders, clientIp } from "../src/api/server";
 
 describe("CSP (BUG-001 regression)", () => {
   const csp = SECURITY_HEADERS["content-security-policy"]!;
@@ -58,6 +58,26 @@ describe("CSP (BUG-001 regression)", () => {
   test("index.html loads the SDK from the permitted origin", async () => {
     const html = await Bun.file("src/admin/index.html").text();
     expect(html).toContain('<script src="https://telegram.org/js/telegram-web-app.js"></script>');
+  });
+});
+
+describe("debug CSP (DEBUG=true)", () => {
+  test("production headers stay untouched by the debug variant", () => {
+    expect(securityHeaders(false)["content-security-policy"]).toBe(
+      SECURITY_HEADERS["content-security-policy"],
+    );
+    expect(SECURITY_HEADERS["content-security-policy"]).not.toContain("jsdelivr");
+  });
+
+  test("debug variant allows the eruda CDN and its inline bootstrap", () => {
+    const csp = securityHeaders(true)["content-security-policy"]!;
+    expect(csp).toContain("https://cdn.jsdelivr.net");
+    expect(csp).toContain("'unsafe-inline'");
+    // Still no wildcard and no eval, even in debug.
+    expect(csp).not.toContain("*");
+    expect(csp).not.toContain("'unsafe-eval'");
+    // Framing rules are unchanged.
+    expect(csp).toContain("frame-ancestors 'self' https://web.telegram.org");
   });
 });
 

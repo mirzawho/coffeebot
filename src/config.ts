@@ -27,6 +27,12 @@ export interface Config {
    * Never enable in production (query strings leak into logs and Referer).
    */
   allowInitDataQuery: boolean;
+  /**
+   * DEV ONLY: inject the eruda in-page console into the Mini App and relax the
+   * CSP so it can load. Never enable in production — it exposes a debug console
+   * to every visitor.
+   */
+  debug: boolean;
 }
 
 export function parseAdminIds(raw: string | undefined): Set<number> {
@@ -163,5 +169,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     aiPersonaFile: (env.AI_PERSONA_FILE ?? "").trim(),
     trustProxy,
     allowInitDataQuery: parseBool(env.ALLOW_INIT_DATA_QUERY),
+    debug: parseBool(env.DEBUG),
   };
 }

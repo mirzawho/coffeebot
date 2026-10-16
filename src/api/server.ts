@@ -13,6 +13,16 @@ const ADMIN_DIR = join(import.meta.dir, "..", "admin");
 // a collapsed IP bucket (proxy misconfig) must never lock operators out.
 const authLimiter = new RateLimiter(5000, 60_000);
 
+const BASE_CSP =
+  "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https://t.me https://cdn4.telesco.pe; connect-src 'self'; frame-ancestors 'self' https://web.telegram.org https://webk.telegram.org https://webz.telegram.org";
+
+// DEBUG=true only: eruda is loaded from jsdelivr and bootstrapped with an inline
+// script, so both need to be allowed. Never used in production.
+const DEBUG_CSP = BASE_CSP.replace(
+  "script-src 'self' https://telegram.org",
+  "script-src 'self' https://telegram.org https://cdn.jsdelivr.net 'unsafe-inline'",
+).replace("connect-src 'self'", "connect-src 'self' https://cdn.jsdelivr.net");
+
 export const SECURITY_HEADERS: Record<string, string> = {
   "x-content-type-options": "nosniff",
   "referrer-policy": "no-referrer",
@@ -28,9 +38,27 @@ export const SECURITY_HEADERS: Record<string, string> = {
   // our own API); img-src covers local product images, inline data: previews,
   // and the admin's Telegram profile photo (specific hosts, no wildcards).
   // style/font-src allow Google Fonts to serve Vazirmatn (the required Persian UI font).
-  "content-security-policy":
-    "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https://t.me https://cdn4.telesco.pe; connect-src 'self'; frame-ancestors 'self' https://web.telegram.org https://webk.telegram.org https://webz.telegram.org",
+  "content-security-policy": BASE_CSP,
 };
+
+/** Security headers for a response; the debug variant widens the CSP for eruda. */
+export function securityHeaders(debug = false): Record<string, string> {
+  if (!debug) return SECURITY_HEADERS;
+  return { ...SECURITY_HEADERS, "content-security-policy": DEBUG_CSP };
+}
+
+// Injected into index.html when DEBUG=true so the panel can be inspected from
+// inside Telegram (no devtools there).
+const ERUDA_SNIPPET = `  <script src="https://cdn.jsdelivr.net/npm/eruda"></script>
+  <script>eruda.init();</script>
+`;
+
+function injectDebugConsole(html: string): string {
+  if (html.includes("eruda")) return html;
+  return html.includes("</body>")
+    ? html.replace("</body>", `${ERUDA_SNIPPET}</body>`)
+    : html + ERUDA_SNIPPET;
+}
 
 /**
  * CORS for the Mini App.
@@ -148,7 +176,11 @@ const MIME: Record<string, string> = {
   ".woff2": "font/woff2",
 };
 
-function serveFile(absPath: string, rootDir: string): Response | null {
+function serveFile(
+  absPath: string,
+  rootDir: string,
+  headers: Record<string, string> = SECURITY_HEADERS,
+): Response | null {
   // Only files inside rootDir are servable — no traversal outside the given root.
   if (!absPath.startsWith(rootDir + "/")) return null;
   if (!existsSync(absPath)) return null;
@@ -161,8 +193,19 @@ function serveFile(absPath: string, rootDir: string): Response | null {
       "content-type": MIME[ext] ?? "application/octet-stream",
       "content-length": String(st.size),
       "cache-control": ext === ".html" ? "no-cache" : "public, max-age=300",
-      ...SECURITY_HEADERS,
+      ...headers,
     },
+  });
+}
+
+/** Serve the Mini App HTML, injecting the eruda console when DEBUG=true. */
+async function serveAdminHtml(absPath: string, app: ApiApp): Promise<Response | null> {
+  const headers = securityHeaders(app.config.debug);
+  if (!app.config.debug) return serveFile(absPath, ADMIN_DIR, headers);
+  if (!absPath.startsWith(ADMIN_DIR + "/") || !existsSync(absPath)) return null;
+  const html = injectDebugConsole(await Bun.file(absPath).text());
+  return new Response(html, {
+    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache", ...headers },
   });
 }
 
@@ -257,11 +300,15 @@ export function createHttpServer(app: ApiApp) {
       let staticPath = path === "/" ? "/index.html" : path;
       if (!staticPath.includes(".")) staticPath += ".html"; // allow /dashboard -> /dashboard.html if added later
       const abs = join(ADMIN_DIR, normalize(staticPath));
-      const f = serveFile(abs, ADMIN_DIR);
+      // Only HTML documents need the debug CSP — a CSP on a JS/CSS response is
+      // never enforced, so assets keep the production headers.
+      const f = abs.endsWith(".html")
+        ? await serveAdminHtml(abs, app)
+        : serveFile(abs, ADMIN_DIR);
       if (f) return f;
 
       // SPA-ish fallback: serve index.html for unknown non-file paths under admin dir.
-      const index = serveFile(join(ADMIN_DIR, "index.html"), ADMIN_DIR);
+      const index = await serveAdminHtml(join(ADMIN_DIR, "index.html"), app);
       if (index && !path.startsWith("/api/")) return index;
 
       return json({ error: "not found" }, 404);

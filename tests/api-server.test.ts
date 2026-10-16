@@ -194,3 +194,55 @@ describe("framing headers allow Telegram to embed the Mini App", () => {
     }
   });
 });
+
+describe("DEBUG=true injects the eruda console", () => {
+  let debugServer: ReturnType<typeof createHttpServer>;
+  let debugBase: string;
+
+  beforeAll(() => {
+    const config = {
+      ...loadConfig({
+        BOT_TOKEN,
+        ADMIN_IDS: "777",
+        TIMEZONE: "Asia/Tehran",
+        APP_BASE_URL: "https://cafe.example.com",
+        DEBUG: "true",
+      }),
+      httpPort: 0,
+    };
+    const businessHours = new BusinessHoursService(db, config.timezone);
+    const app: ApiApp = {
+      config,
+      db,
+      menu: new MenuService(db),
+      orders: new OrdersService(db, businessHours),
+      businessHours,
+      reports: new ReportService(db, businessHours, new NotificationService(db), config.timezone),
+      notifications: new NotificationService(db),
+      uploadsDir: mkdtempSync(join(tmpdir(), "cafe-uploads-")),
+      customers: new CustomersService(db),
+      loyalty: new LoyaltyService(db),
+    };
+    debugServer = createHttpServer(app);
+    debugBase = `http://127.0.0.1:${debugServer.port}`;
+  });
+
+  afterAll(() => {
+    debugServer.stop(true);
+  });
+
+  test("index.html carries the eruda snippet and a widened CSP", async () => {
+    const res = await fetch(`${debugBase}/`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("https://cdn.jsdelivr.net/npm/eruda");
+    expect(html).toContain("eruda.init();");
+    expect(res.headers.get("content-security-policy")).toContain("https://cdn.jsdelivr.net");
+  });
+
+  test("static assets keep the production CSP", async () => {
+    const res = await fetch(`${debugBase}/js/api.js`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-security-policy")).not.toContain("jsdelivr");
+  });
+});
