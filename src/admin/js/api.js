@@ -35,6 +35,11 @@ const Api = (() => {
    * Production: window.Telegram.WebApp.initData, injected by the Telegram SDK
    * (telegram-web-app.js) when the Mini App is opened from inside Telegram.
    *
+   * Hash fallback: some Telegram clients (notably older in-app browsers and
+   * some Desktop builds) put the signed payload in the URL fragment instead of
+   * the SDK property — `#tgWebAppData=...`. The fragment never reaches the
+   * server, so reading it client-side and sending it as the header is safe.
+   *
    * Dev fallback: ?initData=... / ?tgWebAppData=... in the URL, so the panel can
    * be opened in a plain browser. The server only honors these when
    * ALLOW_INIT_DATA_QUERY=1, so this is inert in production.
@@ -46,6 +51,12 @@ const Api = (() => {
     if (tg && typeof tg.initData === "string" && tg.initData) return tg.initData;
 
     try {
+      // URL fragment: Telegram puts tgWebAppData (and other tg* params) here.
+      if (window.location.hash) {
+        const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+        const fromHash = hashParams.get("tgWebAppData") || hashParams.get("initData");
+        if (fromHash) return fromHash;
+      }
       const params = new URLSearchParams(window.location.search);
       const fromQuery = params.get("initData") || params.get("tgWebAppData");
       if (fromQuery) return fromQuery;
@@ -55,10 +66,9 @@ const Api = (() => {
     return "";
   }
 
-  /** True when the page is running inside Telegram with a signed payload. */
+  /** True when a signed payload is available from any source (SDK, hash, query). */
   function isTelegram() {
-    const tg = webApp();
-    return !!(tg && typeof tg.initData === "string" && tg.initData);
+    return !!initData();
   }
 
   function sleep(ms) {
@@ -135,7 +145,7 @@ const Api = (() => {
 
     const headers = {};
     // Read at request time, never cached at module load — initData is injected
-    // asynchronously by the Telegram SDK.
+    // asynchronously by the Telegram SDK (or recovered from the URL fragment).
     const token = initData();
     if (token) {
       headers[HEADER] = token;
@@ -144,7 +154,8 @@ const Api = (() => {
       // end in the 401 "missing x-telegram-init-data".
       console.warn(
         `⚠️ Warning: Sending API request with EMPTY ${HEADER}! ` +
-          `method=${method} path=${path} insideTelegram=${!!webApp()}`,
+          `method=${method} path=${path} insideTelegram=${!!webApp()} ` +
+          `hash=${window.location.hash ? "present" : "absent"}`,
       );
     }
     let payload;
