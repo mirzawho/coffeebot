@@ -180,6 +180,18 @@ export function deliveryKeyboard(): InlineKeyboard {
 }
 
 /**
+ * Profile-wizard controls. «بعدی» keeps the saved value for the current field
+ * (only offered when one exists); «تأیید» saves what has been collected so far.
+ */
+export function profileWizardKeyboard(step: "name" | "phone" | "address", canSkip: boolean): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  if (canSkip) kb.text("⏭ بعدی", "pf:skip");
+  if (step === "address") kb.text("✅ تأیید و ذخیره", "pf:ok");
+  kb.row().text("❌ لغو", "pf:cancel");
+  return kb;
+}
+
+/**
  * Fulfillment picker after payment: delivery (if the customer has an address)
  * or pickup. The delivery button is only rendered when an address exists —
  * the server revalidates on press anyway.

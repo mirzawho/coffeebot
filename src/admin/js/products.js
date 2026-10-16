@@ -214,6 +214,8 @@ const ProductsPage = (() => {
     let selectedFile = null; // pending image upload
     let previewUrl = null;
     let removeImage = false;
+    // Declared early: the price/after-hours fields below branch on it.
+    const hasVariants = isEdit && product.variants.length > 0;
 
     const formError = el("div", { class: "form-error" });
     formError.hidden = true;
@@ -314,7 +316,6 @@ const ProductsPage = (() => {
     }
 
     // 5. price (skipped when the product has variants — prices live on variants)
-    const hasVariants = isEdit && product.variants.length > 0;
     let priceF = null;
     let priceInput = null;
     if (!hasVariants) {

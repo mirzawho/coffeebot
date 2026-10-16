@@ -28,12 +28,12 @@ import {
 } from "../format";
 import { MAX_AI_OFFERS, MAX_ITEM_QUANTITY, MAX_USER_MESSAGE_LENGTH } from "../../utils/ids";
 import { FALLBACK_REPLY, type AiResult } from "../../services/ollama";
-import { normalizePhone, MAX_ADDRESS_LENGTH } from "../../services/customers";
 import { cardToCardAvailable, getAiSettings } from "../../services/settings";
+import { handleProfileWizardText, startProfileWizard } from "../profile-wizard";
 import { validateReceipt } from "../receipt";
 import { isIdentityQuestion, buildIdentityReply } from "../identity";
 import { log } from "../../utils/logger";
-import { showHelp, showMainMenu, showCart, startCheckoutFlow, startProfileEdit, sendConfirmStage, sendFulfillmentChoice } from "./callbacks";
+import { showHelp, showMainMenu, showCart, startCheckoutFlow, sendConfirmStage, sendFulfillmentChoice } from "./callbacks";
 import { withTypingIndicator, TelegramStreamer } from "../typing";
 import { walletKeyboard } from "../keyboards";
 import { formatMoney } from "../../utils/money";
@@ -46,7 +46,7 @@ export function registerMessageHandlers(bot: any, app: BotApp): void {
     await ctx.reply(WELCOME_TEXT, { reply_markup: mainMenu() });
     // First run: a customer without a saved profile is walked through it once.
     if (!app.customers.isProfileComplete(ctx.from!.id)) {
-      await startProfileEdit(ctx, app);
+      await startProfileWizard(ctx, app);
     }
   });
 
@@ -72,8 +72,9 @@ export function registerMessageHandlers(bot: any, app: BotApp): void {
     const raw = ctx.message?.text;
     if (typeof raw !== "string") return;
     const text = raw.trim();
-    // Commands are handled by their registered command handlers.
-    if (text === "/start" || text === "/help" || text === "/whoami" || text === "/admin" || text === "/cancel") return;
+    // Commands are handled by their registered command handlers, except
+    // /cancel which handleText owns (it must also abort active capture flows).
+    if (text === "/start" || text === "/help" || text === "/whoami" || text === "/admin") return;
     await handleText(ctx, app, text);
   });
 
@@ -103,10 +104,24 @@ async function handleText(ctx: Context, app: BotApp, text: string): Promise<void
   const userId = ctx.from!.id;
   const cart = app.cart.getOrCreate(userId);
 
+  // /cancel aborts any active capture flow and resets an in-progress checkout.
+  // It is handled here (not only as a command) because the text handler runs
+  // first and would otherwise swallow the command.
   if (text === "/cancel") {
+    const wasActive =
+      app.profileEdit.isActive(userId) ||
+      app.depositFlow.isActive(userId) ||
+      app.fulfillmentTimeFlow.isActive(userId);
     app.profileEdit.clear(userId);
     app.depositFlow.clear(userId);
     app.fulfillmentTimeFlow.clear(userId);
+    if (wasActive) {
+      await ctx.reply("عملیات لغو شد.", { reply_markup: mainMenu() });
+      return;
+    }
+    app.cart.resetCheckout(userId);
+    await ctx.reply("عملیات لغو شد.", { reply_markup: mainMenu() });
+    return;
   }
 
   // Active text-capture flows take precedence (profile wizard, deposit amount,
@@ -573,96 +588,11 @@ async function handleReceiptMedia(
 /**
  * Step-by-step profile wizard. Steps: name → phone → optional address.
  * The phone must match the mobile pattern; Persian/Arabic digits are
- * converted. /cancel aborts (handled by the command handler clearing flows).
+ * converted. Every step offers لغو / بعدی / تأیید buttons.
  */
 async function applyProfileEdit(ctx: Context, app: BotApp, text: string, step = "default"): Promise<void> {
-  const userId = ctx.from!.id;
-
-  if (step === "name") {
-    const name = text.trim().slice(0, MAX_PROFILE_NAME_LENGTH);
-    if (name.length < 2) {
-      await ctx.reply("نام واردشده کوتاه است. لطفاً نام و نام خانوادگی را کامل بفرستید:");
-      app.profileEdit.expect(userId, "name"); // stay on the same step
-      return;
-    }
-    wizardState.set(userId, { fullName: name });
-    app.profileEdit.expect(userId, "phone");
-    await ctx.reply(
-      [
-        "۲ از ۳ — شماره موبایل خود را بفرستید:",
-        "مثلاً ۰۹۱۲۳۴۵۶۷۸۹ (اعداد فارسی هم قابل قبول است)",
-        "",
-        "برای لغو /cancel را بفرستید.",
-      ].join("\n"),
-    );
-    return;
-  }
-
-  if (step === "phone") {
-    const saved = wizardState.get(userId) ?? {};
-    const phone = normalizePhone(text);
-    if (!phone) {
-      await ctx.reply(
-        "شماره موبایل معتبر نیست. لطفاً یک شماره ۱۱ رقمی مثل ۰۹۱۲۳۴۵۶۷۸۹ بفرستید:",
-      );
-      app.profileEdit.expect(userId, "phone"); // stay on the same step
-      return;
-    }
-    saved.phone = phone;
-    wizardState.set(userId, saved);
-    app.profileEdit.expect(userId, "address");
-    await ctx.reply(
-      [
-        "۳ از ۳ — آدرس محل تحویل را بنویسید (اختیاری):",
-        "اگر آدرس ندارید یا می‌خواهید حضوری تحویل بگیرید، «رد» بفرستید.",
-        "",
-        "برای لغو /cancel را بفرستید.",
-      ].join("\n"),
-    );
-    return;
-  }
-
-  if (step === "address") {
-    const saved = wizardState.get(userId) ?? {};
-    const skip = /^(رد|نه|خیر|-|—|skip)$/i.test(text.trim());
-    const address = skip ? null : text.trim().slice(0, MAX_ADDRESS_LENGTH) || null;
-    wizardState.delete(userId);
-    const r = app.customers.saveProfile(userId, {
-      fullName: saved.fullName ?? "",
-      phone: saved.phone ?? null,
-      address,
-    });
-    if (!r.ok) {
-      await ctx.reply(`${r.error}\n\nدوباره تلاش کنید یا /cancel را بفرستید.`);
-      app.profileEdit.expect(userId, "address");
-      return;
-    }
-    // Keep the Telegram username in sync with the validated sender.
-    if (ctx.from) {
-      app.customers.recordSender(userId, {
-        firstName: ctx.from.first_name,
-        lastName: ctx.from.last_name,
-        username: ctx.from.username,
-      });
-    }
-    await ctx.reply(
-      [
-        "✅ پروفایل ذخیره شد.",
-        `نام: ${r.profile.fullName}`,
-        `موبایل: ${r.profile.phone ? toPersianDigits(r.profile.phone) : "—"}`,
-        r.profile.address ? `آدرس: ${r.profile.address}` : "آدرس: ثبت نشده",
-      ].join("\n"),
-      { reply_markup: mainMenu() },
-    );
-    return;
-  }
-
-  app.profileEdit.clear(userId);
+  await handleProfileWizardText(ctx, app, text, step);
 }
-
-/** Scratch state for the multi-step profile wizard (name/phone before save). */
-const wizardState = new Map<number, { fullName?: string; phone?: string }>();
-const MAX_PROFILE_NAME_LENGTH = 80;
 
 /**
  * Capture the requested delivery/pickup time («ساعت ۵ عصر», «الان»).

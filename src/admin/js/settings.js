@@ -120,8 +120,8 @@ const SettingsPage = (() => {
       const timeWrap = el(
         "div",
         { style: "display:flex;gap:8px;align-items:center" },
-        el("div", { class: "field", style: "flex:1;margin:0" }, el("label", {}, "شروع", openInput)),
-        el("div", { class: "field", style: "flex:1;margin:0" }, el("label", {}, "پایان", closeInput)),
+        el("div", { class: "field", style: "flex:1;min-width:0;margin:0" }, el("label", {}, "شروع", openInput)),
+        el("div", { class: "field", style: "flex:1;min-width:0;margin:0" }, el("label", {}, "پایان", closeInput)),
       );
       const sync = () => {
         openInput.disabled = !sw.input.checked;
@@ -147,8 +147,8 @@ const SettingsPage = (() => {
     }
 
     const saveBtn = el("button", { class: "btn", type: "submit", text: "ذخیره ساعات کاری" });
+    form.appendChild(el("div", { class: "field-hint", style: "margin:14px 0 0", text: "ساعت پایان باید بعد از ساعت شروع باشد؛ ساعت کاری شبانه پشتیبانی نمی‌شود." }));
     form.appendChild(el("div", { class: "form-actions" }, saveBtn, el("button", { class: "btn ghost", type: "button", text: "انصراف", onClick: closeSheet })));
-    form.appendChild(el("div", { class: "field-hint", text: "ساعت پایان باید بعد از ساعت شروع باشد؛ ساعت کاری شبانه پشتیبانی نمی‌شود." }));
 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();

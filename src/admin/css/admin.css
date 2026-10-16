@@ -289,14 +289,17 @@ main#main {
   padding: 11px 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
+  /* 16px is the iOS auto-zoom threshold; anything smaller zooms on focus. */
   font: inherit;
+  font-size: 16px;
   color: var(--text);
   background: var(--surface);
   min-height: 46px;
 }
 .field textarea { min-height: 96px; resize: vertical; line-height: 1.7; }
-/* time values must read hh:mm, not flipped by the RTL paragraph direction */
-.field input[type="time"] { direction: ltr; text-align: right; }
+/* time values must read hh:mm, not flipped by the RTL paragraph direction.
+   min-width:0 lets the native picker shrink inside flex rows instead of overflowing. */
+.field input[type="time"] { direction: ltr; text-align: right; min-width: 0; max-width: 100%; }
 .field input:focus, .field select:focus, .field textarea:focus {
   outline: 2px solid var(--primary);
   outline-offset: -1px;
@@ -310,6 +313,20 @@ main#main {
 
 .form-actions { display: flex; gap: 10px; margin-top: 20px; }
 .form-actions .btn { flex: 1; }
+
+/* Inside a sheet, keep the save/cancel row pinned to the bottom of the scroll
+   area so long forms (hours, product, report) never hide it. Negative margins
+   cancel the sheet-body padding so the bar spans the full width. */
+.sheet-body .form-actions {
+  position: sticky;
+  bottom: -12px;
+  z-index: 5;
+  margin: 18px -16px 0;
+  padding: 12px 16px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -4px 12px rgba(16, 24, 40, 0.06);
+}
 
 .form-error {
   background: var(--danger-soft);
@@ -360,7 +377,8 @@ main#main {
 .switch .track::after {
   content: "";
   position: absolute;
-  top: 3px;
+  /* track content-box is 26px (28 minus 1px borders); a 22px knob centers at top:2px */
+  top: 2px;
   right: 3px;
   width: 22px;
   height: 22px;
@@ -459,7 +477,8 @@ main#main {
   color: var(--text);
   background: var(--surface);
   min-height: 42px;
-  font-size: 13.5px;
+  /* 16px prevents the iOS focus auto-zoom, like the .field inputs. */
+  font-size: 16px;
 }
 .filter-bar input:focus {
   outline: 2px solid var(--primary);

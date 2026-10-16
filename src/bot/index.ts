@@ -25,11 +25,6 @@ export function createBot(app: BotApp): Bot {
   registerMessageHandlers(bot, app);
   registerAdminEntry(bot, app);
 
-  bot.command("cancel", async (ctx) => {
-    app.cart.resetCheckout(ctx.from!.id);
-    await ctx.reply("عملیات لغو شد.");
-  });
-
   return bot;
 }
 

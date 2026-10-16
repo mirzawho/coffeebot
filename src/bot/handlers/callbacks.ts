@@ -36,6 +36,12 @@ import { log } from "../../utils/logger";
 import { cardToCardAvailable } from "../../services/settings";
 import { walletKeyboard, ratingKeyboard } from "../keyboards";
 import { NO_ORDERS_TEXT, customerOrderDetailText, FULFILLMENT_LABELS } from "../format";
+import {
+  profileWizardCancel,
+  profileWizardConfirm,
+  profileWizardSkip,
+  startProfileWizard,
+} from "../profile-wizard";
 
 /** Show the main menu (edits when possible, otherwise sends). */
 export async function showMainMenu(ctx: Context, app: BotApp, edit = false): Promise<void> {
@@ -557,7 +563,10 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
   // ---- profile / wallet / order history / rating ----
 
   if (data === "prof") return showProfile(ctx, app);
-  if (data === "profedit") return startProfileEdit(ctx, app);
+  if (data === "profedit") return startProfileWizard(ctx, app);
+  if (data === "pf:skip") return profileWizardSkip(ctx, app);
+  if (data === "pf:ok") return profileWizardConfirm(ctx, app);
+  if (data === "pf:cancel") return profileWizardCancel(ctx, app);
   if (data === "wal") return showWallet(ctx, app);
   if (data === "wdep") return startDeposit(ctx, app);
   if (data === "whist") return showWalletHistory(ctx, app);
@@ -627,29 +636,6 @@ async function showProfile(ctx: Context, app: BotApp): Promise<void> {
   await ctx.reply(text, {
     reply_markup: new InlineKeyboard().text("✏️ ویرایش پروفایل", "profedit").row().text("🏠 منوی اصلی", "m"),
   });
-}
-
-/**
- * Step-by-step profile wizard: name → phone → optional address. Each answer is
- * validated as it arrives; the phone must match the mobile pattern (Persian
- * digits are converted). /cancel aborts at any step.
- */
-export async function startProfileEdit(ctx: Context, app: BotApp): Promise<void> {
-  const userId = ctx.from!.id;
-  const p = app.customers.getProfile(userId);
-  app.profileEdit.expect(userId, "name");
-  await ctx.reply(
-    [
-      "✏️ ویرایش پروفایل",
-      "",
-      "۱ از ۳ — نام و نام خانوادگی خود را بفرستید:",
-      p?.fullName ? `نام فعلی: ${p.fullName}` : "",
-      "",
-      "برای لغو /cancel را بفرستید.",
-    ]
-      .filter(Boolean)
-      .join("\n"),
-  );
 }
 
 async function showWallet(ctx: Context, app: BotApp): Promise<void> {

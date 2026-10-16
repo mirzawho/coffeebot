@@ -1297,6 +1297,110 @@ describe("customer flows through the bot", () => {
     expect(p?.address).toBeNull();
   });
 
+  test("profile wizard: every step carries لغو / بعدی / تأیید buttons", async () => {
+    app = buildApp({ type: "chat", reply: "x", actions: [], needsClarification: false });
+    const bot = fakeBot();
+    registerMessageHandlers(bot, app);
+    registerCallbackHandlers(bot, app);
+
+    const start = cbCtx("profedit");
+    await bot._handlers.get("callback_query")!(start);
+    // Step 1 (no saved name): only لغو is offered — name is required.
+    let cbs = callbacksOf(start._replies[0]!.opts?.reply_markup);
+    expect(cbs).toContain("pf:cancel");
+    expect(cbs).not.toContain("pf:skip");
+
+    const name = flowCtx("علی رضایی");
+    await bot._handlers.get("message:text")!(name);
+    // Step 2 (no saved phone): still no skip.
+    cbs = callbacksOf(name._replies[0]!.opts?.reply_markup);
+    expect(cbs).toContain("pf:cancel");
+    expect(cbs).not.toContain("pf:skip");
+
+    const phone = flowCtx("۰۹۱۲۱۲۳۴۵۶۷");
+    await bot._handlers.get("message:text")!(phone);
+    // Step 3 (address is optional): skip + confirm are offered.
+    cbs = callbacksOf(phone._replies[0]!.opts?.reply_markup);
+    expect(cbs).toContain("pf:skip");
+    expect(cbs).toContain("pf:ok");
+    expect(cbs).toContain("pf:cancel");
+  });
+
+  test("profile wizard: the لغو button aborts without saving", async () => {
+    app = buildApp({ type: "chat", reply: "x", actions: [], needsClarification: false });
+    const bot = fakeBot();
+    registerMessageHandlers(bot, app);
+    registerCallbackHandlers(bot, app);
+
+    await bot._handlers.get("callback_query")!(cbCtx("profedit"));
+    await bot._handlers.get("message:text")!(flowCtx("علی رضایی"));
+    const cancel = cbCtx("pf:cancel");
+    await bot._handlers.get("callback_query")!(cancel);
+
+    expect(cancel._replies.some((r) => r.text.includes("لغو شد"))).toBe(true);
+    expect(app.customers.getProfile(555)).toBeNull();
+    expect(app.profileEdit.isActive(555)).toBe(false);
+    // A later text is no longer captured by the wizard.
+    await bot._handlers.get("message:text")!(fakeCtx("سلام"));
+    expect(aiInputs.length).toBe(1);
+  });
+
+  test("profile wizard: the تأیید button saves the collected fields", async () => {
+    app = buildApp({ type: "chat", reply: "x", actions: [], needsClarification: false });
+    const bot = fakeBot();
+    registerMessageHandlers(bot, app);
+    registerCallbackHandlers(bot, app);
+
+    await bot._handlers.get("callback_query")!(cbCtx("profedit"));
+    await bot._handlers.get("message:text")!(flowCtx("علی رضایی"));
+    await bot._handlers.get("message:text")!(flowCtx("۰۹۱۲۱۲۳۴۵۶۷"));
+    const ok = cbCtx("pf:ok");
+    await bot._handlers.get("callback_query")!(ok);
+
+    const p = app.customers.getProfile(555);
+    expect(p?.fullName).toBe("علی رضایی");
+    expect(p?.phone).toBe("09121234567");
+    expect(ok._replies.some((r) => r.text.includes("پروفایل ذخیره شد"))).toBe(true);
+  });
+
+  test("profile wizard: the بعدی button keeps the saved value and advances", async () => {
+    app = buildApp({ type: "chat", reply: "x", actions: [], needsClarification: false });
+    app.customers.saveProfile(555, { fullName: "علی رضایی", phone: "09121234567" });
+    const bot = fakeBot();
+    registerMessageHandlers(bot, app);
+    registerCallbackHandlers(bot, app);
+
+    const start = cbCtx("profedit");
+    await bot._handlers.get("callback_query")!(start);
+    // A saved name exists → skip is offered on step 1.
+    expect(callbacksOf(start._replies[0]!.opts?.reply_markup)).toContain("pf:skip");
+    await bot._handlers.get("callback_query")!(cbCtx("pf:skip"));
+    // A saved phone exists → skip is offered on step 2.
+    await bot._handlers.get("callback_query")!(cbCtx("pf:skip"));
+    // Step 3: skip the address, then confirm.
+    await bot._handlers.get("callback_query")!(cbCtx("pf:skip"));
+
+    const p = app.customers.getProfile(555);
+    expect(p?.fullName).toBe("علی رضایی");
+    expect(p?.phone).toBe("09121234567");
+    expect(p?.address).toBeNull();
+  });
+
+  test("/cancel aborts an active profile wizard and says so", async () => {
+    app = buildApp({ type: "chat", reply: "x", actions: [], needsClarification: false });
+    const bot = fakeBot();
+    registerMessageHandlers(bot, app);
+    registerCallbackHandlers(bot, app);
+
+    await bot._handlers.get("callback_query")!(cbCtx("profedit"));
+    const cancel = flowCtx("/cancel");
+    await bot._handlers.get("message:text")!(cancel);
+
+    expect(cancel._replies.some((r) => r.text.includes("لغو شد"))).toBe(true);
+    expect(app.profileEdit.isActive(555)).toBe(false);
+    expect(app.customers.getProfile(555)).toBeNull();
+  });
+
   test("AI profile update: «من محمد محمدی هستم» saves the full name", async () => {
     app = buildApp({
       type: "profile_update",
