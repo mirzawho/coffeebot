@@ -12,13 +12,32 @@ services:
     image: coffeebot:latest
     container_name: coffeebot
     restart: unless-stopped
+    # Bind to loopback only: nginx (on the host) reaches the app through the
+    # Docker bridge, so publishing on 0.0.0.0 would expose the admin panel
+    # directly on the internet, bypassing TLS and the nginx rate limiter.
+    # Use "${HTTP_PORT:-3000}:3000" only if you have no reverse proxy.
     ports:
-      - "${HTTP_PORT:-3000}:3000"
+      - "127.0.0.1:${HTTP_PORT:-3000}:3000"
     env_file:
       - .env
     volumes:
       - ./data:/data
     # Healthcheck is baked into the image (hits /health).
+    networks:
+      cafe-net:
+        # Static IP: nginx.conf proxies to 172.28.0.10. Without a fixed address
+        # the container gets a random bridge IP on every restart and nginx
+        # starts proxying into the void (502 Bad Gateway).
+        ipv4_address: 172.28.0.10
 
 volumes:
   cafe-data:
+
+networks:
+  cafe-net:
+    name: cafe-net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+          gateway: 172.28.0.1

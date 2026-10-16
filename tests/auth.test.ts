@@ -3,6 +3,7 @@ import {
   validateInitData,
   requireAdmin,
   signInitData,
+  extractInitData,
   AuthError,
   INIT_DATA_MAX_AGE_SECONDS,
 } from "../src/api/middleware/auth";
@@ -107,5 +108,47 @@ describe("RateLimiter", () => {
     expect(rl.check("ip2", 0)).toBe(true);
     // After window reset
     expect(rl.check("ip1", 61_000)).toBe(true);
+  });
+});
+
+describe("extractInitData", () => {
+  const payload = signInitData(TOKEN, ADMIN, NOW_S);
+
+  test("reads the x-telegram-init-data header (case-insensitive)", () => {
+    const req = new Request("http://x/api/admin/me", {
+      headers: { "X-Telegram-Init-Data": payload },
+    });
+    expect(extractInitData(req)).toBe(payload);
+  });
+
+  test("accepts the Authorization: tma <initData> form", () => {
+    const req = new Request("http://x/api/admin/me", {
+      headers: { authorization: `tma ${payload}` },
+    });
+    expect(extractInitData(req)).toBe(payload);
+  });
+
+  test("prefers the header over the query param", () => {
+    const req = new Request(`http://x/api/admin/me?initData=other`, {
+      headers: { "x-telegram-init-data": payload },
+    });
+    expect(extractInitData(req, { allowQuery: true })).toBe(payload);
+  });
+
+  test("ignores query params unless explicitly allowed (dev only)", () => {
+    const req = new Request(`http://x/api/admin/me?initData=${encodeURIComponent(payload)}`);
+    expect(extractInitData(req)).toBeNull();
+    expect(extractInitData(req, { allowQuery: true })).toBe(payload);
+  });
+
+  test("returns null when nothing is present", () => {
+    expect(extractInitData(new Request("http://x/api/admin/me"))).toBeNull();
+  });
+
+  test("ignores blank header values", () => {
+    const req = new Request("http://x/api/admin/me", {
+      headers: { "x-telegram-init-data": "   " },
+    });
+    expect(extractInitData(req)).toBeNull();
   });
 });

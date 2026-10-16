@@ -47,12 +47,12 @@
     void cfg.refresh();
   }
 
-  function showFatal(message) {
+  function showFatal(message, onRetry) {
     for (const key of Object.keys(PAGES)) {
       const page = document.getElementById(`page-${key}`);
       page.hidden = key !== state.page;
       page.innerHTML = "";
-      if (key === state.page) page.appendChild(Ui.errorState(message));
+      if (key === state.page) page.appendChild(Ui.errorState(message, onRetry));
     }
   }
 
@@ -83,16 +83,41 @@
       if (typeof tg.setHeaderColor === "function") tg.setHeaderColor("#ffffff");
     }
 
+    // Diagnostics: the two failure modes below look identical in the UI but
+    // have very different causes, so log which one we are in.
+    if (!Api.isTelegram()) {
+      console.warn(
+        "[admin] no signed initData available — the Telegram SDK did not inject " +
+          "window.Telegram.WebApp.initData. Open the panel from inside the bot, or " +
+          "for local development append ?initData=<signed payload> and set " +
+          "ALLOW_INIT_DATA_QUERY=1 on the server.",
+      );
+    }
+
     // Bootstrap: identity (validated server-side) + app context.
     try {
       state.me = await Api.get("/api/admin/me");
     } catch (err) {
       if (err.status === 401 || err.status === 403) {
-        showFatal("برای استفاده از پنل مدیریت، آن را از داخل ربات تلگرام باز کنید.");
+        showFatal(
+          "برای استفاده از پنل مدیریت، آن را از داخل ربات تلگرام باز کنید.",
+          () => void boot(),
+        );
         toast("دسترسی غیرمجاز", true);
         return;
       }
-      showFatal("ارتباط با سرور برقرار نشد. اینترنت خود را بررسی کنید و دوباره تلاش کنید.");
+      if (err.status === 429) {
+        showFatal(
+          "تعداد درخواست‌ها زیاد است. چند لحظه صبر کنید و دوباره تلاش کنید.",
+          () => void boot(),
+        );
+        toast("تعداد درخواست‌ها زیاد است", true);
+        return;
+      }
+      showFatal(
+        "ارتباط با سرور برقرار نشد. اینترنت خود را بررسی کنید و دوباره تلاش کنید.",
+        () => void boot(),
+      );
       return;
     }
 

@@ -41,8 +41,18 @@ describe("CSP (BUG-001 regression)", () => {
     expect(fontPart.replace("font-src", "").trim().split(/\s+/)).toEqual(["https://fonts.gstatic.com"]);
   });
 
-  test("keeps frame-ancestors restricted", () => {
-    expect(csp).toContain("frame-ancestors 'self'");
+  test("does not send X-Frame-Options (Telegram Web frames the Mini App)", () => {
+    expect(SECURITY_HEADERS["x-frame-options"]).toBeUndefined();
+  });
+
+  test("allows Telegram to frame the Mini App, and nobody else", () => {
+    const framePart = csp.split(";").map((s) => s.trim()).find((s) => s.startsWith("frame-ancestors"))!;
+    const origins = framePart.replace("frame-ancestors", "").trim().split(/\s+/);
+    expect(origins).toContain("'self'");
+    expect(origins).toContain("https://web.telegram.org");
+    // Never a bare wildcard — only the *.telegram.org subdomain form.
+    expect(origins).not.toContain("*");
+    expect(origins.every((o) => o === "'self'" || o.endsWith("telegram.org"))).toBe(true);
   });
 
   test("index.html loads the SDK from the permitted origin", async () => {
@@ -81,6 +91,33 @@ describe("client IP extraction (BUG-006 regression)", () => {
     } finally {
       delete process.env.TRUSTED_PROXIES;
     }
+  });
+
+  test("walks the XFF chain right-to-left and skips trusted proxies", () => {
+    process.env.TRUSTED_PROXIES = "172.28.0.1";
+    try {
+      // nginx appended the real client (198.51.100.7) after the spoofed entry.
+      const req = new Request("http://x/", {
+        headers: { "x-forwarded-for": "1.2.3.4, 198.51.100.7, 172.28.0.1" },
+      });
+      expect(clientIp(req, fakeServer("172.28.0.1"))).toBe("198.51.100.7");
+    } finally {
+      delete process.env.TRUSTED_PROXIES;
+    }
+  });
+
+  test("TRUST_PROXY=1 returns the client, not the proxy", () => {
+    const req = new Request("http://x/", {
+      headers: { "x-forwarded-for": "203.0.113.7, 172.28.0.1" },
+    });
+    expect(clientIp(req, fakeServer("172.28.0.1"), 1)).toBe("203.0.113.7");
+  });
+
+  test("TRUST_PROXY=0 ignores X-Forwarded-For entirely", () => {
+    const req = new Request("http://x/", {
+      headers: { "x-forwarded-for": "203.0.113.7" },
+    });
+    expect(clientIp(req, fakeServer("172.28.0.1"), 0)).toBe("172.28.0.1");
   });
 
   test("handles missing requestIP gracefully", () => {

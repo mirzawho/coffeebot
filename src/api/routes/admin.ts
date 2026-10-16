@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { ApiApp } from "../context";
 import {
   AuthError,
+  extractInitData,
   requireAdmin,
   validateInitData,
   type TelegramUser,
@@ -76,8 +77,14 @@ async function readJson(req: Request): Promise<any> {
 }
 
 function authenticate(req: Request, app: ApiApp): TelegramUser {
-  const initData = req.headers.get("x-telegram-init-data");
-  if (!initData) throw new AuthError("missing x-telegram-init-data header");
+  const initData = extractInitData(req, { allowQuery: app.config.allowInitDataQuery });
+  if (!initData) {
+    // Actionable message: the Mini App shows this verbatim, so it must tell the
+    // operator what to do rather than just naming the missing header.
+    throw new AuthError(
+      "missing x-telegram-init-data header — open the panel from inside the Telegram bot",
+    );
+  }
   const validated = validateInitData(initData, app.config.botToken);
   return requireAdmin(validated, app.config.adminIds);
 }

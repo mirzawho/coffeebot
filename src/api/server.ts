@@ -13,39 +13,122 @@ const authLimiter = new RateLimiter(20, 60_000);
 
 export const SECURITY_HEADERS: Record<string, string> = {
   "x-content-type-options": "nosniff",
-  "x-frame-options": "DENY",
   "referrer-policy": "no-referrer",
+  // NOTE: no X-Frame-Options. Telegram Web renders Mini Apps inside an iframe,
+  // and X-Frame-Options: DENY makes the panel render as a blank page there.
+  // Framing is controlled by CSP frame-ancestors instead, which is the modern
+  // replacement and can express "Telegram may frame me, nobody else".
+  // The Telegram Web hosts are listed explicitly (no wildcard) so a compromised
+  // or look-alike subdomain cannot frame the panel.
+  //
   // script-src must allow the official Telegram Mini App SDK origin; everything
   // else stays same-origin. connect-src stays 'self' (the Mini App only calls
   // our own API); img-src covers local product images, inline data: previews,
   // and the admin's Telegram profile photo (specific hosts, no wildcards).
   // style/font-src allow Google Fonts to serve Vazirmatn (the required Persian UI font).
   "content-security-policy":
-    "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https://t.me https://cdn4.telesco.pe; connect-src 'self'; frame-ancestors 'self'",
+    "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https://t.me https://cdn4.telesco.pe; connect-src 'self'; frame-ancestors 'self' https://web.telegram.org https://webk.telegram.org https://webz.telegram.org",
 };
 
-function json(data: unknown, status = 200): Response {
+/**
+ * CORS for the Mini App.
+ *
+ * Same-origin requests (the normal case: the panel is served by this very
+ * server) need no CORS at all. It matters when the panel is opened from
+ * web.telegram.org — Telegram Web hosts Mini Apps in an iframe on a different
+ * origin — or from a local dev server. Only exact origins are echoed back;
+ * never "*", because the API is credentialed and a wildcard would let any
+ * website read admin responses.
+ */
+const ALLOWED_CORS_ORIGINS = new Set([
+  "https://web.telegram.org",
+  "https://webk.telegram.org",
+  "https://webz.telegram.org",
+]);
+
+function corsHeaders(req: Request, app: ApiApp): Record<string, string> {
+  const origin = req.headers.get("origin");
+  if (!origin) return {};
+  const allowed =
+    ALLOWED_CORS_ORIGINS.has(origin) ||
+    origin === app.config.appBaseUrl ||
+    /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+  if (!allowed) return {};
+  return {
+    "access-control-allow-origin": origin,
+    "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    "access-control-allow-headers": "content-type, x-telegram-init-data, authorization",
+    "access-control-max-age": "86400",
+    vary: "Origin",
+  };
+}
+
+function json(data: unknown, status = 200, extra: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8", ...SECURITY_HEADERS },
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      ...SECURITY_HEADERS,
+      ...extra,
+    },
   });
 }
 
-export function clientIp(req: Request, server: { requestIP(r: Request): { address: string } | null }): string {
+/**
+ * Resolve the real client IP.
+ *
+ * X-Forwarded-For is a comma-separated chain: `client, proxy1, proxy2`. Each
+ * proxy APPENDS the address it received the connection from, so the RIGHTMOST
+ * entry is the most trustworthy one and the leftmost is fully client-supplied.
+ * We therefore walk the chain from the right and skip every address that
+ * belongs to a trusted proxy; the first untrusted address is the client.
+ *
+ * This is what makes `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`
+ * in nginx safe: a client sending `X-Forwarded-For: 1.2.3.4` only prepends a
+ * bogus entry, which we never reach because nginx's own appended address is
+ * already untrusted.
+ *
+ * Trust is configured with TRUSTED_PROXIES (explicit IPs, preferred) or
+ * TRUST_PROXY (number of hops, like Express's `app.set('trust proxy', N)`).
+ */
+export function clientIp(
+  req: Request,
+  server: { requestIP(r: Request): { address: string } | null },
+  trustProxy = 0,
+): string {
   // Socket-level address first — unspoofable by the client.
   const peer = server.requestIP(req)?.address ?? "local";
-  // Only honor forwarded headers when a trusted reverse proxy is configured.
-  // Without this, any client could spoof X-Forwarded-For to bypass rate limits.
+
   const trustedProxies = (process.env.TRUSTED_PROXIES ?? "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+
+  const forwarded = (req.headers.get("x-forwarded-for") ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  // Explicit allowlist: only honor XFF when the peer really is a known proxy.
   if (trustedProxies.length > 0) {
-    const forwarded = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-    if (forwarded && trustedProxies.includes(peer)) {
-      return forwarded;
+    if (!trustedProxies.includes(peer)) return peer;
+    for (let i = forwarded.length - 1; i >= 0; i--) {
+      const candidate = forwarded[i]!;
+      if (!trustedProxies.includes(candidate)) return candidate;
     }
+    return peer;
   }
+
+  // Hop-count mode: trust the last N entries (the proxies) and take the one
+  // before them. With TRUST_PROXY=1 and `client, nginx` we return `client`.
+  if (trustProxy > 0 && forwarded.length > 0) {
+    const idx = forwarded.length - 1 - trustProxy;
+    if (idx >= 0) return forwarded[idx]!;
+    // Fewer entries than trusted hops: the chain is shorter than expected, so
+    // fall back to the leftmost entry rather than trusting a proxy address.
+    return forwarded[0]!;
+  }
+
   return peer;
 }
 
@@ -111,23 +194,39 @@ export function createHttpServer(app: ApiApp) {
 
       // Admin API (auth + rate-limited).
       if (path.startsWith("/api/admin/")) {
-        const ip = clientIp(req, server);
+        const cors = corsHeaders(req, app);
+
+        // CORS preflight: the browser sends OPTIONS before any request that
+        // carries the custom x-telegram-init-data header. Answer it here so the
+        // real request is never rejected by the auth layer.
+        if (req.method === "OPTIONS") {
+          return new Response(null, { status: 204, headers: { ...SECURITY_HEADERS, ...cors } });
+        }
+
+        const ip = clientIp(req, server, app.config.trustProxy);
         if (!authLimiter.check(`auth:${ip}`)) {
-          return json({ error: "too many requests" }, 429);
+          // JSON (never HTML) + Retry-After so the Mini App can show a real
+          // message instead of a generic "خطا در دریافت اطلاعات".
+          return json(
+            { error: "too many requests", code: "RATE_LIMITED" },
+            429,
+            { "retry-after": "5", ...cors },
+          );
         }
         try {
           const res = await handleAdminApi(req, app);
           if (res) {
-            // Ensure security headers on API responses too.
+            // Ensure security + CORS headers on API responses too.
             const headers = new Headers(res.headers);
             for (const [k, v] of Object.entries(SECURITY_HEADERS)) headers.set(k, v);
+            for (const [k, v] of Object.entries(cors)) headers.set(k, v);
             return new Response(res.body, { status: res.status, headers });
           }
         } catch (err) {
           log.error("admin api crash", { err: String(err) });
-          return json({ error: "internal error" }, 500);
+          return json({ error: "internal error" }, 500, cors);
         }
-        return json({ error: "not found" }, 404);
+        return json({ error: "not found" }, 404, cors);
       }
 
       // Any other /api path is rejected (no public customer API exposes secrets).

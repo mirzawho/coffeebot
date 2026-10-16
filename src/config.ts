@@ -15,6 +15,18 @@ export interface Config {
   outboundProxyUrl: string;
   /** Editable AI persona file (style only; core rules stay in code). */
   aiPersonaFile: string;
+  /**
+   * Number of trusted reverse-proxy hops in front of the app (Express's
+   * `app.set('trust proxy', N)`). 0 = not behind a proxy. Used only when
+   * TRUSTED_PROXIES is empty; TRUSTED_PROXIES is preferred because it cannot
+   * be defeated by adding extra hops.
+   */
+  trustProxy: number;
+  /**
+   * DEV ONLY: accept initData from ?initData= / ?tgWebAppData= query params.
+   * Never enable in production (query strings leak into logs and Referer).
+   */
+  allowInitDataQuery: boolean;
 }
 
 export function parseAdminIds(raw: string | undefined): Set<number> {
@@ -41,6 +53,12 @@ function parseLogLevel(raw: string | undefined): LogLevel {
   const v = (raw ?? "info").toLowerCase();
   if (v === "debug" || v === "info" || v === "warn" || v === "error") return v;
   throw new Error(`Invalid LOG_LEVEL: "${raw}". Use debug, info, warn, or error.`);
+}
+
+/** "1"/"true"/"yes"/"on" (case-insensitive) => true; anything else => false. */
+function parseBool(raw: string | undefined): boolean {
+  const v = (raw ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
 /**
@@ -102,10 +120,19 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     throw new Error(`Invalid HTTP_PORT: "${env.HTTP_PORT}"`);
   }
 
+  // Trusted reverse-proxy hops (Express's `app.set('trust proxy', N)`).
+  // 0 = direct exposure. Only consulted when TRUSTED_PROXIES is empty.
+  const trustProxyRaw = (env.TRUST_PROXY ?? "0").trim();
+  const trustProxy = Number(trustProxyRaw);
+  if (!Number.isInteger(trustProxy) || trustProxy < 0 || trustProxy > 10) {
+    throw new Error(
+      `Invalid TRUST_PROXY: "${trustProxyRaw}". Use 0 (no proxy) or the number of proxy hops, e.g. TRUST_PROXY=1 behind nginx.`,
+    );
+  }
+
   // Optional outbound proxy. Bun's fetch only supports HTTP(S) CONNECT proxies
   // (socks5:// is rejected), so validate the scheme up-front with a clear error.
-  const outboundProxyUrl = (env.OUTBOUND_PROXY_URL ?? "").trim().replace(/\/$/, "");
-  if (outboundProxyUrl) {
+  const outboundProxyUrl = (env.OUTBOUND_PROXY_URL ?? "").trim().replace(/\/$/, "");  if (outboundProxyUrl) {
     let proxyUrl: URL;
     try {
       proxyUrl = new URL(outboundProxyUrl);
@@ -134,5 +161,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     httpPort,
     outboundProxyUrl,
     aiPersonaFile: (env.AI_PERSONA_FILE ?? "").trim(),
+    trustProxy,
+    allowInitDataQuery: parseBool(env.ALLOW_INIT_DATA_QUERY),
   };
 }

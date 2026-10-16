@@ -114,6 +114,45 @@ export function validateInitData(
   };
 }
 
+/**
+ * Pull the signed initData out of a request.
+ *
+ * Order matters:
+ *   1. `x-telegram-init-data` header — what the Mini App sends (and what nginx
+ *      forwards explicitly). Header names are case-insensitive.
+ *   2. `Authorization: tma <initData>` — the documented alternative for
+ *      clients that cannot set custom headers.
+ *   3. `?initData=` / `?tgWebAppData=` query params — DEV ONLY. Telegram itself
+ *      puts initData in the URL fragment (`#tgWebAppData=...`), which never
+ *      reaches the server, so this is only useful for local testing. It is
+ *      gated behind ALLOW_INIT_DATA_QUERY because query strings end up in
+ *      access logs, browser history and Referer headers.
+ *
+ * Returns null when nothing usable is present — callers turn that into a 401
+ * with an actionable message instead of a generic failure.
+ */
+export function extractInitData(
+  req: Request,
+  opts: { allowQuery?: boolean } = {},
+): string | null {
+  const header = req.headers.get("x-telegram-init-data");
+  if (header && header.trim()) return header.trim();
+
+  const auth = req.headers.get("authorization");
+  if (auth) {
+    const m = /^tma\s+(.+)$/i.exec(auth.trim());
+    if (m && m[1]!.trim()) return m[1]!.trim();
+  }
+
+  if (opts.allowQuery) {
+    const url = new URL(req.url);
+    const q = url.searchParams.get("initData") ?? url.searchParams.get("tgWebAppData");
+    if (q && q.trim()) return q.trim();
+  }
+
+  return null;
+}
+
 /** Authorization gate: authenticated Telegram user must be in ADMIN_IDS. */
 export function requireAdmin(
   validated: ValidatedInitData,

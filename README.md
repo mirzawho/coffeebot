@@ -105,6 +105,25 @@ The image runs as a non-root user, stores all state under `/data`, exposes port 
 
 Put a TLS-terminating reverse proxy (Caddy, nginx, Traefik) in front of it and set `APP_BASE_URL` to the public HTTPS origin.
 
+### Behind a reverse proxy (required for the Mini App)
+
+The admin panel authenticates every request with Telegram's signed `initData`, sent in the `x-telegram-init-data` header. Two things must be right or the panel fails in production with `429 Too many requests` or `missing x-telegram-init-data header`:
+
+1. **Tell the app which proxy to trust.** Otherwise every request looks like it came from the proxy's IP, so the per-IP rate limiter puts all users in one bucket and returns 429 as soon as a few people open the panel. Set **one** of:
+
+   ```bash
+   TRUSTED_PROXIES=172.28.0.1   # preferred: explicit proxy IPs (Docker bridge gateway)
+   TRUST_PROXY=1                # alternative: trust N hops, like Express's app.set('trust proxy', 1)
+   ```
+
+   `TRUSTED_PROXIES` is preferred because the app walks `X-Forwarded-For` from the **right** and skips trusted addresses, so a client-supplied `X-Forwarded-For` cannot spoof its IP. `TRUST_PROXY=N` trusts the last N entries instead.
+
+2. **Append, don't overwrite, `X-Forwarded-For`.** In nginx use `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` — **not** `$remote_addr`. Overwriting collapses every client into the proxy's IP and causes exactly the 429 storm above. A ready-to-use config is in `nginx.conf` (it also raises the header buffers for the multi-KB `initData` header, forwards `x-telegram-init-data` explicitly, answers CORS preflight, and drops `X-Frame-Options` so Telegram Web can embed the panel in an iframe).
+
+The app's own `429`/`401` responses are always JSON (`{"error": "...", "code": "RATE_LIMITED"}`) with a `Retry-After` header, so the Mini App can show a real message instead of a generic error.
+
+For local development without Telegram, set `ALLOW_INIT_DATA_QUERY=1` and open `https://your-host/?initData=<signed payload>`. **Never enable this in production** — query strings leak into access logs and `Referer` headers.
+
 ### Telegram Mini App setup
 
 1. Talk to @BotFather → `/newbot` → copy the token into `BOT_TOKEN`.
