@@ -8,8 +8,10 @@ import { botState } from "../bot/state";
 
 const ADMIN_DIR = join(import.meta.dir, "..", "admin");
 
-// Stricter limit for anything under /api (auth + admin API).
-const authLimiter = new RateLimiter(20, 60_000);
+// Per-IP limit for anything under /api (auth + admin API). Sized generously
+// (5000/min) because the panel fires a burst of parallel requests on load and
+// a collapsed IP bucket (proxy misconfig) must never lock operators out.
+const authLimiter = new RateLimiter(5000, 60_000);
 
 export const SECURITY_HEADERS: Record<string, string> = {
   "x-content-type-options": "nosniff",
@@ -202,6 +204,13 @@ export function createHttpServer(app: ApiApp) {
         if (req.method === "OPTIONS") {
           return new Response(null, { status: 204, headers: { ...SECURITY_HEADERS, ...cors } });
         }
+
+        // TEMP DIAGNOSTIC: traces initData delivery end-to-end. Remove once
+        // production is stable. Length only — the header value is never logged.
+        const initDataLen = req.headers.get("x-telegram-init-data")?.length ?? 0;
+        console.log(
+          `[diag] Incoming Request: ${req.method} ${path} | initData Header Length: ${initDataLen} | Client IP seen by App: ${clientIp(req, server, app.config.trustProxy)}`,
+        );
 
         const ip = clientIp(req, server, app.config.trustProxy);
         if (!authLimiter.check(`auth:${ip}`)) {

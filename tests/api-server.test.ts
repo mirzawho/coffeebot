@@ -130,11 +130,11 @@ describe("error responses are JSON, never HTML", () => {
     const headers = {
       "x-telegram-init-data": signInitData(BOT_TOKEN, ADMIN as any, Math.floor(Date.now() / 1000)),
     };
-    // The limiter allows 20/min per IP; fire enough to trip it regardless of
+    // The limiter allows 5000/min per IP; fire enough to trip it regardless of
     // how many requests earlier tests already consumed.
     const statuses: number[] = [];
     let limited: Response | null = null;
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < 5010; i++) {
       const res = await fetch(`${base}/api/admin/me`, { headers });
       statuses.push(res.status);
       if (res.status === 429 && !limited) limited = res;
