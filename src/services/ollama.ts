@@ -96,11 +96,6 @@ export interface AiInput {
    * the hardcoded core rules; can never grant permissions or change behavior.
    */
   persona?: string;
-  /**
-   * When provided, the raw model text is streamed here as it is generated
-   * (best-effort; the caller must tolerate arbitrary chunk boundaries).
-   */
-  onDelta?: (delta: string) => void;
   /** Saved customer first name for personalization (never invented). */
   customerFirstName?: string | null;
   /** Whether the outside-business-hours price rule currently applies. */
@@ -549,9 +544,6 @@ export class OllamaService implements AiService {
     log.info("ai request started", { model: this.cfg.model, chars: message.length });
     // Bun-specific fetch extension (not in the DOM RequestInit type).
     const fetchOptions = (this.cfg.proxy ? { proxy: this.cfg.proxy } : {}) as RequestInit;
-    // Streaming is only useful when a consumer wants the raw text; the intent
-    // JSON itself is never streamed to the customer.
-    const stream = typeof input.onDelta === "function";
     try {
       const res = await fetch(`${this.cfg.baseUrl}/chat/completions`, {
         method: "POST",
@@ -563,7 +555,7 @@ export class OllamaService implements AiService {
           model: this.cfg.model,
           messages: buildMessages({ ...input, message }),
           temperature: 0.2,
-          stream,
+          stream: false,
           // OpenAI-compatible JSON mode; if the endpoint rejects it we retry without (below).
           response_format: { type: "json_object" },
         }),
@@ -583,7 +575,7 @@ export class OllamaService implements AiService {
             model: this.cfg.model,
             messages: buildMessages({ ...input, message }),
             temperature: 0.2,
-            stream,
+            stream: false,
           }),
           signal: controller.signal,
           ...fetchOptions,
@@ -594,7 +586,7 @@ export class OllamaService implements AiService {
           log.warn("ai unavailable", { reason: "retry_failed", status: retry.status });
           return unavailableResult();
         }
-        return await this.consume(retry, stream, input, catalog(input));
+        return this.parse(await retry.json(), catalog(input));
       }
 
       if (!res.ok) {
@@ -617,7 +609,7 @@ export class OllamaService implements AiService {
         return unavailableResult();
       }
 
-      return await this.consume(res, stream, input, catalog(input));
+      return this.parse(await res.json(), catalog(input));
     } catch (err) {
       const { reason, detail } = describeFetchError(err);
       log.warn("ai request failed", { reason, err: detail });
@@ -626,81 +618,6 @@ export class OllamaService implements AiService {
     } finally {
       clearTimeout(timeout);
     }
-  }
-
-  /**
-   * Consume the model response: a plain JSON body, or — when streaming was
-   * requested — an SSE stream whose deltas are accumulated in order (and
-   * forwarded via onDelta). The final validated AiResult is produced only from
-   * the COMPLETE text — partial intent JSON is never executed or exposed.
-   */
-  private async consume(
-    res: Response,
-    streamed: boolean,
-    input: AiInput,
-    cat: AiInput["catalog"],
-  ): Promise<AiResult> {
-    if (streamed) {
-      // SSE stream: data: {"choices":[{"delta":{"content":"..."}}]} ... [DONE]
-      let full = "";
-      try {
-        const reader = res.body?.getReader();
-        if (!reader) {
-          log.warn("ai response invalid", { reason: "empty_stream" });
-          log.warn("ai fallback used", { reason: "invalid_response" });
-          return fallbackResult();
-        }
-        const decoder = new TextDecoder();
-        let buffer = "";
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          let idx: number;
-          while ((idx = buffer.indexOf("\n")) >= 0) {
-            const line = buffer.slice(0, idx).trim();
-            buffer = buffer.slice(idx + 1);
-            if (!line.startsWith("data:")) continue;
-            const payload = line.slice(5).trim();
-            if (payload === "[DONE]") continue;
-            try {
-              const chunk = JSON.parse(payload);
-              const delta = chunk?.choices?.[0]?.delta?.content;
-              if (typeof delta === "string" && delta) {
-                full += delta;
-                try {
-                  input.onDelta?.(delta);
-                } catch {
-                  /* consumer callback must never break the stream */
-                }
-              }
-            } catch {
-              /* skip malformed keep-alive/comment lines */
-            }
-          }
-        }
-      } catch (err) {
-        // Incomplete stream: keep whatever accumulated and parse it below.
-        log.warn("ai stream interrupted", { err: String((err as any)?.message ?? err) });
-      }
-      if (!full.trim()) {
-        log.warn("ai response invalid", { reason: "empty_stream_content" });
-        log.warn("ai fallback used", { reason: "invalid_response" });
-        return fallbackResult();
-      }
-      log.info("ai stream completed", { chars: full.length });
-      const result = validateResult(extractJson(full), cat);
-      if (!result) {
-        log.warn("ai response invalid", { reason: "unparseable_json" });
-        log.warn("ai fallback used", { reason: "invalid_response" });
-        return fallbackResult();
-      }
-      log.info("ai response parsed", { type: result.type, actions: result.actions.length });
-      return result;
-    }
-
-    // Non-streaming JSON body (previous behavior).
-    return this.parse(await res.json(), cat);
   }
 
   private parse(data: unknown, cat: AiInput["catalog"]): AiResult {

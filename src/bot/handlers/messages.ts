@@ -34,7 +34,7 @@ import { validateReceipt } from "../receipt";
 import { isIdentityQuestion, buildIdentityReply } from "../identity";
 import { log } from "../../utils/logger";
 import { showHelp, showMainMenu, showCart, startCheckoutFlow, sendConfirmStage, sendFulfillmentChoice } from "./callbacks";
-import { withTypingIndicator, TelegramStreamer } from "../typing";
+import { withTypingIndicator } from "../typing";
 import { walletKeyboard } from "../keyboards";
 import { formatMoney } from "../../utils/money";
 import { toPersianDigits } from "../../utils/dates";
@@ -153,11 +153,11 @@ async function handleText(ctx: Context, app: BotApp, text: string): Promise<void
 
   // Checkout states take precedence over AI.
   if (cart.state === "checkout_payment") {
-    const { payment } = app.orders.getPaymentInstructions(userId);
+    const { payment, total } = app.orders.getPaymentInstructions(userId);
     await ctx.reply(PAYMENT_CHOICE_PROMPT_TEXT, {
       reply_markup: paymentMethodKeyboard({
         walletBalance: app.customers.getBalance(userId),
-        total: app.cart.getTotals(userId).total,
+        total,
         walletEnabled: payment.walletEnabled,
         cardEnabled: cardToCardAvailable(payment),
       }),
@@ -218,9 +218,6 @@ async function handleNaturalLanguage(ctx: Context, app: BotApp, text: string): P
 
   log.info("text routed to ai", { userId, chars: text.length, state: cart.state });
 
-  // Progressive display for the model's customer-facing text. The intent JSON
-  // itself is never streamed — only the validated `reply` is shown.
-  const streamer = new TelegramStreamer(ctx);
   let result;
   try {
     result = await withTypingIndicator(
@@ -247,14 +244,12 @@ async function handleNaturalLanguage(ctx: Context, app: BotApp, text: string): P
                 timesOrdered: u.timesOrdered,
               }))
             : undefined,
-        onDelta: (delta) => streamer.append(delta),
       }),
     );
   } catch (err) {
     // understand() must not throw for network/model failures (they become an
     // "unavailable" result); reaching here means an unexpected application error.
     log.error("ai understand threw", { userId, err: String(err) });
-    await streamer.finalize().catch(() => {});
     await ctx.reply(AI_FALLBACK_TEXT, { reply_markup: mainMenu(app.cart.lineCount(userId)) });
     return;
   }
@@ -265,25 +260,18 @@ async function handleNaturalLanguage(ctx: Context, app: BotApp, text: string): P
     switch (result.type) {
       case "product_offer":
       case "price_check": {
-        // The streamed text (if any) is the model's lead-in; finalize it, then
-        // append the confirmation cards.
-        const lead = await streamer.finalize();
-        await sendOfferCards(ctx, app, result, lead);
+        await sendOfferCards(ctx, app, result);
         break;
       }
       case "cart_view": {
-        const lead = await streamer.finalize();
-        if (lead && lead !== FALLBACK_REPLY) {
-          // Lead already delivered via the stream; just show the cart after it.
-        } else if (result.reply && result.reply !== FALLBACK_REPLY) {
+        if (result.reply && result.reply !== FALLBACK_REPLY) {
           await ctx.reply(result.reply);
         }
         await showCart(ctx, app, false);
         break;
       }
       case "checkout": {
-        const lead = await streamer.finalize();
-        if (!lead && result.reply && result.reply !== FALLBACK_REPLY) {
+        if (result.reply && result.reply !== FALLBACK_REPLY) {
           await ctx.reply(result.reply);
         }
         await startCheckoutFlow(ctx, app);
@@ -291,28 +279,23 @@ async function handleNaturalLanguage(ctx: Context, app: BotApp, text: string): P
       }
       case "order_status": {
         // Status always comes from the database — the model only routes here.
-        await streamer.finalize().catch(() => {});
         const latest = app.orders.latestOrderFor(userId);
         await ctx.reply(latest ? orderStatusText(latest) : NO_ORDERS_TEXT);
         break;
       }
       case "cart_action": {
-        const lead = await streamer.finalize();
-        await applyCartActions(ctx, app, result, lead);
+        await applyCartActions(ctx, app, result);
         break;
       }
       case "profile_update": {
         // The model extracted profile facts; the backend re-validates them
         // (phone pattern, lengths) before anything is saved.
-        const lead = await streamer.finalize();
-        await applyAiProfileUpdate(ctx, app, result, lead);
+        await applyAiProfileUpdate(ctx, app, result);
         break;
       }
       default: {
-        // chat / clarification — the streamed text IS the reply; finalize
-        // delivers it exactly once (or sends it fresh if nothing streamed).
-        const delivered = await streamer.finalize();
-        if (!delivered && result.reply) await ctx.reply(result.reply);
+        // chat / clarification — one normal reply with the validated text.
+        if (result.reply) await ctx.reply(result.reply);
         break;
       }
     }
@@ -327,8 +310,8 @@ async function handleNaturalLanguage(ctx: Context, app: BotApp, text: string): P
   log.info("ai reply delivered", { userId, type: result.type });
 }
 
-/** Render a confirmation/info card per resolved offer. `lead` is the already-delivered streamed text. */
-async function sendOfferCards(ctx: Context, app: BotApp, result: AiResult, lead = ""): Promise<void> {
+/** Render a confirmation/info card per resolved offer. */
+async function sendOfferCards(ctx: Context, app: BotApp, result: AiResult): Promise<void> {
   const userId = ctx.from!.id;
   const { payment } = app.orders.getPaymentInstructions(userId);
   const currency = payment.currency;
@@ -345,11 +328,7 @@ async function sendOfferCards(ctx: Context, app: BotApp, result: AiResult, lead 
       ? resolved.variant
       : product.variants.find((v) => v.id === offer.variantId) ?? null;
     const leadText =
-      i === 0 && lead && lead !== FALLBACK_REPLY
-        ? `${lead}\n\n`
-        : i === 0 && !lead && result.reply && result.reply !== FALLBACK_REPLY
-          ? `${result.reply}\n\n`
-          : "";
+      i === 0 && result.reply && result.reply !== FALLBACK_REPLY ? `${result.reply}\n\n` : "";
     const card = leadText + productCardText(product, variant, offer.quantity, available, currency);
     const alternatives = available
       ? []
@@ -380,13 +359,13 @@ async function sendOfferCards(ctx: Context, app: BotApp, result: AiResult, lead 
   }
   if (!sent) {
     // The model claimed products but none survived validation — ask, don't guess.
-    const text = lead && lead !== FALLBACK_REPLY ? lead : result.reply && result.reply !== FALLBACK_REPLY ? result.reply : FALLBACK_REPLY;
+    const text = result.reply && result.reply !== FALLBACK_REPLY ? result.reply : FALLBACK_REPLY;
     await ctx.reply(text);
   }
 }
 
 /** Apply only backend-validated cart actions; clear requires confirmation. */
-async function applyCartActions(ctx: Context, app: BotApp, result: AiResult, lead = ""): Promise<void> {
+async function applyCartActions(ctx: Context, app: BotApp, result: AiResult): Promise<void> {
   const userId = ctx.from!.id;
   const { payment } = app.orders.getPaymentInstructions(userId);
   const currency = payment.currency;
@@ -436,7 +415,7 @@ async function applyCartActions(ctx: Context, app: BotApp, result: AiResult, lea
     }
   }
 
-  const after = app.cart.getTotals(userId);
+  const after = app.orders.getPaymentInstructions(userId);
 
   if (clearRequested) {
     if (after.lines.length === 0) {
@@ -451,8 +430,7 @@ async function applyCartActions(ctx: Context, app: BotApp, result: AiResult, lea
     return;
   }
 
-  // The streamed lead (if any) already reached the customer; don't repeat it.
-  const replyParts: string[] = lead && lead !== FALLBACK_REPLY ? [] : [result.reply];
+  const replyParts: string[] = [result.reply];
   if (errors.length > 0) replyParts.push(...errors.slice(0, 3));
   if (applied.length > 0 || result.actions.length > 0) {
     replyParts.push("");
@@ -470,7 +448,7 @@ async function applyCartActions(ctx: Context, app: BotApp, result: AiResult, lea
  * Only fields present in the message are changed; the phone is normalized
  * (Persian digits → English) and must match the mobile pattern.
  */
-async function applyAiProfileUpdate(ctx: Context, app: BotApp, result: AiResult, lead = ""): Promise<void> {
+async function applyAiProfileUpdate(ctx: Context, app: BotApp, result: AiResult): Promise<void> {
   const userId = ctx.from!.id;
   const fields = result.profileFields ?? {};
   const existing = app.customers.getProfile(userId);
@@ -488,9 +466,9 @@ async function applyAiProfileUpdate(ctx: Context, app: BotApp, result: AiResult,
   if (fields.address !== undefined) input.address = fields.address;
 
   const r = app.customers.saveProfile(userId, input);
+  const leadText = result.reply && result.reply !== FALLBACK_REPLY ? `${result.reply}\n\n` : "";
   if (!r.ok) {
-    const text = `${lead && lead !== FALLBACK_REPLY ? lead + "\n\n" : ""}⚠️ ${r.error}`;
-    await ctx.reply(text);
+    await ctx.reply(`${leadText}⚠️ ${r.error}`);
     return;
   }
   if (ctx.from) {
@@ -505,8 +483,9 @@ async function applyAiProfileUpdate(ctx: Context, app: BotApp, result: AiResult,
     r.profile.phone ? `موبایل: ${toPersianDigits(r.profile.phone)}` : null,
     r.profile.address ? `آدرس: ${r.profile.address}` : null,
   ].filter(Boolean);
-  const text = `${lead && lead !== FALLBACK_REPLY ? lead + "\n\n" : ""}✅ پروفایل به‌روز شد.\n${lines.join("\n")}`;
-  await ctx.reply(text, { reply_markup: mainMenu(app.cart.lineCount(userId)) });
+  await ctx.reply(`${leadText}✅ پروفایل به‌روز شد.\n${lines.join("\n")}`, {
+    reply_markup: mainMenu(app.cart.lineCount(userId)),
+  });
 }
 
 interface ReceiptMedia {

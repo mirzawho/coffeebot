@@ -135,12 +135,12 @@ async function showProduct(ctx: Context, app: BotApp, productId: number, edit = 
 export async function showCart(ctx: Context, app: BotApp, edit = true): Promise<void> {
   const userId = ctx.from!.id;
   app.cart.pruneInvalidItems(userId);
-  const totals = app.cart.getTotals(userId);
-  const { payment } = app.orders.getPaymentInstructions(userId);
+  // After-hours-aware totals — the same prices checkout will charge.
+  const { total, lines, payment } = app.orders.getPaymentInstructions(userId);
   const currency = payment.currency;
-  const text = cartText(totals.lines, totals.total, currency);
-  const kb = totals.lines.length > 0
-    ? cartKeyboard(userId, totals.lines, app.tokens)
+  const text = cartText(lines, total, currency);
+  const kb = lines.length > 0
+    ? cartKeyboard(userId, lines, app.tokens)
     : mainMenu();
   if (edit) {
     try {
@@ -192,21 +192,21 @@ async function sendPaymentChoice(
   summaryTotal?: number,
 ): Promise<void> {
   const userId = ctx.from!.id;
-  const totals = app.cart.getTotals(userId);
-  const { payment } = app.orders.getPaymentInstructions(userId);
+  // After-hours-aware — matches what startCheckout/confirmOrder will charge.
+  const { total, lines, payment } = app.orders.getPaymentInstructions(userId);
   const balance = app.customers.getBalance(userId);
   const cardEnabled = cardToCardAvailable(payment);
   const opts = {
     walletEnabled: payment.walletEnabled,
     cardEnabled,
   };
-  const lines = summaryLines ?? totals.lines;
-  const total = summaryTotal ?? totals.total;
-  await ctx.reply(checkoutStartText(lines, total, payment.currency, balance, opts), {
+  const showLines = summaryLines ?? lines;
+  const showTotal = summaryTotal ?? total;
+  await ctx.reply(checkoutStartText(showLines, showTotal, payment.currency, balance, opts), {
     parse_mode: "HTML",
     reply_markup: paymentMethodKeyboard({
       walletBalance: balance,
-      total,
+      total: showTotal,
       ...opts,
     }),
   });
@@ -218,12 +218,11 @@ async function sendPaymentChoice(
  */
 async function sendCardPaymentStage(ctx: Context, app: BotApp, withSummary: boolean): Promise<void> {
   const userId = ctx.from!.id;
-  const totals = app.cart.getTotals(userId);
-  const { payment } = app.orders.getPaymentInstructions(userId);
+  const { total, lines, payment } = app.orders.getPaymentInstructions(userId);
   const text = withSummary
-    ? `${orderSummaryText(totals.lines, totals.total, payment.currency)}\n\n${paymentText(payment, totals.total)}`
-    : paymentText(payment, totals.total);
-  const copyKb = cardCopyKeyboard(totals.total, payment.cardNumber || null);
+    ? `${orderSummaryText(lines, total, payment.currency)}\n\n${paymentText(payment, total)}`
+    : paymentText(payment, total);
+  const copyKb = cardCopyKeyboard(total, payment.cardNumber || null);
   copyKb
     .row()
     .text("🛒 سبد خرید", "cart")
@@ -234,11 +233,11 @@ async function sendCardPaymentStage(ctx: Context, app: BotApp, withSummary: bool
 export async function sendConfirmStage(ctx: Context, app: BotApp): Promise<void> {
   const userId = ctx.from!.id;
   const cart = app.cart.get(userId);
-  const totals = app.cart.getTotals(userId);
-  const { payment } = app.orders.getPaymentInstructions(userId);
+  // After-hours-aware totals — what confirmOrder will actually charge.
+  const { total, lines, payment } = app.orders.getPaymentInstructions(userId);
   const currency = payment.currency;
   const balance = app.customers.getBalance(userId);
-  const summary = confirmSummaryText(totals.lines, totals.total, currency, cart?.deliveryNotes ?? null, {
+  const summary = confirmSummaryText(lines, total, currency, cart?.deliveryNotes ?? null, {
     method: cart?.fulfillmentMethod ?? null,
     time: cart?.fulfillmentTime ?? null,
   });
@@ -318,12 +317,11 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
       await ctx.answerCallbackQuery({ text: res.error, show_alert: true });
       return;
     }
-    const totals = app.cart.getTotals(userId);
-    const { payment } = app.orders.getPaymentInstructions(userId);
+    const { total, lines, payment } = app.orders.getPaymentInstructions(userId);
     const currency = payment.currency;
     await ctx.answerCallbackQuery({ text: "به سبد اضافه شد ✓" });
-    await ctx.reply(`✅ به سبد اضافه شد.\n${cartText(totals.lines, totals.total, currency)}`, {
-      reply_markup: totals.lines.length > 0 ? cartKeyboard(userId, totals.lines, app.tokens) : mainMenu(),
+    await ctx.reply(`✅ به سبد اضافه شد.\n${cartText(lines, total, currency)}`, {
+      reply_markup: lines.length > 0 ? cartKeyboard(userId, lines, app.tokens) : mainMenu(),
     });
     return;
   }
@@ -356,11 +354,10 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
       await ctx.answerCallbackQuery({ text: res.error, show_alert: true });
       return;
     }
-    const totals = app.cart.getTotals(userId);
-    const { payment } = app.orders.getPaymentInstructions(userId);
+    const { total, lines, payment } = app.orders.getPaymentInstructions(userId);
     await ctx.answerCallbackQuery({ text: "به سبد اضافه شد ✓" });
-    await ctx.reply(`✅ به سبد اضافه شد.\n${cartText(totals.lines, totals.total, payment.currency)}`, {
-      reply_markup: totals.lines.length > 0 ? cartKeyboard(userId, totals.lines, app.tokens) : mainMenu(),
+    await ctx.reply(`✅ به سبد اضافه شد.\n${cartText(lines, total, payment.currency)}`, {
+      reply_markup: lines.length > 0 ? cartKeyboard(userId, lines, app.tokens) : mainMenu(),
     });
     return;
   }
@@ -536,7 +533,7 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
         return;
       }
       await ctx.reply(result.reason === "empty" ? "سبد خرید شما خالی است." : result.error, {
-        reply_markup: mainMenu(),
+        reply_markup: mainMenu(app.cart.lineCount(userId)),
       });
       return;
     }
@@ -703,7 +700,7 @@ async function showOrderHistory(ctx: Context, app: BotApp, offset: number): Prom
   const PAGE = 5;
   const orders = app.orders.listForCustomer(userId, PAGE + 1, offset);
   if (orders.length === 0 && offset === 0) {
-    await ctx.reply(NO_ORDERS_TEXT, { reply_markup: mainMenu() });
+    await ctx.reply(NO_ORDERS_TEXT, { reply_markup: mainMenu(app.cart.lineCount(userId)) });
     return;
   }
   const page = orders.slice(0, PAGE);

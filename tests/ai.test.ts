@@ -583,4 +583,19 @@ describe("OllamaService failure modes (unavailable vs malformed)", () => {
       restoreFetch();
     }
   });
+
+  test("provider is called in non-streaming mode (stream: false)", async () => {
+    let seenStream: unknown = "unset";
+    mockFetch(async (_url, init) => {
+      seenStream = JSON.parse(String(init?.body)).stream;
+      return new Response(JSON.stringify(validOllamaBody()), { status: 200 });
+    });
+    try {
+      const svc = createAiService({ apiKey: "k", baseUrl: "https://x/v1", model: "m" });
+      await svc.understand(emptyInput());
+      expect(seenStream).toBe(false);
+    } finally {
+      restoreFetch();
+    }
+  });
 });

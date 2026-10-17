@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach } from "bun:test";
+import { describe, test, expect, beforeEach, setSystemTime } from "bun:test";
 import { openDatabase } from "../src/db/database";
 import type { Db } from "../src/db/database";
 import { loadConfig } from "../src/config";
@@ -1474,6 +1474,12 @@ describe("customer flows through the bot", () => {
     expect(deposits[0]!.status).toBe("pending");
     expect(deposits[0]!.amount).toBe(100000);
     expect(amountMsg._replies.some((r) => r.text.includes("603799"))).toBe(true);
+    // Copy buttons for amount + card number are attached to the payment request.
+    const lastReply = amountMsg._replies[amountMsg._replies.length - 1]!;
+    const copyBtns = (lastReply.opts?.reply_markup?.inline_keyboard ?? []).flat().filter((b: any) => b.copy_text);
+    expect(copyBtns.length).toBe(2);
+    expect(copyBtns.some((b: any) => b.copy_text.text === "100000")).toBe(true);
+    expect(copyBtns.some((b: any) => b.copy_text.text === "603799")).toBe(true);
     expect(aiInputs.length).toBe(0);
   });
 
@@ -1617,5 +1623,44 @@ describe("cart-first checkout UX", () => {
     expect(labels).toContain("شماره کارت");
     expect(copyBtns.some((b) => b.copy_text.text === "30000")).toBe(true);
     expect(copyBtns.some((b) => b.copy_text.text === "603799")).toBe(true);
+  });
+
+  test("card-to-card copy amount uses the after-hours price when the café is closed", async () => {
+    // Product with a distinct after-hours price (checkout.test.ts pattern).
+    new MenuService(db).updateProduct(waterId, { afterHoursPriceAmount: 20000 });
+    seedCart(2);
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, app);
+
+    // Friday: closed by default schedule → after-hours price applies (2 × 20,000).
+    setSystemTime(new Date("2026-10-16T12:00:00Z"));
+    try {
+      const co = makeCallbackCtx("co");
+      await bot._handlers.get("callback_query")!(co);
+      expect(co._replies[0]!.text).toContain("40,000"); // startCheckout snapshot
+
+      const ctx = makeCallbackCtx("pm:c");
+      await bot._handlers.get("callback_query")!(ctx);
+      expect(ctx._replies.length).toBe(1);
+      expect(ctx._replies[0]!.text).toContain("40,000");
+      const copyBtns = (ctx._replies[0]!.opts?.reply_markup?.inline_keyboard ?? [])
+        .flat()
+        .filter((b: any) => b.copy_text);
+      expect(copyBtns.some((b: any) => b.copy_text.text === "40000")).toBe(true);
+      expect(copyBtns.some((b: any) => b.copy_text.text === "20000")).toBe(false);
+    } finally {
+      setSystemTime();
+    }
+  });
+
+  test("order history empty reply still shows the cart button when the cart has items", async () => {
+    seedCart(1);
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, app);
+    const ctx = makeCallbackCtx("oh");
+    await bot._handlers.get("callback_query")!(ctx);
+    const cbs = callbacksOf(ctx._replies[0]!.opts?.reply_markup);
+    expect(cbs).toContain("cart");
+    expect(cbs).not.toContain("co");
   });
 });
