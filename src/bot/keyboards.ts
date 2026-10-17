@@ -2,6 +2,7 @@ import { InlineKeyboard } from "grammy";
 import type { Category, Product } from "../services/menu";
 import type { CartLine } from "../services/cart";
 import type { TokenService } from "./tokens";
+import { toPersianDigits } from "../utils/dates";
 
 /**
  * Callback data conventions (keep under 64 bytes):
@@ -17,7 +18,7 @@ import type { TokenService } from "./tokens";
  *  r:<id>:<tok>          remove line
  *  clr          clear-cart confirmation prompt
  *  clry:<tok>   confirmed clear
- *  co           start checkout
+ *  co           start checkout ("پرداخت و ثبت سفارش" — from the cart view)
  *  pm:w / pm:c  choose wallet / card-to-card payment
  *  skip         skip delivery notes
  *  cf:<tok>     final confirm
@@ -25,18 +26,23 @@ import type { TokenService } from "./tokens";
  *  hlp          help
  */
 
-export function mainMenu(): InlineKeyboard {
-  return new InlineKeyboard()
-    .text("☕ منوی محصولات", "cats")
-    .text("🛒 سبد خرید", "cart")
-    .row()
+/**
+ * Main menu. The cart button is only rendered while the cart has items —
+ * an empty cart offers nothing to open. Checkout is NOT offered here: the
+ * customer opens the cart and pays from its own view.
+ */
+export function mainMenu(cartLineCount = 0): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  kb.text("☕ منوی محصولات", "cats");
+  if (cartLineCount > 0) kb.text("🛒 سبد خرید", "cart");
+  kb.row()
     .text("👤 پروفایل", "prof")
     .text("💰 کیف پول", "wal")
     .row()
     .text("📦 سفارش‌های من", "oh")
-    .text("✅ تسویه حساب", "co")
     .row()
     .text("ℹ️ راهنما", "hlp");
+  return kb;
 }
 
 export function categoriesKeyboard(categories: Category[]): InlineKeyboard {
@@ -57,7 +63,12 @@ export function productsKeyboard(categoryId: number, products: Product[]): Inlin
   return kb;
 }
 
-export function productKeyboard(telegramId: number, product: Product, tokens: TokenService): InlineKeyboard {
+export function productKeyboard(
+  telegramId: number,
+  product: Product,
+  tokens: TokenService,
+  cartLineCount = 0,
+): InlineKeyboard {
   // Fresh tokens for this render; invalidate older unused ones to keep callbacks short-lived.
   tokens.invalidateForUser(telegramId);
   const kb = new InlineKeyboard();
@@ -71,7 +82,8 @@ export function productKeyboard(telegramId: number, product: Product, tokens: To
     const tok = tokens.mint(telegramId, `a:${product.id}:0`);
     kb.text("➕ افزودن به سبد", `a:${product.id}:0:${tok}`).row();
   }
-  kb.text("⬅️ محصولات", `cat:${product.categoryId}`).text("🛒 سبد خرید", "cart");
+  kb.text("⬅️ محصولات", `cat:${product.categoryId}`);
+  if (cartLineCount > 0) kb.text("🛒 سبد خرید", "cart");
   return kb;
 }
 
@@ -88,6 +100,7 @@ export function offerKeyboard(
   quantity: number,
   tokens: TokenService,
   alternatives: Product[] = [],
+  cartLineCount = 0,
 ): InlineKeyboard {
   const kb = new InlineKeyboard();
   const activeVariants = product.variants.filter((v) => v.active);
@@ -106,10 +119,15 @@ export function offerKeyboard(
   for (const alt of alternatives.slice(0, 3)) {
     kb.text(`similar: ${alt.name}`, `p:${alt.id}`).row();
   }
-  kb.text("↩️ لغو", "oc").text("🛒 سبد خرید", "cart");
+  kb.text("↩️ لغو", "oc");
+  if (cartLineCount > 0) kb.text("🛒 سبد خرید", "cart");
   return kb;
 }
 
+/**
+ * Cart lines: four buttons per item — `2x نام محصول` (display; re-renders the
+ * cart), −, +, delete. The quantity prefix makes the count scannable at a glance.
+ */
 export function cartKeyboard(telegramId: number, lines: CartLine[], tokens: TokenService): InlineKeyboard {
   tokens.invalidateForUser(telegramId);
   const kb = new InlineKeyboard();
@@ -118,8 +136,9 @@ export function cartKeyboard(telegramId: number, lines: CartLine[], tokens: Toke
     const plusTok = tokens.mint(telegramId, `q:${l.cartItemId}:p`);
     const delTok = tokens.mint(telegramId, `r:${l.cartItemId}`);
     const label = l.variantName ? `${l.productName} (${l.variantName})` : l.productName;
-    const shortLabel = label.length > 24 ? `${label.slice(0, 22)}…` : label;
-    kb.text(`➖ ${shortLabel} ×${l.quantity}`, `q:${l.cartItemId}:m:${minusTok}`)
+    const shortLabel = label.length > 20 ? `${label.slice(0, 18)}…` : label;
+    kb.text(`${toPersianDigits(String(l.quantity))}× ${shortLabel}`, "cart")
+      .text("➖", `q:${l.cartItemId}:m:${minusTok}`)
       .text("➕", `q:${l.cartItemId}:p:${plusTok}`)
       .text("🗑", `r:${l.cartItemId}:${delTok}`)
       .row();
@@ -127,7 +146,7 @@ export function cartKeyboard(telegramId: number, lines: CartLine[], tokens: Toke
   if (lines.length > 0) {
     kb.text("🗑 خالی کردن سبد", "clr").row();
   }
-  kb.text("✅ تسویه حساب", "co").row().text("🏠 منوی اصلی", "m");
+  kb.text("💳 پرداخت و ثبت سفارش", "co").row().text("🏠 منوی اصلی", "m");
   return kb;
 }
 
@@ -153,8 +172,8 @@ export function checkoutKeyboard(
 }
 
 /**
- * Payment-method picker shown right after «تسویه حساب». Each button appears
- * only when that method is both enabled by the admin and actually usable
+ * Payment-method picker shown right after «پرداخت و ثبت سفارش». Each button
+ * appears only when that method is both enabled by the admin and actually usable
  * (wallet balance covers the order / a card number is configured). The server
  * revalidates everything on press.
  */
@@ -172,6 +191,18 @@ export function paymentMethodKeyboard(opts: {
     kb.text("💳 کارت به کارت", "pm:c").row();
   }
   kb.text("🛒 سبد خرید", "cart").text("❌ انصراف", "cx");
+  return kb;
+}
+
+/**
+ * Copy-to-clipboard buttons (Telegram `copy_text`) for a card-to-card payment:
+ * the exact amount and the card number, so the customer pastes them into the
+ * banking app instead of retyping. Both share one row when both are present.
+ */
+export function cardCopyKeyboard(amount: number | null, cardNumber: string | null): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  if (amount !== null && amount > 0) kb.copyText("📋 کپی مبلغ", String(amount));
+  if (cardNumber) kb.copyText("📋 کپی شماره کارت", cardNumber);
   return kb;
 }
 

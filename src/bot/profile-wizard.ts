@@ -175,7 +175,7 @@ export async function profileWizardCancel(ctx: Context, app: BotApp): Promise<vo
   const userId = ctx.from!.id;
   app.profileEdit.clear(userId);
   wizardState.delete(userId);
-  await ctx.reply("ویرایش پروفایل لغو شد.", { reply_markup: mainMenu() });
+  await ctx.reply("ویرایش پروفایل لغو شد.", { reply_markup: mainMenu(app.cart.lineCount(userId)) });
 }
 
 /** Validate the collected fields and persist the profile. */
@@ -223,6 +223,6 @@ async function finishWizard(ctx: Context, app: BotApp): Promise<void> {
       `موبایل: ${r.profile.phone ? toPersianDigits(r.profile.phone) : "—"}`,
       r.profile.address ? `آدرس: ${r.profile.address}` : "آدرس: ثبت نشده",
     ].join("\n"),
-    { reply_markup: mainMenu() },
+    { reply_markup: mainMenu(app.cart.lineCount(userId)) },
   );
 }

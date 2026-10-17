@@ -1528,3 +1528,94 @@ describe("customer flows through the bot", () => {
     expect(app.loyalty.usualFor(999).primary.length).toBe(0);
   });
 });
+
+describe("cart-first checkout UX", () => {
+  function seedCart(quantity = 2) {
+    app = buildApp({ type: "chat", reply: "x", actions: [], needsClarification: false });
+    app.cart.addItem(555, waterId, null, quantity);
+  }
+
+  function buttonsFlat(kb: any): any[] {
+    return (kb?.inline_keyboard ?? []).flat();
+  }
+
+  test("main menu has no checkout button and hides the cart button when the cart is empty", async () => {
+    app = buildApp({ type: "chat", reply: "x", actions: [], needsClarification: false });
+    const bot = fakeBot();
+    registerMessageHandlers(bot, app);
+    const ctx = fakeCtx("/start");
+    await bot._commands.get("start")!(ctx);
+    const cbs = callbacksOf(ctx._replies[0]!.opts?.reply_markup);
+    expect(cbs).not.toContain("co");
+    expect(cbs).not.toContain("cart");
+
+    // With items in the cart the cart button appears (still no checkout button).
+    app.cart.addItem(555, waterId, null, 1);
+    const ctx2 = fakeCtx("/start");
+    await bot._commands.get("start")!(ctx2);
+    const cbs2 = callbacksOf(ctx2._replies[0]!.opts?.reply_markup);
+    expect(cbs2).toContain("cart");
+    expect(cbs2).not.toContain("co");
+  });
+
+  test("checkout start sends ONE message combining the summary and the payment choice", async () => {
+    seedCart(2);
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, app);
+    const co = makeCallbackCtx("co");
+    await bot._handlers.get("callback_query")!(co);
+
+    expect(co._replies.length).toBe(1);
+    const reply = co._replies[0]!;
+    expect(reply.text).toContain("خلاصه سفارش");
+    expect(reply.text).toContain("روش پرداخت");
+    expect(reply.text).toContain("30,000"); // 2 × 15,000
+    expect(reply.opts?.parse_mode).toBe("HTML");
+    const buttons = callbacksOf(reply.opts?.reply_markup);
+    expect(buttons).toContain("pm:c");
+    expect(buttons).not.toContain("pm:w"); // empty wallet
+    expect(app.cart.get(555)?.state).toBe("checkout_payment");
+  });
+
+  test("the cart keyboard shows a 4-button row per item and «پرداخت و ثبت سفارش»", async () => {
+    seedCart(3);
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, app);
+    const ctx = makeCallbackCtx("cart");
+    await bot._handlers.get("callback_query")!(ctx);
+
+    const kb = ctx._edits[0]?.opts?.reply_markup ?? ctx._replies[0]?.opts?.reply_markup;
+    const rows = kb?.inline_keyboard ?? [];
+    // First row: quantity label | − | + | delete
+    expect(rows[0]!.length).toBe(4);
+    expect(rows[0]![0]!.text).toContain("۳×"); // Persian digit + multiplier first
+    expect(rows[0]![0]!.callback_data).toBe("cart");
+    expect(callbacksOf(kb).some((c) => c?.startsWith("q:"))).toBe(true);
+    expect(callbacksOf(kb).some((c) => c?.startsWith("r:"))).toBe(true);
+    // The pay button carries the new label, not «تسویه حساب».
+    const labels = buttonsFlat(kb).map((b) => b.text as string);
+    expect(labels.some((t: string) => t.includes("پرداخت و ثبت سفارش"))).toBe(true);
+    expect(labels.some((t: string) => t.includes("تسویه حساب"))).toBe(false);
+  });
+
+  test("card-to-card stage is one message with copy buttons for amount and card number", async () => {
+    seedCart(2);
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, app);
+    await bot._handlers.get("callback_query")!(makeCallbackCtx("co"));
+    const ctx = makeCallbackCtx("pm:c");
+    await bot._handlers.get("callback_query")!(ctx);
+
+    expect(ctx._replies.length).toBe(1);
+    const reply = ctx._replies[0]!;
+    expect(reply.text).toContain("603799");
+    expect(reply.text).toContain("رسید");
+    const copyBtns = buttonsFlat(reply.opts?.reply_markup).filter((b) => b.copy_text);
+    expect(copyBtns.length).toBe(2);
+    const labels = copyBtns.map((b) => b.text as string).join(" ");
+    expect(labels).toContain("کپی مبلغ");
+    expect(labels).toContain("شماره کارت");
+    expect(copyBtns.some((b) => b.copy_text.text === "30000")).toBe(true);
+    expect(copyBtns.some((b) => b.copy_text.text === "603799")).toBe(true);
+  });
+});

@@ -19,7 +19,7 @@ export const HELP_TEXT = `راهنما:
   «یه اسپرسو سینگل می‌خوام» / «تعداد کاپوچینو رو دو تا کن» / «اسپرسو رو حذف کن»
   «قیمت کاپوچینو چنده؟» / «سفارشم کجاست؟»
 • با دکمه‌های سبد خرید تعداد را تغییر دهید یا قلمی را حذف کنید.
-• در «تسویه حساب» روش پرداخت را انتخاب کنید:
+• از «سبد خرید» و سپس «پرداخت و ثبت سفارش» روش پرداخت را انتخاب کنید:
   💰 کیف پول — اگر موجودی کافی باشد، مبلغ بلافاصله کسر می‌شود.
   💳 کارت به کارت — مبلغ را کارت به کارت کنید و تصویر رسید را بفرستید؛
      پس از تأیید مدیر، پرداخت ثبت می‌شود.
@@ -151,31 +151,36 @@ export function orderSummaryText(lines: CartLine[], total: number, currency: str
   ].join("\n");
 }
 
-export function paymentText(payment: PaymentSettings, total: number): string {
-  const parts: string[] = ["💳 لطفاً مبلغ زیر را کارت به کارت کنید و تصویر رسید را ارسال کنید:"];
-  parts.push("");
-  parts.push(`مبلغ: ${formatMoney(total, payment.currency)}`);
-  if (payment.cardNumber) parts.push(`شماره کارت: ${payment.cardNumber}`);
-  if (payment.cardholderName) parts.push(`به نام: ${payment.cardholderName}`);
-  parts.push("");
-  parts.push("⚠️ توجه: ربات پرداخت را تأیید نمی‌کند؛ رسید فقط دریافت و ثبت می‌شود.");
-  return parts.join("\n");
+/** Escape dynamic text for Telegram HTML parse mode. */
+export function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/** Payment-method picker prompt, with the live wallet balance. */
-export function paymentChoiceText(
+/**
+ * Checkout-start message (HTML parse mode): the order summary and the
+ * payment-method choice in ONE message — previously two separate sends.
+ * Dynamic segments (product names, currency) are HTML-escaped.
+ */
+export function checkoutStartText(
+  lines: CartLine[],
   total: number,
   currency: string,
   walletBalance: number,
   opts: { walletEnabled: boolean; cardEnabled: boolean },
 ): string {
-  const parts: string[] = [
-    "💳 روش پرداخت را انتخاب کنید:",
-    "",
-    `مبلغ قابل پرداخت: ${formatMoney(total, currency)}`,
-  ];
+  const parts: string[] = ["🧾 <b>خلاصه سفارش</b>:"];
+  for (const l of lines) {
+    const name = l.variantName ? `${l.productName} (${l.variantName})` : l.productName;
+    parts.push(
+      `• ${escapeHtml(name)} — ${toPersianDigits(String(l.quantity))} × ${formatAmount(l.unitPrice)} = ${escapeHtml(formatMoney(l.lineTotal, currency))}`,
+    );
+  }
+  parts.push("");
+  parts.push(`💳 مبلغ قابل پرداخت: <b>${escapeHtml(formatMoney(total, currency))}</b>`);
+  parts.push("");
+  parts.push("روش پرداخت را انتخاب کنید:");
   if (opts.walletEnabled) {
-    parts.push(`💰 موجودی کیف پول شما: ${formatMoney(walletBalance, currency)}`);
+    parts.push(`💰 موجودی کیف پول شما: ${escapeHtml(formatMoney(walletBalance, currency))}`);
   }
   if (opts.walletEnabled && walletBalance < total) {
     parts.push(
@@ -184,6 +189,19 @@ export function paymentChoiceText(
         : "موجودی کیف پول برای این سفارش کافی نیست؛ لطفاً کیف پول را شارژ کنید.",
     );
   }
+  return parts.join("\n");
+}
+
+export function paymentText(payment: PaymentSettings, total: number): string {
+  const parts: string[] = ["💳 لطفاً مبلغ زیر را کارت به کارت کنید و تصویر رسید را ارسال کنید:"];
+  parts.push("");
+  parts.push(`مبلغ: ${formatMoney(total, payment.currency)}`);
+  if (payment.cardNumber) parts.push(`شماره کارت: ${payment.cardNumber}`);
+  if (payment.cardholderName) parts.push(`به نام: ${payment.cardholderName}`);
+  parts.push("");
+  parts.push("⚠️ توجه: ربات پرداخت را تأیید نمی‌کند؛ رسید فقط دریافت و ثبت می‌شود.");
+  parts.push("");
+  parts.push("📤 پس از پرداخت، تصویر رسید (عکس یا فایل تصویری) را همین‌جا بفرستید.");
   return parts.join("\n");
 }
 

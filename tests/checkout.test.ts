@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach } from "bun:test";
+import { describe, test, expect, beforeEach, setSystemTime } from "bun:test";
 import { openDatabase } from "../src/db/database";
 import type { Db } from "../src/db/database";
 import { MenuService } from "../src/services/menu";
@@ -147,15 +147,22 @@ describe("checkout flow", () => {
   test("the displayed total matches the charged amount after hours", () => {
     menu.updateProduct(waterId, { afterHoursPriceAmount: 20000 });
     seedCart(1, 2);
-    // The cafe is closed on Fridays, so the after-hours price applies.
-    const friday = new Date("2026-10-16T12:00:00Z");
-    expect(bh.isOpenAt(friday)).toBe(false);
-    const shown = orders.getPaymentInstructions(1);
-    expect(shown.total).toBe(40000); // 2 × 20,000, not 2 × 15,000
-    const co = orders.startCheckout(1);
-    expect(co.ok).toBe(true);
-    if (!co.ok) return;
-    expect(co.total).toBe(shown.total);
+    // The cafe is closed on Fridays, so the after-hours price applies. Pin the
+    // clock — the service reads the real time, so a hardcoded date would only
+    // pass on the matching weekday.
+    setSystemTime(new Date("2026-10-16T12:00:00Z"));
+    try {
+      const friday = new Date("2026-10-16T12:00:00Z");
+      expect(bh.isOpenAt(friday)).toBe(false);
+      const shown = orders.getPaymentInstructions(1);
+      expect(shown.total).toBe(40000); // 2 × 20,000, not 2 × 15,000
+      const co = orders.startCheckout(1);
+      expect(co.ok).toBe(true);
+      if (!co.ok) return;
+      expect(co.total).toBe(shown.total);
+    } finally {
+      setSystemTime();
+    }
   });
 
   test("price change mid-checkout returns price_changed then re-confirm succeeds", () => {

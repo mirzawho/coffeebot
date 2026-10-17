@@ -639,6 +639,8 @@ route("PUT", "/api/admin/notification-settings", async ({ app, req }) => {
         notifyOrderConfirmed:
           body.notifyOrderConfirmed !== undefined ? !!body.notifyOrderConfirmed : undefined,
         askDeliveryRating: body.askDeliveryRating !== undefined ? !!body.askDeliveryRating : undefined,
+        notifyWalletChanges:
+          body.notifyWalletChanges !== undefined ? !!body.notifyWalletChanges : undefined,
       }),
     );
   } catch (err) {
@@ -684,7 +686,19 @@ route("POST", "/api/admin/wallet/deposits/:id/approve", ({ app, user, params }) 
   const r = app.customers.approveDeposit(id, user.id);
   if (!r.ok) return badRequest(r.error);
   const deposit = app.customers.getDeposit(id);
-  return json({ ok: true, balance: deposit ? app.customers.getBalance(deposit.telegramId) : 0 });
+  const balance = deposit ? app.customers.getBalance(deposit.telegramId) : 0;
+
+  // Tell the customer the top-up landed — gated by the admin's notification
+  // switch. The ref key is the ledger transaction id, so a retried approve
+  // (or a double-click) can never queue the same notice twice.
+  let notified = false;
+  if (deposit && getNotificationSettings(app.db).notifyWalletChanges) {
+    const currency = getCurrency(app.db);
+    const text = walletDepositApprovedText(r.deposit.amount, r.balanceAfter, currency);
+    notified = app.notifications.enqueue("wallet_adjustment", `wallet_tx_${r.txId}`, [r.deposit.telegramId], { text }) > 0;
+  }
+
+  return json({ ok: true, balance, notified });
 });
 
 route("POST", "/api/admin/wallet/deposits/:id/reject", ({ app, user, params }) => {
@@ -770,9 +784,10 @@ route("GET", "/api/admin/customers/:id", ({ app, params }) => {
  * signed integer; the server re-validates against balance/limit rules and the
  * admin actor is recorded in the ledger for audit.
  *
- * The customer is told about the change through the durable notification queue
- * (kind `wallet_adjustment`), keyed by the ledger transaction id so a retried
- * request can never send the same notice twice.
+ * When the admin's wallet-notification switch is on, the customer is told about
+ * the change through the durable notification queue (kind `wallet_adjustment`),
+ * keyed by the ledger transaction id so a retried request can never send the
+ * same notice twice. With the switch off, `notified` comes back false.
  */
 route("POST", "/api/admin/customers/:id/wallet", async ({ app, user, params, req }) => {
   const telegramId = num(params.id);
@@ -786,11 +801,14 @@ route("POST", "/api/admin/customers/:id/wallet", async ({ app, user, params, req
   const r = app.customers.adjustBalance(telegramId, amount, body.note ?? null, user.id);
   if (!r.ok) return badRequest(r.error);
 
-  const currency = getCurrency(app.db);
-  const text = walletAdjustmentText(amount, r.balance, currency, body.note ?? null);
-  app.notifications.enqueue("wallet_adjustment", `wallet_tx_${r.txId}`, [telegramId], { text });
+  let notified = false;
+  if (getNotificationSettings(app.db).notifyWalletChanges) {
+    const currency = getCurrency(app.db);
+    const text = walletAdjustmentText(amount, r.balance, currency, body.note ?? null);
+    notified = app.notifications.enqueue("wallet_adjustment", `wallet_tx_${r.txId}`, [telegramId], { text }) > 0;
+  }
 
-  return json({ ok: true, balance: r.balance, notified: true });
+  return json({ ok: true, balance: r.balance, notified });
 });
 
 /** Customer-facing message for an admin wallet change. */
@@ -809,6 +827,16 @@ export function walletAdjustmentText(
   ];
   if (cleanNote) lines.push(`توضیح: ${cleanNote}`);
   return lines.join("\n");
+}
+
+/** Customer-facing message after an admin approves a card-to-card top-up. */
+export function walletDepositApprovedText(amount: number, balanceAfter: number, currency: string): string {
+  return [
+    "✅ درخواست شارژ کیف پول شما تأیید شد.",
+    "",
+    `مبلغ شارژ: ${formatMoney(amount, currency)}`,
+    `موجودی جدید: ${formatMoney(balanceAfter, currency)}`,
+  ].join("\n");
 }
 
 // order lifecycle actions (admin)

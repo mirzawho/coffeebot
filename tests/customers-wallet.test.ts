@@ -403,6 +403,7 @@ describe("AI settings", () => {
   test("notification toggles default on and persist", () => {
     expect(getNotificationSettings(db).notifyOrderConfirmed).toBe(true);
     expect(getNotificationSettings(db).askDeliveryRating).toBe(true);
+    expect(getNotificationSettings(db).notifyWalletChanges).toBe(true);
   });
 });
 
@@ -669,6 +670,62 @@ describe("admin order lifecycle API", () => {
       .query("SELECT * FROM notifications WHERE kind = 'wallet_adjustment'")
       .all() as any[];
     expect(rows.length).toBe(0);
+  });
+
+  test("approving a card-to-card top-up queues a wallet notice for the customer", async () => {
+    customers.saveProfile(555, { fullName: "علی" });
+    const dep = customers.createDeposit(555, 75000);
+    if (!dep.ok) throw new Error("deposit failed");
+    const r = await call("POST", `/api/admin/wallet/deposits/${dep.deposit.id}/approve`);
+    expect(r.status).toBe(200);
+    expect((r.body as any).balance).toBe(75000);
+    expect((r.body as any).notified).toBe(true);
+
+    const rows = db
+      .query("SELECT * FROM notifications WHERE kind = 'wallet_adjustment'")
+      .all() as any[];
+    expect(rows.length).toBe(1);
+    expect(rows[0].recipient_id).toBe(555);
+    expect(rows[0].ref_key).toMatch(/^wallet_tx_\d+$/);
+    const payload = JSON.parse(rows[0].payload);
+    expect(payload.text).toContain("شارژ");
+    expect(payload.text).toContain("75,000");
+  });
+
+  test("the wallet-notification toggle gates both top-up and adjustment notices", async () => {
+    customers.saveProfile(555, { fullName: "علی" });
+
+    // Switch off via the API — no notices from here on.
+    const off = await call("PUT", "/api/admin/notification-settings", { notifyWalletChanges: false });
+    expect(off.status).toBe(200);
+    expect((off.body as any).notifyWalletChanges).toBe(false);
+
+    const dep = customers.createDeposit(555, 30000);
+    if (!dep.ok) throw new Error("deposit failed");
+    const approve = await call("POST", `/api/admin/wallet/deposits/${dep.deposit.id}/approve`);
+    expect(approve.status).toBe(200);
+    expect((approve.body as any).balance).toBe(30000); // wallet still credited
+    expect((approve.body as any).notified).toBe(false);
+
+    const adjust = await call("POST", "/api/admin/customers/555/wallet", { amount: 10000 });
+    expect(adjust.status).toBe(200);
+    expect((adjust.body as any).notified).toBe(false);
+
+    const rows = db
+      .query("SELECT * FROM notifications WHERE kind = 'wallet_adjustment'")
+      .all() as any[];
+    expect(rows.length).toBe(0);
+
+    // Switch back on → the next approval notifies again.
+    await call("PUT", "/api/admin/notification-settings", { notifyWalletChanges: true });
+    const dep2 = customers.createDeposit(555, 20000);
+    if (!dep2.ok) throw new Error("deposit failed");
+    const approve2 = await call("POST", `/api/admin/wallet/deposits/${dep2.deposit.id}/approve`);
+    expect((approve2.body as any).notified).toBe(true);
+    const after = db
+      .query("SELECT * FROM notifications WHERE kind = 'wallet_adjustment'")
+      .all() as any[];
+    expect(after.length).toBe(1);
   });
 
   test("the wallet notice is delivered to the customer by the scheduler", async () => {

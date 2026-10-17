@@ -275,6 +275,11 @@ export class CartService {
     return { lines, total, itemCount };
   }
 
+  /** Number of live cart lines — drives whether the cart button is shown. */
+  lineCount(telegramId: number): number {
+    return this.getTotals(telegramId).lines.length;
+  }
+
   /** Remove cart items whose product/variant became inactive or unpriced. */
   pruneInvalidItems(telegramId: number): void {
     const totals = this.getTotals(telegramId);

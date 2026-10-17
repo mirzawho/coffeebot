@@ -2,10 +2,10 @@ import type { Context } from "grammy";
 import type { BotApp } from "../context";
 import { pushHistory } from "../context";
 import {
+  cardCopyKeyboard,
   cartKeyboard,
   checkoutKeyboard,
   clearConfirmKeyboard,
-  deliveryKeyboard,
   fulfillmentKeyboard,
   mainMenu,
   offerKeyboard,
@@ -43,7 +43,7 @@ import { toPersianDigits } from "../../utils/dates";
 export function registerMessageHandlers(bot: any, app: BotApp): void {
   bot.command("start", async (ctx: Context) => {
     app.cart.getOrCreate(ctx.from!.id);
-    await ctx.reply(WELCOME_TEXT, { reply_markup: mainMenu() });
+    await ctx.reply(WELCOME_TEXT, { reply_markup: mainMenu(app.cart.lineCount(ctx.from!.id)) });
     // First run: a customer without a saved profile is walked through it once.
     if (!app.customers.isProfileComplete(ctx.from!.id)) {
       await startProfileWizard(ctx, app);
@@ -51,7 +51,7 @@ export function registerMessageHandlers(bot: any, app: BotApp): void {
   });
 
   bot.command("help", async (ctx: Context) => {
-    await ctx.reply(HELP_TEXT, { reply_markup: mainMenu() });
+    await ctx.reply(HELP_TEXT, { reply_markup: mainMenu(app.cart.lineCount(ctx.from!.id)) });
   });
 
   // Deterministic identity command — answered from the trusted sender object.
@@ -116,11 +116,11 @@ async function handleText(ctx: Context, app: BotApp, text: string): Promise<void
     app.depositFlow.clear(userId);
     app.fulfillmentTimeFlow.clear(userId);
     if (wasActive) {
-      await ctx.reply("عملیات لغو شد.", { reply_markup: mainMenu() });
+      await ctx.reply("عملیات لغو شد.", { reply_markup: mainMenu(app.cart.lineCount(userId)) });
       return;
     }
     app.cart.resetCheckout(userId);
-    await ctx.reply("عملیات لغو شد.", { reply_markup: mainMenu() });
+    await ctx.reply("عملیات لغو شد.", { reply_markup: mainMenu(app.cart.lineCount(userId)) });
     return;
   }
 
@@ -210,7 +210,7 @@ async function handleNaturalLanguage(ctx: Context, app: BotApp, text: string): P
   // AI disabled by the admin: free-text falls back to a friendly hint; the
   // deterministic menu/cart buttons keep working regardless.
   if (!aiSettings.enabled) {
-    await ctx.reply(AI_FALLBACK_TEXT, { reply_markup: mainMenu() });
+    await ctx.reply(AI_FALLBACK_TEXT, { reply_markup: mainMenu(app.cart.lineCount(userId)) });
     return;
   }
   const profile = app.customers.getProfile(userId);
@@ -255,7 +255,7 @@ async function handleNaturalLanguage(ctx: Context, app: BotApp, text: string): P
     // "unavailable" result); reaching here means an unexpected application error.
     log.error("ai understand threw", { userId, err: String(err) });
     await streamer.finalize().catch(() => {});
-    await ctx.reply(AI_FALLBACK_TEXT, { reply_markup: mainMenu() });
+    await ctx.reply(AI_FALLBACK_TEXT, { reply_markup: mainMenu(app.cart.lineCount(userId)) });
     return;
   }
 
@@ -333,6 +333,7 @@ async function sendOfferCards(ctx: Context, app: BotApp, result: AiResult, lead 
   const { payment } = app.orders.getPaymentInstructions(userId);
   const currency = payment.currency;
   const offers = (result.offers ?? []).slice(0, MAX_AI_OFFERS);
+  const cartCount = app.cart.lineCount(userId);
   let sent = false;
   for (let i = 0; i < offers.length; i++) {
     const offer = offers[i]!;
@@ -360,6 +361,7 @@ async function sendOfferCards(ctx: Context, app: BotApp, result: AiResult, lead 
       offer.quantity,
       app.tokens,
       alternatives,
+      cartCount,
     );
     sent = true;
     const imageUrl =
@@ -459,7 +461,7 @@ async function applyCartActions(ctx: Context, app: BotApp, result: AiResult, lea
 
   await ctx.reply(replyParts.filter(Boolean).join("\n"), {
     reply_markup:
-      after.lines.length > 0 ? cartKeyboard(userId, after.lines, app.tokens) : mainMenu(),
+      after.lines.length > 0 ? cartKeyboard(userId, after.lines, app.tokens) : mainMenu(app.cart.lineCount(userId)),
   });
 }
 
@@ -504,7 +506,7 @@ async function applyAiProfileUpdate(ctx: Context, app: BotApp, result: AiResult,
     r.profile.address ? `آدرس: ${r.profile.address}` : null,
   ].filter(Boolean);
   const text = `${lead && lead !== FALLBACK_REPLY ? lead + "\n\n" : ""}✅ پروفایل به‌روز شد.\n${lines.join("\n")}`;
-  await ctx.reply(text, { reply_markup: mainMenu() });
+  await ctx.reply(text, { reply_markup: mainMenu(app.cart.lineCount(userId)) });
 }
 
 interface ReceiptMedia {
@@ -549,8 +551,8 @@ async function handleReceiptMedia(
   if (cart.state !== "checkout_receipt" && cart.state !== "checkout_payment") {
     // Outside checkout, product images etc. are not used — be explicit.
     if (cart.state === "browsing") {
-      await ctx.reply("برای ارسال رسید، ابتدا «تسویه حساب» را بزنید.", {
-        reply_markup: mainMenu(),
+      await ctx.reply("برای ارسال رسید، ابتدا «پرداخت و ثبت سفارش» را از سبد خرید بزنید.", {
+        reply_markup: mainMenu(app.cart.lineCount(userId)),
       });
       return;
     }
@@ -602,8 +604,8 @@ async function applyFulfillmentTime(ctx: Context, app: BotApp, text: string): Pr
   const userId = ctx.from!.id;
   const cart = app.cart.get(userId);
   if (!cart || cart.state !== "checkout_confirm") {
-    await ctx.reply("این مرحله دیگر معتبر نیست؛ دوباره از «تسویه حساب» شروع کنید.", {
-      reply_markup: mainMenu(),
+    await ctx.reply("این مرحله دیگر معتبر نیست؛ دوباره از «پرداخت و ثبت سفارش» شروع کنید.", {
+      reply_markup: mainMenu(app.cart.lineCount(userId)),
     });
     return;
   }
@@ -642,6 +644,12 @@ async function applyDepositAmount(ctx: Context, app: BotApp, text: string): Prom
       "",
       "پس از تأیید ادمین، موجودی شما شارژ می‌شود.",
     ].join("\n"),
-    { reply_markup: walletKeyboard() },
+    {
+      reply_markup: cardCopyKeyboard(r.deposit.amount, payment.cardNumber || null)
+        .row()
+        .text("📜 تاریخچه کیف پول", "whist")
+        .row()
+        .text("🏠 منوی اصلی", "m"),
+    },
   );
 }

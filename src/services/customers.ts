@@ -376,7 +376,9 @@ export class CustomersService {
   approveDeposit(
     depositId: number,
     adminId: number,
-  ): { ok: true; deposit: WalletDeposit; credited: boolean } | { ok: false; error: string } {
+  ):
+    | { ok: true; deposit: WalletDeposit; credited: boolean; txId: number; balanceAfter: number }
+    | { ok: false; error: string } {
     try {
       const result = tx(this.db, () => {
         const d = this.getDeposit(depositId);
@@ -391,7 +393,13 @@ export class CustomersService {
             "UPDATE wallet_deposits SET status = 'approved', reviewed_by = ?, reviewed_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'",
           )
           .run(adminId, nowIso(), nowIso(), depositId);
-        return { ok: true as const, deposit: this.getDeposit(depositId)!, credited: credit.applied };
+        return {
+          ok: true as const,
+          deposit: this.getDeposit(depositId)!,
+          credited: credit.applied,
+          txId: credit.tx.id,
+          balanceAfter: credit.tx.balanceAfter,
+        };
       });
       return result;
     } catch (err) {

@@ -2,11 +2,11 @@ import type { Context } from "grammy";
 import { InlineKeyboard } from "grammy";
 import type { BotApp } from "../context";
 import {
+  cardCopyKeyboard,
   cartKeyboard,
   categoriesKeyboard,
   checkoutKeyboard,
   clearConfirmKeyboard,
-  deliveryKeyboard,
   fulfillmentKeyboard,
   mainMenu,
   paymentMethodKeyboard,
@@ -15,16 +15,15 @@ import {
 } from "../keyboards";
 import {
   cartText,
+  checkoutStartText,
   confirmSummaryText,
   fulfillmentPromptText,
   FULFILLMENT_TIME_PROMPT_TEXT,
   HELP_TEXT,
   orderConfirmedText,
   orderSummaryText,
-  paymentChoiceText,
   paymentText,
   productDetailText,
-  RECEIPT_PROMPT_TEXT,
   STALE_TEXT,
   walletPaymentSummaryText,
   WELCOME_TEXT,
@@ -47,7 +46,7 @@ import {
 export async function showMainMenu(ctx: Context, app: BotApp, edit = false): Promise<void> {
   const userId = ctx.from!.id;
   const text = `${WELCOME_TEXT}\n\nساعات کاری: ${app.businessHours.isOpenAt(new Date()) ? "🟢 باز" : "🔴 بسته"} | بازگشایی: ${app.businessHours.nextOpeningLabel(new Date())}`;
-  const kb = mainMenu();
+  const kb = mainMenu(app.cart.lineCount(userId));
   if (edit) {
     try {
       await ctx.editMessageText(text, { reply_markup: kb });
@@ -59,16 +58,17 @@ export async function showMainMenu(ctx: Context, app: BotApp, edit = false): Pro
   await ctx.reply(text, { reply_markup: kb });
 }
 
-export async function showHelp(ctx: Context, edit = false): Promise<void> {
+export async function showHelp(ctx: Context, app: BotApp, edit = false): Promise<void> {
+  const kb = mainMenu(app.cart.lineCount(ctx.from!.id));
   if (edit) {
     try {
-      await ctx.editMessageText(HELP_TEXT, { reply_markup: mainMenu() });
+      await ctx.editMessageText(HELP_TEXT, { reply_markup: kb });
       return;
     } catch {
       /* fall through */
     }
   }
-  await ctx.reply(HELP_TEXT, { reply_markup: mainMenu() });
+  await ctx.reply(HELP_TEXT, { reply_markup: kb });
 }
 
 async function showCategories(ctx: Context, app: BotApp, edit = false): Promise<void> {
@@ -77,7 +77,9 @@ async function showCategories(ctx: Context, app: BotApp, edit = false): Promise<
     categories.length === 0
       ? "فعلاً دسته‌بندی فعالی وجود ندارد."
       : "دسته‌بندی مورد نظر را انتخاب کنید:";
-  const kb = categories.length > 0 ? categoriesKeyboard(categories) : mainMenu();
+  const kb = categories.length > 0
+    ? categoriesKeyboard(categories)
+    : mainMenu(app.cart.lineCount(ctx.from!.id));
   if (edit) {
     try {
       await ctx.editMessageText(text, { reply_markup: kb });
@@ -118,7 +120,7 @@ async function showProduct(ctx: Context, app: BotApp, productId: number, edit = 
   const { payment } = app.orders.getPaymentInstructions(userId);
   const currency = payment.currency;
   const text = productDetailText(product, currency);
-  const kb = productKeyboard(userId, product, app.tokens);
+  const kb = productKeyboard(userId, product, app.tokens, app.cart.lineCount(userId));
   if (edit) {
     try {
       await ctx.editMessageText(text, { reply_markup: kb });
@@ -161,11 +163,7 @@ export async function startCheckoutFlow(ctx: Context, app: BotApp): Promise<void
       return;
     }
     if (cart.state === "checkout_receipt") {
-      await ctx.reply(orderSummaryFromCart(app, userId), {
-        reply_markup: checkoutKeyboard(userId, "receipt", app.tokens),
-      });
-      await ctx.reply(paymentForCart(app, userId));
-      await ctx.reply(RECEIPT_PROMPT_TEXT);
+      await sendCardPaymentStage(ctx, app, true);
       return;
     }
     if (cart.state === "checkout_fulfillment") {
@@ -179,48 +177,58 @@ export async function startCheckoutFlow(ctx: Context, app: BotApp): Promise<void
   }
   const result = app.orders.startCheckout(userId);
   if (!result.ok) {
-    await ctx.reply(result.error, { reply_markup: mainMenu() });
+    await ctx.reply(result.error, { reply_markup: mainMenu(app.cart.lineCount(userId)) });
     return;
   }
-  await ctx.reply(orderSummaryText(result.lines, result.total, result.payment.currency));
-  await sendPaymentChoice(ctx, app);
+  // One message: order summary + payment-method choice (previously two).
+  await sendPaymentChoice(ctx, app, result.lines, result.total);
 }
 
-/** Payment-method picker (wallet balance + card-to-card). */
-async function sendPaymentChoice(ctx: Context, app: BotApp): Promise<void> {
+/** Payment-method picker (wallet balance + card-to-card), merged with the summary. */
+async function sendPaymentChoice(
+  ctx: Context,
+  app: BotApp,
+  summaryLines?: Parameters<typeof checkoutStartText>[0],
+  summaryTotal?: number,
+): Promise<void> {
   const userId = ctx.from!.id;
   const totals = app.cart.getTotals(userId);
   const { payment } = app.orders.getPaymentInstructions(userId);
   const balance = app.customers.getBalance(userId);
   const cardEnabled = cardToCardAvailable(payment);
-  await ctx.reply(
-    paymentChoiceText(totals.total, payment.currency, balance, {
-      walletEnabled: payment.walletEnabled,
-      cardEnabled,
+  const opts = {
+    walletEnabled: payment.walletEnabled,
+    cardEnabled,
+  };
+  const lines = summaryLines ?? totals.lines;
+  const total = summaryTotal ?? totals.total;
+  await ctx.reply(checkoutStartText(lines, total, payment.currency, balance, opts), {
+    parse_mode: "HTML",
+    reply_markup: paymentMethodKeyboard({
+      walletBalance: balance,
+      total,
+      ...opts,
     }),
-    {
-      reply_markup: paymentMethodKeyboard({
-        walletBalance: balance,
-        total: totals.total,
-        walletEnabled: payment.walletEnabled,
-        cardEnabled,
-      }),
-    },
-  );
+  });
 }
 
-function orderSummaryFromCart(app: BotApp, userId: number): string {
+/**
+ * Card-to-card stage: payment instructions + receipt request as ONE message,
+ * with copy-to-clipboard buttons for the amount and the card number.
+ */
+async function sendCardPaymentStage(ctx: Context, app: BotApp, withSummary: boolean): Promise<void> {
+  const userId = ctx.from!.id;
   const totals = app.cart.getTotals(userId);
   const { payment } = app.orders.getPaymentInstructions(userId);
-  const currency = payment.currency;
-  return orderSummaryText(totals.lines, totals.total, currency);
-}
-
-function paymentForCart(app: BotApp, userId: number): string {
-  const totals = app.cart.getTotals(userId);
-  const { payment } = app.orders.getPaymentInstructions(userId);
-  const currency = payment.currency;
-  return paymentText(payment, totals.total);
+  const text = withSummary
+    ? `${orderSummaryText(totals.lines, totals.total, payment.currency)}\n\n${paymentText(payment, totals.total)}`
+    : paymentText(payment, totals.total);
+  const copyKb = cardCopyKeyboard(totals.total, payment.cardNumber || null);
+  copyKb
+    .row()
+    .text("🛒 سبد خرید", "cart")
+    .text("❌ انصراف از خرید", "cx");
+  await ctx.reply(text, { reply_markup: copyKb });
 }
 
 export async function sendConfirmStage(ctx: Context, app: BotApp): Promise<void> {
@@ -274,7 +282,7 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
   const userId = ctx.from!.id;
 
   if (data === "m") return showMainMenu(ctx, app, true);
-  if (data === "hlp") return showHelp(ctx, true);
+  if (data === "hlp") return showHelp(ctx, app, true);
   if (data === "cats") return showCategories(ctx, app, true);
   if (data === "cart") return showCart(ctx, app, true);
 
@@ -465,10 +473,7 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
       await sendFulfillmentChoice(ctx, app);
       return;
     }
-    await ctx.reply(paymentForCart(app, userId));
-    await ctx.reply(RECEIPT_PROMPT_TEXT, {
-      reply_markup: checkoutKeyboard(userId, "receipt", app.tokens),
-    });
+    await sendCardPaymentStage(ctx, app, false);
     return;
   }
 
@@ -556,7 +561,7 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
 
   if (data === "cx") {
     app.cart.resetCheckout(userId);
-    await ctx.reply("عملیات خرید لغو شد.", { reply_markup: mainMenu() });
+    await ctx.reply("عملیات خرید لغو شد.", { reply_markup: mainMenu(app.cart.lineCount(userId)) });
     return;
   }
 
@@ -680,6 +685,8 @@ async function startDeposit(ctx: Context, app: BotApp): Promise<void> {
     return;
   }
   app.depositFlow.expect(userId);
+  const copyKb = cardCopyKeyboard(null, payment.cardNumber || null);
+  copyKb.row().text("🏠 منوی اصلی", "m");
   await ctx.reply(
     [
       "💰 مبلغ شارژ را به تومان بفرستید (فقط عدد). مثلاً:",
@@ -687,6 +694,7 @@ async function startDeposit(ctx: Context, app: BotApp): Promise<void> {
       "",
       `پس از انتخاب مبلغ، کارت به کارت کنید:\nشماره کارت: ${payment.cardNumber}\nبه نام: ${payment.cardholderName || "—"}`,
     ].join("\n"),
+    { reply_markup: copyKb },
   );
 }
 

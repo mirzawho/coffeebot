@@ -389,6 +389,7 @@ const SettingsPage = (() => {
     const parts = [];
     parts.push(notifSettings.notifyOrderConfirmed ? "تأیید سفارش: روشن" : "تأیید سفارش: خاموش");
     parts.push(notifSettings.askDeliveryRating ? "امتیاز تحویل: روشن" : "امتیاز تحویل: خاموش");
+    parts.push(notifSettings.notifyWalletChanges ? "تغییر کیف پول: روشن" : "تغییر کیف پول: خاموش");
     return parts.join(" · ");
   }
 
@@ -456,6 +457,11 @@ const SettingsPage = (() => {
   function openNotifSheet() {
     const confirmSw = switchField("اطلاع به مشتری هنگام تأیید سفارش", notifSettings.notifyOrderConfirmed);
     const ratingSw = switchField("درخواست امتیاز پس از تحویل", notifSettings.askDeliveryRating);
+    const walletSw = switchField(
+      "اطلاع به مشتری هنگام تغییر کیف پول",
+      notifSettings.notifyWalletChanges,
+      "تأیید شارژ کارت به کارت و افزایش/کاهش موجودی توسط مدیر",
+    );
     const formError = el("div", { class: "form-error" });
     formError.hidden = true;
     const saveBtn = el("button", { class: "btn", type: "submit", text: "ذخیره" });
@@ -465,7 +471,8 @@ const SettingsPage = (() => {
       formError,
       el("div", { class: "card", style: "padding:4px 14px;margin-bottom:14px" },
         el("div", { style: "border-bottom:1px solid var(--border)" }, confirmSw.root),
-        ratingSw.root),
+        el("div", { style: "border-bottom:1px solid var(--border)" }, ratingSw.root),
+        walletSw.root),
       el("div", { class: "form-actions" }, saveBtn, el("button", { class: "btn ghost", type: "button", text: "انصراف", onClick: closeSheet })),
     );
     form.addEventListener("submit", async (e) => {
@@ -476,6 +483,7 @@ const SettingsPage = (() => {
         notifSettings = await Api.put("/api/admin/notification-settings", {
           notifyOrderConfirmed: confirmSw.input.checked,
           askDeliveryRating: ratingSw.input.checked,
+          notifyWalletChanges: walletSw.input.checked,
         });
         toast("تنظیمات اعلان ذخیره شد");
         closeSheet();

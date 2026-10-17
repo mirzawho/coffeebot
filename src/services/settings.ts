@@ -216,12 +216,15 @@ export function updateAiSettings(
 export interface NotificationSettings {
   notifyOrderConfirmed: boolean;
   askDeliveryRating: boolean;
+  /** Customer notices for wallet changes: approved top-ups + admin adjustments. */
+  notifyWalletChanges: boolean;
 }
 
 export function getNotificationSettings(db: Db): NotificationSettings {
   return {
     notifyOrderConfirmed: getSetting(db, "notify_order_confirmed") !== "0", // default on
     askDeliveryRating: getSetting(db, "ask_delivery_rating") !== "0", // default on
+    notifyWalletChanges: getSetting(db, "notify_wallet_changes") !== "0", // default on
   };
 }
 
@@ -233,6 +236,8 @@ export function updateNotificationSettings(
     setSetting(db, "notify_order_confirmed", input.notifyOrderConfirmed ? "1" : "0");
   if (input.askDeliveryRating !== undefined)
     setSetting(db, "ask_delivery_rating", input.askDeliveryRating ? "1" : "0");
+  if (input.notifyWalletChanges !== undefined)
+    setSetting(db, "notify_wallet_changes", input.notifyWalletChanges ? "1" : "0");
   return getNotificationSettings(db);
 }
 
