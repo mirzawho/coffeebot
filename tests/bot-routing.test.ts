@@ -19,6 +19,7 @@ import {
 import { TokenService } from "../src/bot/tokens";
 import { CustomersService } from "../src/services/customers";
 import { LoyaltyService } from "../src/services/loyalty";
+import { NotificationService } from "../src/services/notifications";
 import { registerMessageHandlers } from "../src/bot/handlers/messages";
 import { registerCallbackHandlers } from "../src/bot/handlers/callbacks";
 import { registerAdminEntry, adminWebAppUrl, adminEntryKeyboard } from "../src/bot/admin-entry";
@@ -101,9 +102,10 @@ function buildApp(aiResult: AiResult | ((input: AiInput) => AiResult)): BotApp {
     persona: "",
     customers: new CustomersService(db),
     loyalty: new LoyaltyService(db),
+    notifications: new NotificationService(db),
     profileEdit: new TextCaptureFlow(),
     depositFlow: new TextCaptureFlow(),
-    fulfillmentTimeFlow: new TextCaptureFlow(),
+    rejectReasonFlow: new TextCaptureFlow(),
   };
 }
 
@@ -324,6 +326,10 @@ function makeCallbackCtx(data: string, userId = 555) {
     },
     editMessageText: async (t: string, opts?: any) => {
       edits.push({ text: t, opts });
+      return {} as any;
+    },
+    editMessageReplyMarkup: async () => {
+      edits.push({ text: "", opts: { reply_markup: null } });
       return {} as any;
     },
     _answers: answers,
@@ -690,7 +696,7 @@ describe("checkout, payment, and receipt via conversation", () => {
     expect(app.cart.get(555)?.paymentMethod).toBe("wallet");
   });
 
-  test("after payment the customer is asked delivery vs pickup, then the time", async () => {
+  test("after payment the fulfillment buttons place the order; typing edits it", async () => {
     app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
     const dep = app.customers.createDeposit(555, 200000);
     if (!dep.ok) throw new Error("deposit failed");
@@ -703,21 +709,57 @@ describe("checkout, payment, and receipt via conversation", () => {
     await bot._handlers.get("callback_query")!(makeCallbackCtx("co"));
     await bot._handlers.get("callback_query")!(makeCallbackCtx("pm:w"));
 
-    // Wallet goes straight to the fulfillment question.
+    // Wallet waits on the fulfillment keyboard — no order yet.
     expect(app.cart.get(555)?.state).toBe("checkout_fulfillment");
     const pick = makeCallbackCtx("fm:d");
     await bot._handlers.get("callback_query")!(pick);
-    expect(app.cart.get(555)?.state).toBe("checkout_confirm");
-    expect(app.cart.get(555)?.fulfillmentMethod).toBe("delivery");
-    expect(pick._replies.some((r) => r.text.includes("چه زمانی"))).toBe(true);
+    // The press places the order immediately (wallet charged) and edits the message.
+    expect(app.cart.get(555)?.state).toBe("browsing");
+    const order = app.orders.latestOrderFor(555);
+    expect(order).not.toBeNull();
+    expect(order!.fulfillmentMethod).toBe("delivery");
+    expect(order!.paymentStatus).toBe("paid");
+    const shown = pick._edits.map((e) => e.text).join("\n");
+    expect(shown).toContain("ارسال 🛵");
 
-    // The time answer is captured, then the confirm summary shows both.
+    // Typed text related to the order edits it; unrelated text goes to the AI.
     const timeCtx = fakeCtx("ساعت ۵ عصر");
     await bot._handlers.get("message:text")!(timeCtx);
-    expect(app.cart.get(555)?.fulfillmentTime).toBe("ساعت ۵ عصر");
-    const summary = timeCtx._replies.map((r) => r.text).join("\n");
-    expect(summary).toContain("ارسال 🛵");
-    expect(summary).toContain("ساعت ۵ عصر");
+    expect(app.orders.latestOrderFor(555)!.deliveryTime).toBe("ساعت ۵ عصر");
+    expect(timeCtx._replies.map((r) => r.text).join("\n")).toContain("ساعت ۵ عصر");
+  });
+
+  test("the placed-order keyboard carries delivery + quick-time buttons", async () => {
+    app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
+    app.orders.startCheckout(555);
+    app.orders.choosePaymentMethod(555, "card_to_card");
+    const bot = fakeBot();
+    registerMessageHandlers(bot, app);
+    registerCallbackHandlers(bot, app);
+    const media = makeMediaCtx("photo");
+    await bot._handlers.get("message:photo")!(media);
+
+    // The receipt placed the order and the summary offers the new keyboard.
+    const summary = media._replies.find((r) => r.opts?.reply_markup)!;
+    expect(callbacksOf(summary.opts.reply_markup)).toEqual([
+      "fm:p",
+      "ft:now",
+      "ft:tomorrow",
+      "ft:5m",
+      "ft:10m",
+    ]);
+
+    // «۵ دقیقه بعد» resolves to a concrete clock time and refreshes the message.
+    const press = makeCallbackCtx("ft:5m");
+    await bot._handlers.get("callback_query")!(press);
+    const order = app.orders.latestOrderFor(555)!;
+    expect(order.deliveryTime).toMatch(/^ساعت [۰-۹]{1,2}:[۰-۹]{2}$/);
+    expect(press._edits.map((e) => e.text).join("\n")).toContain("تحویل حضوری 🏪");
+
+    // A press with nothing to place and nothing placed is refused.
+    const stale = makeCallbackCtx("ft:now", 999);
+    await bot._handlers.get("callback_query")!(stale);
+    expect(stale._answers.some((a) => a?.show_alert)).toBe(true);
   });
 
   test("delivery without a saved address is refused; pickup always works", async () => {
@@ -735,11 +777,14 @@ describe("checkout, payment, and receipt via conversation", () => {
     await bot._handlers.get("callback_query")!(pick);
     expect(pick._answers.some((a) => (a.text ?? "").includes("آدرس"))).toBe(true);
     expect(app.cart.get(555)?.state).toBe("checkout_fulfillment");
+    expect(app.orders.latestOrderFor(555)).toBeNull();
 
-    // Pickup works.
+    // Pickup works and places the order.
     await bot._handlers.get("callback_query")!(makeCallbackCtx("fm:p"));
-    expect(app.cart.get(555)?.state).toBe("checkout_confirm");
-    expect(app.cart.get(555)?.fulfillmentMethod).toBe("pickup");
+    expect(app.cart.get(555)?.state).toBe("browsing");
+    const order = app.orders.latestOrderFor(555);
+    expect(order).not.toBeNull();
+    expect(order!.fulfillmentMethod).toBe("pickup");
   });
 
   test("wallet choice with an insufficient balance is refused with an alert", async () => {
@@ -876,7 +921,7 @@ describe("checkout, payment, and receipt via conversation", () => {
     expect(app.cart.get(555)?.state).toBe("checkout_receipt");
   });
 
-  test("a payment screenshot attaches the receipt and advances to delivery stage", async () => {
+  test("a payment screenshot places the order right away with a thanks + summary", async () => {
     app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
     app.orders.startCheckout(555);
     app.orders.choosePaymentMethod(555, "card_to_card");
@@ -885,9 +930,16 @@ describe("checkout, payment, and receipt via conversation", () => {
     const ctx = makeMediaCtx("photo");
     await bot._handlers.get("message:photo")!(ctx);
 
-    expect(app.cart.get(555)?.state).toBe("checkout_fulfillment");
-    expect(app.cart.get(555)?.receiptFileId).toBe("receipt-file");
-    expect(ctx._replies.some((r) => r.text.includes("رسید دریافت شد"))).toBe(true);
+    // No extra confirm step: the receipt itself creates the order.
+    expect(app.cart.get(555)?.state).toBe("browsing");
+    const order = app.orders.latestOrderFor(555);
+    expect(order).not.toBeNull();
+    expect(order!.receiptFileId).toBe("receipt-file");
+    expect(order!.fulfillmentMethod).toBe("pickup"); // default
+    const reply = ctx._replies.map((r) => r.text).join("\n");
+    expect(reply).toContain("رسید شما دریافت شد");
+    expect(reply).toContain(order!.orderNumber);
+    expect(reply).toContain("در انتظار تأیید مدیر");
   });
 
   test("a screenshot sent straight from the payment screen is accepted", async () => {
@@ -898,8 +950,10 @@ describe("checkout, payment, and receipt via conversation", () => {
     const ctx = makeMediaCtx("photo");
     await bot._handlers.get("message:photo")!(ctx);
 
-    expect(app.cart.get(555)?.paymentMethod).toBe("card_to_card");
-    expect(app.cart.get(555)?.state).toBe("checkout_fulfillment");
+    const order = app.orders.latestOrderFor(555);
+    expect(order).not.toBeNull();
+    expect(order!.paymentMethod).toBe("card_to_card");
+    expect(app.cart.get(555)?.state).toBe("browsing");
   });
 
   test("duplicate screenshots after the receipt stage are not re-attached", async () => {
@@ -913,6 +967,7 @@ describe("checkout, payment, and receipt via conversation", () => {
 
     expect(app.cart.get(555)?.receiptFileId).toBe("receipt-file"); // unchanged
     expect(ctx._replies.some((r) => r.text.includes("قبلاً"))).toBe(true);
+    expect(app.orders.latestOrderFor(555)).toBeNull(); // nothing was placed twice
   });
 
   test("unsupported file types are rejected at the receipt stage", async () => {
@@ -944,20 +999,10 @@ describe("checkout, payment, and receipt via conversation", () => {
     // 3. Choose card-to-card
     await bot._handlers.get("callback_query")!(makeCallbackCtx("pm:c"));
     expect(app.cart.get(555)?.state).toBe("checkout_receipt");
-    // 4. Send receipt screenshot
-    await bot._handlers.get("message:photo")!(makeMediaCtx("photo"));
-    expect(app.cart.get(555)?.state).toBe("checkout_fulfillment");
-    // 5. Fulfillment: pickup (no address saved) → time prompt → skip time
-    await bot._handlers.get("callback_query")!(makeCallbackCtx("fm:p"));
-    expect(app.cart.get(555)?.state).toBe("checkout_confirm");
-    const timeCtx = fakeCtx("پیش‌فرض");
-    await bot._handlers.get("message:text")!(timeCtx);
-    // 6. Final confirm with the one-shot token from the keyboard
-    const confirmData = callbacksOf(timeCtx._replies[timeCtx._replies.length - 1]!.opts?.reply_markup).find((c) =>
-      c?.startsWith("cf:"),
-    )!;
-    const confirmCtx = makeCallbackCtx(confirmData);
-    await bot._handlers.get("callback_query")!(confirmCtx);
+    // 4. Send receipt screenshot — the order is placed immediately
+    const media = makeMediaCtx("photo");
+    await bot._handlers.get("message:photo")!(media);
+    expect(app.cart.get(555)?.state).toBe("browsing");
 
     // Order persisted with snapshot and receipt
     const latest = app.orders.latestOrderFor(555);
@@ -969,13 +1014,21 @@ describe("checkout, payment, and receipt via conversation", () => {
     expect(latest!.status).toBe("receipt_received_unverified");
     expect(latest!.paymentMethod).toBe("card_to_card");
     expect(latest!.paymentStatus).toBe("receipt_received");
-    // Confirmation mentions the order number
-    expect(confirmCtx._replies.some((r) => r.text.includes(latest!.orderNumber))).toBe(true);
+    // The receipt message thanks the customer and shows the order number.
+    expect(media._replies.some((r) => r.text.includes(latest!.orderNumber))).toBe(true);
     // Cart finalized
     expect(app.cart.getTotals(555).lines.length).toBe(0);
-    // Duplicate confirm is rejected (token already consumed)
-    const dup = makeCallbackCtx(confirmData);
-    await bot._handlers.get("callback_query")!(dup);
+
+    // 5. The buttons on the placed message edit delivery without any confirm step.
+    const tomorrow = makeCallbackCtx("ft:tomorrow");
+    await bot._handlers.get("callback_query")!(tomorrow);
+    expect(app.orders.latestOrderFor(555)!.deliveryTime).toBe("فردا");
+    // Delivery without an address is refused; typing «فردا» also edits.
+    const delivery = makeCallbackCtx("fm:d");
+    await bot._handlers.get("callback_query")!(delivery);
+    expect(delivery._answers.some((a) => (a.text ?? "").includes("آدرس"))).toBe(true);
+    expect(app.orders.latestOrderFor(555)!.fulfillmentMethod).toBe("pickup");
+    // Re-renders still show exactly one order.
     expect(app.orders.listRecent(10).filter((o) => o.customerTelegramId === 555).length).toBe(1);
   });
 
@@ -996,17 +1049,10 @@ describe("checkout, payment, and receipt via conversation", () => {
     const walletCtx = makeCallbackCtx("pm:w");
     await bot._handlers.get("callback_query")!(walletCtx);
     expect(app.cart.get(555)?.state).toBe("checkout_fulfillment");
-    // Fulfillment: pickup + default time → confirm keyboard.
-    await bot._handlers.get("callback_query")!(makeCallbackCtx("fm:p"));
-    const timeCtx = fakeCtx("پیش‌فرض");
-    await bot._handlers.get("message:text")!(timeCtx);
 
-    // Confirm with the one-shot token from the confirm keyboard.
-    const confirmData = callbacksOf(timeCtx._replies[timeCtx._replies.length - 1]!.opts?.reply_markup).find((c) =>
-      c?.startsWith("cf:"),
-    )!;
-    const confirmCtx = makeCallbackCtx(confirmData);
-    await bot._handlers.get("callback_query")!(confirmCtx);
+    // The first fulfillment press charges the wallet and places the order.
+    const pick = makeCallbackCtx("fm:p");
+    await bot._handlers.get("callback_query")!(pick);
 
     const order = app.orders.latestOrderFor(555);
     expect(order).not.toBeNull();
@@ -1015,7 +1061,8 @@ describe("checkout, payment, and receipt via conversation", () => {
     expect(order!.receiptFileId).toBeNull();
     expect(app.customers.getBalance(555)).toBe(40000);
     // The confirmation reports the remaining balance.
-    expect(confirmCtx._replies.some((r) => r.text.includes("40,000"))).toBe(true);
+    const shown = [...pick._replies, ...pick._edits].map((r) => r.text).join("\n");
+    expect(shown).toContain("40,000");
   });
 
   test("cancel during checkout clears pending checkout state honestly", async () => {
@@ -1170,7 +1217,9 @@ describe("bug fix: free-text reaches the AI pipeline", () => {
     await bot._handlers.get("message:photo")!(makeMediaCtx("photo"));
 
     expect(aiInputs.length).toBe(0); // AI was never consulted
-    expect(app.cart.get(555)?.state).toBe("checkout_fulfillment");
+    // The receipt itself placed the order — no extra confirm step.
+    expect(app.cart.get(555)?.state).toBe("browsing");
+    expect(app.orders.latestOrderFor(555)).not.toBeNull();
   });
 
   test("a failing Telegram reply is not counted as delivered (no assistant history)", async () => {
@@ -1662,5 +1711,147 @@ describe("cart-first checkout UX", () => {
     const cbs = callbacksOf(ctx._replies[0]!.opts?.reply_markup);
     expect(cbs).toContain("cart");
     expect(cbs).not.toContain("co");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Admin receipt review: تأیید/لغو buttons + reject-reason capture
+// ---------------------------------------------------------------------------
+
+describe("admin receipt review (confirm/reject keyboard)", () => {
+  const ADMIN = 777;
+
+  /** Card order placed exactly like the bot does (receipt → immediate order). */
+  async function placeCardOrder(): Promise<{ app: BotApp; orderId: number; orderNumber: string }> {
+    const menu = new MenuService(db);
+    const cat = menu.listCategories(false)[0]!;
+    const espId = menu
+      .createProduct({ categoryId: cat.id, name: "اسپرسو", fixedPriceAmount: 80000 })
+      .id;
+    const built = buildApp({ type: "chat", reply: "x", actions: [], needsClarification: false });
+    built.cart.addItem(555, espId, null, 1);
+    const bot = fakeBot();
+    registerMessageHandlers(bot, built);
+    registerCallbackHandlers(bot, built);
+    await bot._handlers.get("callback_query")!(makeCallbackCtx("co"));
+    await bot._handlers.get("callback_query")!(makeCallbackCtx("pm:c"));
+    await bot._handlers.get("message:photo")!(makeMediaCtx("photo"));
+    const order = built.orders.latestOrderFor(555);
+    if (!order) throw new Error("order not placed");
+    return { app: built, orderId: order.id, orderNumber: order.orderNumber };
+  }
+
+  test("a non-admin pressing the review buttons is refused", async () => {
+    const built = await placeCardOrder();
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, built.app);
+    const ctx = makeCallbackCtx(`oa:yes:${built.orderId}`, 999);
+    await bot._handlers.get("callback_query")!(ctx);
+
+    expect(ctx._answers.some((a) => a?.show_alert && a?.text?.includes("غیرمجاز"))).toBe(true);
+    expect(built.app.orders.loadOrder(built.orderId)!.paymentStatus).toBe("receipt_received");
+  });
+
+  test("admin تأیید marks the order paid and notifies the customer once", async () => {
+    const built = await placeCardOrder();
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, built.app);
+    const ctx = makeCallbackCtx(`oa:yes:${built.orderId}`, ADMIN);
+    await bot._handlers.get("callback_query")!(ctx);
+
+    const order = built.app.orders.loadOrder(built.orderId)!;
+    expect(order.paymentStatus).toBe("paid");
+    expect(order.paymentReviewedBy).toBe(ADMIN);
+    expect(ctx._answers.some((a) => a?.text?.includes("تأیید شد"))).toBe(true);
+    // Buttons stripped so the resolved message cannot be re-pressed.
+    expect(ctx._edits.length).toBeGreaterThan(0);
+
+    const rows = built.app.db
+      .query("SELECT * FROM notifications WHERE kind = 'customer_notice' AND ref_key = ?")
+      .all(`payment_approved_${built.orderNumber}`) as any[];
+    expect(rows.length).toBe(1);
+    expect(JSON.parse(rows[0]!.payload).text).toContain("تأیید شد");
+
+    // A second press is a no-op — no duplicate customer notice.
+    await bot._handlers.get("callback_query")!(makeCallbackCtx(`oa:yes:${built.orderId}`, ADMIN));
+    const after = built.app.db
+      .query("SELECT COUNT(*) AS c FROM notifications WHERE kind = 'customer_notice' AND ref_key = ?")
+      .get(`payment_approved_${built.orderNumber}`) as { c: number };
+    expect(after.c).toBe(1);
+  });
+
+  test("admin لغو asks for a reason; the typed reason is saved and sent to the customer with the receipt image", async () => {
+    const built = await placeCardOrder();
+    const bot = fakeBot();
+    registerMessageHandlers(bot, built.app);
+    registerCallbackHandlers(bot, built.app);
+
+    const press = makeCallbackCtx(`oa:no:${built.orderId}`, ADMIN);
+    await bot._handlers.get("callback_query")!(press);
+    // Nothing is rejected yet — the reason is captured from the next text.
+    expect(built.app.orders.loadOrder(built.orderId)!.paymentStatus).toBe("receipt_received");
+    expect(built.app.rejectReasonFlow.isActive(ADMIN)).toBe(true);
+    expect(press._replies.some((r) => r.text.includes("دلیل"))).toBe(true);
+
+    const reasonCtx = fakeCtx("مبلغ واریزی کمتر از مبلغ سفارش است", {
+      id: ADMIN,
+      first_name: "Admin",
+    });
+    await bot._handlers.get("message:text")!(reasonCtx);
+
+    const order = built.app.orders.loadOrder(built.orderId)!;
+    expect(order.paymentStatus).toBe("rejected");
+    expect(order.rejectionReason).toBe("مبلغ واریزی کمتر از مبلغ سفارش است");
+    expect(order.paymentReviewedBy).toBe(ADMIN);
+    expect(built.app.rejectReasonFlow.isActive(ADMIN)).toBe(false);
+
+    // Customer notice: receipt image + reason text in one payload.
+    const rows = built.app.db
+      .query("SELECT * FROM notifications WHERE kind = 'customer_notice' AND ref_key = ?")
+      .all(`payment_rejected_${built.orderNumber}`) as any[];
+    expect(rows.length).toBe(1);
+    const payload = JSON.parse(rows[0]!.payload);
+    expect(payload.photoFileId).toBe("receipt-file");
+    expect(payload.text).toContain("مبلغ واریزی کمتر از مبلغ سفارش است");
+    expect(reasonCtx._replies.some((r) => r.text.includes("برای مشتری ارسال شد"))).toBe(true);
+  });
+
+  test("/cancel mid-reason clears the flow without rejecting the order", async () => {
+    const built = await placeCardOrder();
+    const bot = fakeBot();
+    registerMessageHandlers(bot, built.app);
+    registerCallbackHandlers(bot, built.app);
+    await bot._handlers.get("callback_query")!(makeCallbackCtx(`oa:no:${built.orderId}`, ADMIN));
+
+    const cancelCtx = fakeCtx("/cancel", { id: ADMIN, first_name: "Admin" });
+    await bot._handlers.get("message:text")!(cancelCtx);
+
+    expect(built.app.rejectReasonFlow.isActive(ADMIN)).toBe(false);
+    const order = built.app.orders.loadOrder(built.orderId)!;
+    expect(order.paymentStatus).toBe("receipt_received");
+    expect(order.rejectionReason).toBeNull();
+  });
+
+  test("لغو on an already-paid order is refused and does not arm the flow", async () => {
+    const built = await placeCardOrder();
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, built.app);
+    await bot._handlers.get("callback_query")!(makeCallbackCtx(`oa:yes:${built.orderId}`, ADMIN));
+
+    const ctx = makeCallbackCtx(`oa:no:${built.orderId}`, ADMIN);
+    await bot._handlers.get("callback_query")!(ctx);
+    expect(ctx._answers.some((a) => a?.show_alert)).toBe(true);
+    expect(built.app.rejectReasonFlow.isActive(ADMIN)).toBe(false);
+    expect(built.app.orders.loadOrder(built.orderId)!.paymentStatus).toBe("paid");
+  });
+
+  test("a customer's normal text is unaffected while no reject flow is active", async () => {
+    const built = await placeCardOrder();
+    const bot = fakeBot();
+    registerMessageHandlers(bot, built.app);
+    // No flow armed: an admin's free text must not be swallowed as a reason.
+    const ctx = fakeCtx("سلام", { id: ADMIN, first_name: "Admin" });
+    await bot._handlers.get("message:text")!(ctx);
+    expect(built.app.orders.loadOrder(built.orderId)!.paymentStatus).toBe("receipt_received");
   });
 });

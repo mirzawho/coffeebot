@@ -25,6 +25,7 @@ import {
 } from "../../services/settings";
 import { formatMoney, parseAmountInput } from "../../utils/money";
 import { formatJalaliFa, isValidDate } from "../../utils/dates";
+import { paymentRejectedCustomerText } from "../../bot/format";
 import { log } from "../../utils/logger";
 import type { Order } from "../../services/orders";
 
@@ -842,8 +843,17 @@ export function walletDepositApprovedText(amount: number, balanceAfter: number, 
 // order lifecycle actions (admin)
 
 /** Enqueue a customer notice (durable queue; delivery via scheduler). */
-function notifyCustomer(app: ApiApp, telegramId: number, refKey: string, text: string): void {
-  app.notifications.enqueue("customer_notice", refKey, [telegramId], { text });
+function notifyCustomer(
+  app: ApiApp,
+  telegramId: number,
+  refKey: string,
+  text: string,
+  photoFileId?: string | null,
+): void {
+  app.notifications.enqueue("customer_notice", refKey, [telegramId], {
+    text,
+    ...(photoFileId ? { photoFileId } : {}),
+  });
 }
 
 route("POST", "/api/admin/orders/:ref/confirm", ({ app, user, params }) => {
@@ -936,18 +946,36 @@ route("POST", "/api/admin/orders/:ref/payment/approve", ({ app, user, params }) 
   return json({ ok: true, already: r.already, order: orderDto(r.order, app.config.timezone) });
 });
 
-/** Admin rejects a card-to-card receipt (wrong amount, unreadable, unpaid). */
-route("POST", "/api/admin/orders/:ref/payment/reject", ({ app, user, params }) => {
+/**
+ * Admin rejects a card-to-card receipt. The panel collects an optional reason
+ * (`{ reason }`); without one the customer still gets the receipt image with a
+ * generic text. The bot keyboard path always requires a reason.
+ */
+route("POST", "/api/admin/orders/:ref/payment/reject", async ({ app, user, params, req }) => {
   const order = app.orders.findByNumber(decodeURIComponent(params.ref));
   if (!order) return badRequest("سفارش یافت نشد");
-  const r = app.orders.markPaymentRejected(order.id, user.id);
+  let reason: string | null = null;
+  try {
+    const body = (await readJson(req)) as { reason?: unknown } | null;
+    if (typeof body?.reason === "string" && body.reason.trim()) {
+      reason = body.reason.trim().slice(0, 500);
+    }
+  } catch (err) {
+    if (err instanceof HttpError && err.status === 413) throw err;
+    // Unreadable body: fall through with no reason (backward compatible).
+  }
+  const r = app.orders.markPaymentRejected(order.id, user.id, reason);
   if (!r.ok) return badRequest(r.error);
   if (!r.already) {
+    const text = reason
+      ? paymentRejectedCustomerText(r.order.orderNumber, reason)
+      : `⚠️ رسید پرداخت سفارش ${r.order.orderNumber} تأیید نشد. لطفاً با کافه تماس بگیرید.`;
     notifyCustomer(
       app,
       r.order.customerTelegramId,
       `payment_rejected_${r.order.orderNumber}`,
-      `⚠️ رسید پرداخت سفارش ${r.order.orderNumber} تأیید نشد. لطفاً با کافه تماس بگیرید.`,
+      text,
+      r.order.receiptFileId,
     );
   }
   return json({ ok: true, already: r.already, order: orderDto(r.order, app.config.timezone) });

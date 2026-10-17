@@ -8,7 +8,8 @@ export type CartState =
   | "checkout_payment"
   | "checkout_receipt"
   | "checkout_fulfillment"
-  | "checkout_confirm";
+  | "checkout_confirm"
+  | "checkout_placed";
 
 /** How the customer chose to pay. Null until they pick at checkout. */
 export type CartPaymentMethod = "card_to_card" | "wallet";
@@ -319,7 +320,11 @@ export class CartService {
       .run(fileId, messageId, nowIso(), telegramId);
   }
 
-  /** Record the fulfillment choice (delivery vs pickup) and ask the time next. */
+  /**
+   * Record the fulfillment choice (delivery vs pickup). Moves the cart to
+   * `checkout_confirm`, the stage `confirmOrder` accepts — the card path then
+   * places the order immediately, the wallet path on the same press.
+   */
   setFulfillmentMethod(telegramId: number, method: FulfillmentMethod): void {
     this.getOrCreate(telegramId);
     this.db
@@ -334,14 +339,6 @@ export class CartService {
     this.db
       .query("UPDATE carts SET fulfillment_time = ?, updated_at = ? WHERE telegram_id = ?")
       .run(time === null ? null : time.trim().slice(0, 100) || null, nowIso(), telegramId);
-  }
-
-  setDeliveryNotes(telegramId: number, notes: string | null): void {
-    this.db
-      .query(
-        "UPDATE carts SET delivery_notes = ?, state = 'checkout_confirm', updated_at = ? WHERE telegram_id = ?",
-      )
-      .run(notes, nowIso(), telegramId);
   }
 
   setCheckoutTotal(telegramId: number, total: number): void {

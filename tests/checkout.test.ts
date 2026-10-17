@@ -58,7 +58,6 @@ describe("checkout flow", () => {
     toConfirm(1, "delivery");
     cart.setFulfillmentTime(1, "ساعت ۵ عصر");
     expect(cart.get(1)?.state).toBe("checkout_confirm");
-    expect(orders.setDeliveryNotes(1, "اتاق ۴").ok).toBe(true);
 
     const conf = orders.confirmOrder(1, "Ali");
     expect(conf.ok).toBe(true);
@@ -66,7 +65,7 @@ describe("checkout flow", () => {
     expect(conf.order.orderNumber).toMatch(/^CN-\d{8}-\d{4}$/);
     expect(conf.order.totalAmount).toBe(45000);
     expect(conf.order.receiptFileId).toBe("file-xyz");
-    expect(conf.order.deliveryNotes).toBe("اتاق ۴");
+    expect(conf.order.deliveryNotes).toBeNull();
     expect(conf.order.fulfillmentMethod).toBe("delivery");
     expect(conf.order.deliveryTime).toBe("ساعت ۵ عصر");
     expect(conf.order.status).toBe("receipt_received_unverified");
@@ -79,6 +78,63 @@ describe("checkout flow", () => {
     expect(cart.getTotals(1).lines.length).toBe(0);
     expect(cart.get(1)?.state).toBe("browsing");
     expect(cart.get(1)?.paymentMethod).toBeNull();
+  });
+
+  test("placeOrderAfterReceipt creates the order immediately with pickup/now defaults", () => {
+    seedCart(1, 2); // 30,000
+    orders.startCheckout(1);
+    orders.choosePaymentMethod(1, "card_to_card");
+    const placed = orders.placeOrderAfterReceipt(1, "receipt-file", 42, "Ali");
+    expect(placed.ok).toBe(true);
+    if (!placed.ok) return;
+    expect(placed.order.paymentMethod).toBe("card_to_card");
+    expect(placed.order.paymentStatus).toBe("receipt_received");
+    expect(placed.order.receiptFileId).toBe("receipt-file");
+    // Defaults applied at placement — no extra confirm step.
+    expect(placed.order.fulfillmentMethod).toBe("pickup");
+    expect(placed.order.deliveryTime).toBeNull();
+    expect(placed.order.totalAmount).toBe(30000);
+    expect(cart.get(1)?.state).toBe("browsing");
+    expect(cart.getTotals(1).lines.length).toBe(0);
+    // The receipt is inside the editable window.
+    expect(orders.editableOrderFor(1)?.id).toBe(placed.order.id);
+  });
+
+  test("updateFulfillment edits a pending order but refuses after confirmation", () => {
+    seedCart(1, 1);
+    orders.startCheckout(1);
+    const placed = orders.placeOrderAfterReceipt(1, "f", 1);
+    expect(placed.ok).toBe(true);
+    if (!placed.ok) return;
+    // Delivery needs a saved address.
+    new CustomersService(db).saveProfile(1, { fullName: "مشتری", address: "تهران" });
+
+    const edited = orders.updateFulfillment(placed.order.id, 1, {
+      method: "delivery",
+      time: "فردا",
+    });
+    expect(edited.ok).toBe(true);
+    if (!edited.ok) return;
+    expect(edited.order.fulfillmentMethod).toBe("delivery");
+    expect(edited.order.deliveryTime).toBe("فردا");
+
+    // Another customer cannot touch it.
+    expect(orders.updateFulfillment(placed.order.id, 2, { method: "pickup" }).ok).toBe(false);
+
+    // Once the café confirms it, the customer can no longer edit.
+    orders.markConfirmed(placed.order.id, 777);
+    expect(orders.updateFulfillment(placed.order.id, 1, { method: "pickup" }).ok).toBe(false);
+  });
+
+  test("delivery edit is refused without a saved address", () => {
+    seedCart(1, 1);
+    orders.startCheckout(1);
+    const placed = orders.placeOrderAfterReceipt(1, "f", 1);
+    if (!placed.ok) throw new Error("place failed");
+    const r = orders.updateFulfillment(placed.order.id, 1, { method: "delivery" });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error).toContain("آدرس");
   });
 
   test("a screenshot sent on the payment screen implicitly selects card-to-card", () => {
@@ -135,8 +191,7 @@ describe("checkout flow", () => {
     seedCart(1, 1);
     orders.startCheckout(1);
     orders.choosePaymentMethod(1, "card_to_card");
-    // Force the confirm stage without ever attaching a receipt.
-    cart.setDeliveryNotes(1, null);
+    // Still on the receipt stage — confirm must refuse before any order exists.
     const conf = orders.confirmOrder(1, "Ali");
     expect(conf.ok).toBe(false);
     if (conf.ok) return;
@@ -246,10 +301,12 @@ describe("checkout flow", () => {
     expect(c2.order.businessDate).toBe(c1.order.businessDate);
   });
 
-  test("receipt required before delivery stage", () => {
+  test("receipt required before the order can be placed", () => {
     seedCart(1);
     orders.startCheckout(1);
-    expect(orders.setDeliveryNotes(1, "x").ok).toBe(false);
+    // Still on the payment picker — nothing may place an order yet.
+    expect(orders.confirmOrder(1).ok).toBe(false);
+    expect(orders.listForCustomer(1).length).toBe(0);
   });
 });
 

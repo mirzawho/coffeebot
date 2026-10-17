@@ -133,8 +133,9 @@ describe("late orders", () => {
     const rows = db
       .query("SELECT kind, ref_key FROM notifications WHERE kind = 'order_update' ORDER BY id")
       .all() as any[];
-    expect(rows.length).toBe(2); // two recipients
-    expect(rows[0].ref_key).toBe(o2.orderNumber);
+    // Card orders notify at placement (o1: 2 rows) plus the late path for o2.
+    const forO2 = rows.filter((r) => r.ref_key === o2.orderNumber);
+    expect(forO2.length).toBe(2); // two recipients
   });
 
   test("order AFTER skipped_empty report also generates order_update notifications", () => {
@@ -155,13 +156,21 @@ describe("late orders", () => {
     expect(rows[0].ref_key).toBe(o.orderNumber);
   });
 
-  test("order BEFORE report does not generate order_update (it is in the report)", () => {
+  test("a card order BEFORE the report still notifies immediately (receipt review)", () => {
+    // The receipt-with-review-buttons must reach the admin right away —
+    // it must not wait for the daily report.
     const o1 = placeOrder(1);
-    reports.trySend(o1.businessDate);
     const rows = db
+      .query("SELECT ref_key FROM notifications WHERE kind = 'order_update'")
+      .all() as { ref_key: string }[];
+    expect(rows.length).toBe(2); // two recipients
+    expect(rows[0]!.ref_key).toBe(o1.orderNumber);
+    // The report run adds no duplicate order_update rows.
+    reports.trySend(o1.businessDate);
+    const after = db
       .query("SELECT COUNT(*) AS c FROM notifications WHERE kind = 'order_update'")
       .get() as { c: number };
-    expect(rows.c).toBe(0);
+    expect(after.c).toBe(2);
   });
 });
 

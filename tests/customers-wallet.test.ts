@@ -882,6 +882,28 @@ describe("admin payment review API", () => {
     expect((approve.body as any).order.paymentStatus).toBe("paid");
   });
 
+  test("rejecting with a reason stores it and queues the receipt image + reason for the customer", async () => {
+    const { orderNumber } = placeCardOrder();
+    const r = await call("POST", `/api/admin/orders/${orderNumber}/payment/reject`, {
+      reason: "مبلغ واریزی کمتر از مبلغ سفارش است",
+    });
+    expect(r.status).toBe(200);
+    expect((r.body as any).order.paymentStatus).toBe("rejected");
+
+    const o = orders.findByNumber(orderNumber)!;
+    expect(o.paymentStatus).toBe("rejected");
+    expect(o.rejectionReason).toBe("مبلغ واریزی کمتر از مبلغ سفارش است");
+
+    // The customer notice carries BOTH the receipt image and the reason text.
+    const rows = db
+      .query("SELECT * FROM notifications WHERE kind = 'customer_notice' AND ref_key = ?")
+      .all(`payment_rejected_${orderNumber}`) as any[];
+    expect(rows.length).toBe(1);
+    const payload = JSON.parse(rows[0]!.payload);
+    expect(payload.photoFileId).toBe("receipt-file");
+    expect(payload.text).toContain("مبلغ واریزی کمتر از مبلغ سفارش است");
+  });
+
   test("a paid order cannot be rejected", async () => {
     const { orderNumber } = placeCardOrder();
     await call("POST", `/api/admin/orders/${orderNumber}/payment/approve`);

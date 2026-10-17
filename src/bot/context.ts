@@ -8,6 +8,7 @@ import type { AiService } from "../services/ollama";
 import type { TokenService } from "./tokens";
 import type { CustomersService } from "../services/customers";
 import type { LoyaltyService } from "../services/loyalty";
+import type { NotificationService } from "../services/notifications";
 
 export interface ChatTurn {
   role: "user" | "assistant";
@@ -51,12 +52,14 @@ export interface BotApp {
   persona: string;
   customers: CustomersService;
   loyalty: LoyaltyService;
+  /** Durable customer notifications (payment review outcomes). */
+  notifications: NotificationService;
   /** Multi-step profile wizard (name → phone → address). */
   profileEdit: TextCaptureFlow;
   /** Next text message is captured as a wallet deposit amount. */
   depositFlow: TextCaptureFlow;
-  /** Next text message is captured as the delivery/pickup time. */
-  fulfillmentTimeFlow: TextCaptureFlow;
+  /** Next admin text is the rejection reason for the order id in `step`. */
+  rejectReasonFlow: TextCaptureFlow;
 }
 
 const HISTORY_CAP = 300;

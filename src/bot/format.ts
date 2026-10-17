@@ -3,7 +3,7 @@ import type { PaymentSettings } from "../services/settings";
 import type { Product, Variant } from "../services/menu";
 import type { Order } from "../services/orders";
 import { formatAmount, formatMoney } from "../utils/money";
-import { toPersianDigits } from "../utils/dates";
+import { toPersianDigits, zonedNow } from "../utils/dates";
 
 export const WELCOME_TEXT = `سلام! 👋
 به کافه خوش آمدید.
@@ -22,7 +22,7 @@ export const HELP_TEXT = `راهنما:
 • از «سبد خرید» و سپس «پرداخت و ثبت سفارش» روش پرداخت را انتخاب کنید:
   💰 کیف پول — اگر موجودی کافی باشد، مبلغ بلافاصله کسر می‌شود.
   💳 کارت به کارت — مبلغ را کارت به کارت کنید و تصویر رسید را بفرستید؛
-     پس از تأیید مدیر، پرداخت ثبت می‌شود.
+     سفارش بلافاصله ثبت می‌شود و پس از تأیید مدیر، پرداخت قطعی می‌شود.
 • ساعات کاری را رعایت کنید؛ سفارش‌های خارج از ساعات کاری به اولین روز کاری بعدی منتقل می‌شوند.
 
 پرداخت کارت به کارت توسط ربات تأیید نمی‌شود؛ رسید دریافت و برای بررسی به مدیر ارجاع می‌شود.`;
@@ -131,11 +131,12 @@ export function cartText(lines: CartLine[], total: number, currency: string): st
   const parts: string[] = ["🛒 سبد خرید شما:", ""];
   for (const l of lines) {
     const name = l.variantName ? `${l.productName} (${l.variantName})` : l.productName;
-    parts.push(`• ${name}`);
-    parts.push(`  ${toPersianDigits(String(l.quantity))} × ${formatAmount(l.unitPrice)} = ${formatMoney(l.lineTotal, currency)}`);
+    parts.push(
+      `• ${name} — ${toPersianDigits(String(l.quantity))} × ${formatAmount(l.unitPrice)} = ${formatMoney(l.lineTotal, currency)}`,
+    );
   }
   parts.push("");
-  parts.push(`جمع کل: ${formatMoney(total, currency)}`);
+  parts.push(`💳 مبلغ قابل پرداخت: ${formatMoney(total, currency)}`);
   return parts.join("\n");
 }
 
@@ -147,7 +148,7 @@ export function orderSummaryText(lines: CartLine[], total: number, currency: str
       return `• ${name} — ${toPersianDigits(String(l.quantity))} × ${formatAmount(l.unitPrice)} = ${formatMoney(l.lineTotal, currency)}`;
     }),
     "",
-    `مبلغ قابل پرداخت: ${formatMoney(total, currency)}`,
+    `💳 مبلغ قابل پرداخت: ${formatMoney(total, currency)}`,
   ].join("\n");
 }
 
@@ -201,11 +202,11 @@ export function paymentText(payment: PaymentSettings, total: number): string {
   parts.push("");
   parts.push("⚠️ توجه: ربات پرداخت را تأیید نمی‌کند؛ رسید فقط دریافت و ثبت می‌شود.");
   parts.push("");
-  parts.push("📤 پس از پرداخت، تصویر رسید (عکس یا فایل تصویری) را همین‌جا بفرستید.");
+  parts.push("📤 پس از پرداخت، تصویر رسید (عکس یا فایل تصویری) را همین‌جا بفرستید تا سفارش ثبت شود.");
   return parts.join("\n");
 }
 
-/** Shown when the customer picks wallet payment, before final confirmation. */
+/** Wallet chosen: show the balance effect; the order is placed on the next step. */
 export function walletPaymentSummaryText(
   total: number,
   currency: string,
@@ -218,7 +219,7 @@ export function walletPaymentSummaryText(
     `موجودی فعلی: ${formatMoney(balance, currency)}`,
     `موجودی پس از پرداخت: ${formatMoney(balance - total, currency)}`,
     "",
-    "برای کسر مبلغ از کیف پول، سفارش را تأیید کنید.",
+    "روش تحویل و زمان را انتخاب کنید تا سفارش ثبت و مبلغ کسر شود.",
   ].join("\n");
 }
 
@@ -234,70 +235,91 @@ export const RECEIPT_WRONG_STATE_TEXT =
 export const UNSUPPORTED_TEXT =
   "فعلاً فقط پیام متنی رو می‌تونم پردازش کنم. لطفاً درخواستت رو به‌صورت متن بنویس. 😊";
 
-export const DELIVERY_PROMPT_TEXT =
-  "📦 در صورت تمایل یادداشت تحویل بنویسید (مثلاً طبقه، شرکت یا توضیح خاص).\nیا با دکمه زیر بدون یادداشت ادامه دهید.";
+/** Labels for the quick-pick time buttons, resolved to a concrete clock time where useful. */
+export type QuickTimeChoice = "now" | "5m" | "10m" | "1h" | "tomorrow";
 
-export const FULFILLMENT_PROMPT_TEXT =
-  "🛵 سفارش را برایتان ارسال کنیم یا خودتان تحویل می‌گیرید؟";
-
-export function fulfillmentPromptText(hasAddress: boolean, address: string | null): string {
-  return hasAddress
-    ? `${FULFILLMENT_PROMPT_TEXT}\n\n📍 آدرس ثبت‌شده شما: ${address}`
-    : `${FULFILLMENT_PROMPT_TEXT}\n\n(آدرسی ثبت نکرده‌اید؛ برای ارسال، ابتدا پروفایل را کامل کنید.)`;
+export function quickFulfillmentTimeLabel(choice: QuickTimeChoice, now: Date, timeZone: string): string {
+  if (choice === "now") return "همین الان";
+  if (choice === "tomorrow") return "فردا";
+  const minutes = choice === "5m" ? 5 : choice === "10m" ? 10 : 60;
+  const target = new Date(now.getTime() + minutes * 60_000);
+  return `ساعت ${toPersianDigits(zonedNow(target, timeZone).time)}`;
 }
-
-export const FULFILLMENT_TIME_PROMPT_TEXT =
-  "⏰ چه زمانی تحویل بگیرید؟ (مثلاً «ساعت ۵ عصر» یا «الان»)\nیا «پیش‌فرض» بفرستید تا در اولین فرصت آماده شود.";
 
 export function fulfillmentLabel(method: "delivery" | "pickup" | null): string {
   return method === "delivery" ? "ارسال 🛵" : "تحویل حضوری 🏪";
 }
 
-export function confirmSummaryText(
-  lines: CartLine[],
-  total: number,
-  currency: string,
-  deliveryNotes: string | null,
-  fulfillment?: { method: "delivery" | "pickup" | null; time: string | null },
+export function fulfillmentLine(method: "delivery" | "pickup", time: string | null): string {
+  const timePart = time ? ` — ${time}` : "";
+  return `🛵 روش تحویل: ${fulfillmentLabel(method)}${timePart}`;
+}
+
+export const RECEIPT_PLACED_LEAD_TEXT = "🎉 ممنون! رسید شما دریافت شد و سفارش ثبت شد.";
+export const ORDER_PLACED_LEAD_TEXT = "🎉 سفارش شما ثبت شد!";
+
+/**
+ * The placed-order summary — sent once the order row exists and re-rendered
+ * in place when the customer edits delivery via the buttons. Defaults
+ * (pickup, now) are already stored; `awaitingFulfillment` adds the hint to
+ * pick method/time with the keyboard.
+ */
+export function orderPlacedSummaryText(
+  order: Order,
+  opts: { lead?: string; awaitingFulfillment?: boolean; walletRemaining?: number } = {},
 ): string {
-  const parts = [orderSummaryText(lines, total, currency)];
-  if (fulfillment && fulfillment.method) {
-    const timePart = fulfillment.time ? ` — ${fulfillment.time}` : "";
-    parts.push(`\n🛵 روش تحویل: ${fulfillmentLabel(fulfillment.method)}${timePart}`);
-  }
-  if (deliveryNotes) parts.push(`\n📦 یادداشت: ${deliveryNotes}`);
+  const parts: string[] = [opts.lead ?? ORDER_PLACED_LEAD_TEXT];
   parts.push("");
-  parts.push("آیا سفارش نهایی شود؟");
+  parts.push(`شماره سفارش: ${order.orderNumber}`);
+  for (const it of order.items) {
+    const name = it.variantName ? `${it.productName} (${it.variantName})` : it.productName;
+    parts.push(
+      `• ${name} — ${toPersianDigits(String(it.quantity))} × ${formatAmount(it.unitPrice)} = ${formatMoney(it.lineTotal, order.currency)}`,
+    );
+  }
+  parts.push("");
+  parts.push(`مبلغ کل: ${formatMoney(order.totalAmount, order.currency)}`);
+  parts.push("");
+  parts.push(fulfillmentLine(order.fulfillmentMethod, order.deliveryTime));
+  parts.push("");
+  if (order.paymentMethod === "wallet") {
+    const remaining =
+      opts.walletRemaining !== undefined
+        ? ` — موجودی باقی‌مانده: ${formatMoney(opts.walletRemaining, order.currency)}`
+        : "";
+    parts.push(`💰 پرداخت از کیف پول انجام شد${remaining}.`);
+  } else {
+    parts.push("💳 وضعیت پرداخت: رسید دریافت شده — در انتظار تأیید مدیر.");
+  }
+  if (opts.awaitingFulfillment) {
+    parts.push("");
+    parts.push("روش تحویل و زمان را با دکمه‌های زیر انتخاب کنید (پیش‌فرض: تحویل حضوری — الان).");
+  }
   return parts.join("\n");
 }
 
-export function orderConfirmedText(order: Order): string {
-  const fulfill =
-    order.fulfillmentMethod === "delivery"
-      ? `روش تحویل: ارسال 🛵${order.deliveryTime ? ` — ${order.deliveryTime}` : ""}`
-      : "روش تحویل: تحویل حضوری 🏪";
-  if (order.paymentMethod === "wallet") {
-    return [
-      "✅ سفارش شما با موفقیت ثبت شد.",
-      "",
-      `شماره سفارش: ${order.orderNumber}`,
-      `مبلغ: ${formatMoney(order.totalAmount, order.currency)}`,
-      "روش پرداخت: کیف پول 💰 (پرداخت انجام شد)",
-      fulfill,
-      "",
-      "سفارش شما در نوبت آماده‌سازی است.",
-    ].join("\n");
-  }
+/** Shown when the price drifted before the order could be placed. */
+export function priceChangedText(total: number, currency: string): string {
   return [
-    "✅ سفارش شما با موفقیت ثبت شد.",
+    "⚠️ قیمت برخی اقلام تغییر کرده است.",
+    `مبلغ جدید: ${formatMoney(total, currency)}`,
     "",
-    `شماره سفارش: ${order.orderNumber}`,
-    `مبلغ: ${formatMoney(order.totalAmount, order.currency)}`,
-    "روش پرداخت: کارت به کارت 💳",
-    fulfill,
+    "دکمه‌های زیر را بزنید تا سفارش با مبلغ جدید ثبت شود.",
+  ].join("\n");
+}
+
+/** Admin pressed لغو on a receipt: ask for the rejection reason. */
+export const REJECT_REASON_PROMPT_TEXT =
+  "📝 دلیل رد رسید را بنویسید (مثلاً: مبلغ واریزی کمتر از مبلغ سفارش است).\nاین متن به‌همراه تصویر رسید برای مشتری ارسال می‌شود.";
+
+/** Customer-facing rejection notice; sent together with the receipt image. */
+export function paymentRejectedCustomerText(orderNumber: string, reason: string): string {
+  return [
+    `⚠️ رسید پرداخت سفارش ${orderNumber} تأیید نشد.`,
     "",
-    "وضعیت: رسید دریافت شده (در انتظار تأیید پرداخت توسط مدیر).",
-    "پس از تأیید پرداخت، سفارش آماده‌سازی می‌شود.",
+    `دلیل: ${reason}`,
+    "",
+    "لطفاً با کافه تماس بگیرید.",
   ].join("\n");
 }
 

@@ -1,6 +1,6 @@
 import type { Db } from "../db/database";
 import { nowIso, tx } from "../db/database";
-import { formatOrderNumber, MAX_DELIVERY_NOTES_LENGTH } from "../utils/ids";
+import { formatOrderNumber } from "../utils/ids";
 import { formatMoney } from "../utils/money";
 import { BusinessHoursService } from "./business-hours";
 import { CartService, type CartLine, type FulfillmentMethod } from "./cart";
@@ -44,6 +44,8 @@ export interface Order {
   deliveredAt: string | null;
   paymentReviewedBy: number | null;
   paymentReviewedAt: string | null;
+  /** Admin's explanation when the receipt was rejected; null until rejected. */
+  rejectionReason: string | null;
   createdAt: string;
   items: OrderItem[];
 }
@@ -54,6 +56,19 @@ export type ConfirmResult =
   | { ok: false; reason: "empty" }
   | { ok: false; reason: "inactive_items"; error: string }
   | { ok: false; reason: "error"; error: string };
+
+export type PlaceResult =
+  | { ok: true; order: Order }
+  | { ok: false; reason: "empty" }
+  | { ok: false; reason: "inactive_items"; error: string }
+  | { ok: false; reason: "price_changed"; total: number; lines: CartLine[] }
+  | { ok: false; reason: "error"; error: string };
+
+/**
+ * How long a placed-but-pending order stays editable by the customer
+ * (delivery method / time). After this window only the admin can touch it.
+ */
+export const ORDER_EDIT_WINDOW_MS = 15 * 60_000;
 
 export type StartCheckoutResult =
   | { ok: true; lines: CartLine[]; total: number; payment: PaymentSettings; walletBalance: number }
@@ -186,44 +201,67 @@ export class OrdersService {
     return { ok: true };
   }
 
-  setDeliveryNotes(telegramId: number, notes: string | null): { ok: true } | { ok: false; error: string } {
-    const cart = this.carts.get(telegramId);
-    if (!cart || cart.state !== "checkout_confirm") {
-      return { ok: false, error: "در این مرحله امکان ثبت اطلاعات تحویل نیست" };
+  /**
+   * Place a card-to-card order right after the receipt arrives: the receipt is
+   * attached and the order is created in one step (defaults: pickup, now).
+   * A price drift mid-checkout parks the cart in `checkout_placed` so the
+   * follow-up button press retries against the new total — never a duplicate.
+   */
+  placeOrderAfterReceipt(
+    telegramId: number,
+    fileId: string,
+    messageId: number,
+    customerName?: string | null,
+  ): PlaceResult {
+    const attach = this.attachReceipt(telegramId, fileId, messageId);
+    if (!attach.ok) return { ok: false, reason: "error", error: attach.error };
+    const placed = this.placeOrder(telegramId, false, customerName);
+    if (!placed.ok && (placed.reason === "price_changed" || placed.reason === "inactive_items")) {
+      this.carts.setState(telegramId, "checkout_placed");
     }
-    if (notes !== null) {
-      const trimmed = notes.trim();
-      if (trimmed.length > MAX_DELIVERY_NOTES_LENGTH) {
-        return { ok: false, error: "یادداشت تحویل بیش از حد مجاز طولانی است" };
-      }
-      this.carts.setDeliveryNotes(telegramId, trimmed || null);
-    } else {
-      this.carts.setDeliveryNotes(telegramId, null);
-    }
-    return { ok: true };
+    return placed;
   }
 
   /**
-   * Confirm and create the order. Prices are recomputed here (with the
-   * after-hours rule applied); if they drifted from the checkout snapshot the
-   * caller must show the new amounts and confirm again.
-   *
-   * The payment method comes from the customer's checkout choice; `payWithWallet`
-   * overrides it for callers that already know (tests, admin tooling). A wallet
-   * order is charged atomically inside the same transaction as the order row.
+   * The customer's most recent placed-but-pending order inside the edit
+   * window — the one the fulfillment buttons on the confirmation message
+   * are allowed to change.
    */
-  confirmOrder(
+  editableOrderFor(telegramId: number): Order | null {
+    const row = this.db
+      .query(
+        `SELECT id FROM orders WHERE customer_telegram_id = ? AND fulfillment_status = 'pending'
+         AND created_at >= ? ORDER BY id DESC LIMIT 1`,
+      )
+      .get(telegramId, new Date(Date.now() - ORDER_EDIT_WINDOW_MS).toISOString()) as
+      | { id: number }
+      | null;
+    return row ? this.loadOrder(row.id) : null;
+  }
+
+  /**
+   * Create the order for a cart at `checkout_fulfillment`/`checkout_confirm`,
+   * or update the already-placed `checkout_placed` row in place (price-changed
+   * retry, or a late fulfillment edit). `payWithWallet` is only meaningful for
+   * the create path; a placed card order never re-runs the wallet charge.
+   */
+  private placeOrder(
     telegramId: number,
+    payWithWallet: boolean,
     customerName?: string | null,
-    payWithWallet?: boolean,
-  ): ConfirmResult {
+  ): PlaceResult {
     const cart = this.carts.get(telegramId);
-    if (!cart || cart.state !== "checkout_confirm") {
-      return { ok: false, reason: "error", error: "سفارش آماده تأیید نیست؛ فرایند پرداخت را از ابتدا انجام دهید" };
+    if (
+      !cart ||
+      (cart.state !== "checkout_fulfillment" &&
+        cart.state !== "checkout_confirm" &&
+        cart.state !== "checkout_placed")
+    ) {
+      return { ok: false, reason: "error", error: "سفارش آماده ثبت نیست؛ فرایند پرداخت را از ابتدا انجام دهید" };
     }
-    const useWallet = payWithWallet ?? cart.paymentMethod === "wallet";
+    const useWallet = payWithWallet || cart.paymentMethod === "wallet";
     // A method switched off by the admin must not be honoured, even if the
-    // customer reached the confirm stage before the switch was flipped.
+    // customer reached this stage before the switch was flipped.
     const payment = getPaymentSettings(this.db);
     if (useWallet && !payment.walletEnabled) {
       return { ok: false, reason: "error", error: "پرداخت با کیف پول توسط مدیر غیرفعال شده است" };
@@ -264,10 +302,12 @@ export class OrdersService {
     }
 
     const currency = getCurrency(this.db);
-    const businessDate = this.businessHours.targetBusinessDate(new Date());
 
     try {
       const order = tx(this.db, () => {
+        // `checkout_placed` means a previous attempt hit a price change BEFORE
+        // any row was written — always insert here, never touch an older order.
+        const businessDate = this.businessHours.targetBusinessDate(new Date());
         const seq =
           (
             this.db
@@ -302,13 +342,20 @@ export class OrdersService {
 
         // Wallet charge: idempotent per order; rolls back the whole order on failure.
         if (useWallet) {
-          const pay = this.customers.payOrderFromWallet(telegramId, orderId, totals.total);
-          if (!pay.ok) throw new Error(pay.error);
-          this.db
-            .query("UPDATE orders SET wallet_debit_tx_id = ? WHERE id = ?")
-            .run(pay.txId, orderId);
+          const existingDebit = this.db
+            .query("SELECT wallet_debit_tx_id FROM orders WHERE id = ?")
+            .get(orderId) as { wallet_debit_tx_id: number | null } | null;
+          if (!existingDebit?.wallet_debit_tx_id) {
+            const pay = this.customers.payOrderFromWallet(telegramId, orderId, totals.total);
+            if (!pay.ok) throw new Error(pay.error);
+            this.db
+              .query("UPDATE orders SET wallet_debit_tx_id = ? WHERE id = ?")
+              .run(pay.txId, orderId);
+          }
         }
 
+        // The order items are a snapshot of the live cart lines.
+        this.db.query("DELETE FROM order_items WHERE order_id = ?").run(orderId);
         const insertItem = this.db.query(
           `INSERT INTO order_items (order_id, product_id, variant_id, product_name, variant_name,
            quantity, unit_price_amount, line_total_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -347,9 +394,73 @@ export class OrdersService {
   }
 
   /**
-   * If the daily report for this business date was already generated (sent,
-   * mid-send, failed, or skipped as empty), enqueue immediate order_update
-   * notifications so the order is not silent until tomorrow.
+   * Confirm and create the order. Prices are recomputed here (with the
+   * after-hours rule applied); if they drifted from the checkout snapshot the
+   * caller must show the new amounts and confirm again.
+   *
+   * The payment method comes from the customer's checkout choice; `payWithWallet`
+   * overrides it for callers that already know (tests, admin tooling). A wallet
+   * order is charged atomically inside the same transaction as the order row.
+   */
+  confirmOrder(
+    telegramId: number,
+    customerName?: string | null,
+    payWithWallet?: boolean,
+  ): ConfirmResult {
+    const result = this.placeOrder(telegramId, payWithWallet ?? false, customerName);
+    if (result.ok) return { ok: true, order: result.order };
+    if (result.reason === "price_changed") {
+      return { ok: false, reason: "price_changed", total: result.total, lines: result.lines };
+    }
+    if (result.reason === "empty") return { ok: false, reason: "empty" };
+    if (result.reason === "inactive_items") {
+      return { ok: false, reason: "inactive_items", error: result.error };
+    }
+    return { ok: false, reason: "error", error: result.error };
+  }
+
+  /**
+   * Edit delivery method / time on an order that is already placed but not
+   * yet confirmed by the café. Only the ordering customer can do this, and
+   * only while the order is still `pending`.
+   */
+  updateFulfillment(
+    orderId: number,
+    telegramId: number,
+    update: { method?: FulfillmentMethod; time?: string | null },
+  ): { ok: true; order: Order } | { ok: false; error: string } {
+    return tx(this.db, () => {
+      const order = this.loadOrderForCustomer(orderId, telegramId);
+      if (!order) return { ok: false as const, error: "سفارش یافت نشد" };
+      if (order.fulfillmentStatus !== "pending") {
+        return { ok: false as const, error: "این سفارش دیگر قابل ویرایش نیست" };
+      }
+      if (update.method === "delivery") {
+        const profile = this.customers.getProfile(telegramId);
+        if (!profile?.address) {
+          return { ok: false as const, error: "ابتدا آدرس خود را در پروفایل ثبت کنید" };
+        }
+      }
+      const method = update.method ?? order.fulfillmentMethod;
+      const time =
+        update.time !== undefined
+          ? update.time === null
+            ? null
+            : update.time.trim().slice(0, 100) || null
+          : order.deliveryTime;
+      this.db
+        .query("UPDATE orders SET fulfillment_method = ?, delivery_time = ? WHERE id = ?")
+        .run(method, time, orderId);
+      return { ok: true as const, order: this.loadOrder(orderId)! };
+    });
+  }
+
+  /**
+   * Enqueue immediate `order_update` notifications so the admin is not silent
+   * until tomorrow. Fired for card-to-card orders (they carry a receipt the
+   * admin must review right away) and for late orders after the daily report
+   * already ran. The refKey/recipient `ON CONFLICT DO NOTHING` dedupes the two
+   * paths when both apply.
    */
   private notifyLateOrderIfNeeded(order: Order): void {
     const run = this.db
@@ -361,7 +472,8 @@ export class OrdersService {
         run.status === "sent" ||
         run.status === "failed" ||
         run.status === "skipped_empty");
-    if (!reportAlreadyGenerated) return;
+    const needsReview = order.paymentMethod === "card_to_card" && !!order.receiptFileId;
+    if (!reportAlreadyGenerated && !needsReview) return;
 
     const recipients = this.reportRecipientIds();
     const payload = JSON.stringify({ type: "order_update", orderId: order.id });
@@ -425,6 +537,7 @@ export class OrdersService {
       deliveredAt: r.delivered_at ?? null,
       paymentReviewedBy: r.payment_reviewed_by ?? null,
       paymentReviewedAt: r.payment_reviewed_at ?? null,
+      rejectionReason: r.rejection_reason ?? null,
       createdAt: r.created_at,
       items,
     };
@@ -577,10 +690,15 @@ export class OrdersService {
     });
   }
 
-  /** Admin rejects a card-to-card receipt (wrong amount, unreadable, unpaid). */
-  markPaymentRejected(orderId: number, adminId: number):
+  /**
+   * Admin rejects a card-to-card receipt (wrong amount, unreadable, unpaid).
+   * `reason` is stored for the customer notice; the bot keyboard path always
+   * supplies one (it asks the admin first), the panel may omit it.
+   */
+  markPaymentRejected(orderId: number, adminId: number, reason: string | null):
     | { ok: true; order: Order; already: boolean }
     | { ok: false; error: string } {
+    const trimmed = (reason ?? "").trim().slice(0, 500) || null;
     return tx(this.db, () => {
       const current = this.loadOrder(orderId);
       if (!current) return { ok: false as const, error: "سفارش یافت نشد" };
@@ -592,10 +710,11 @@ export class OrdersService {
       }
       this.db
         .query(
-          `UPDATE orders SET payment_status = 'rejected', payment_reviewed_by = ?, payment_reviewed_at = ?
+          `UPDATE orders SET payment_status = 'rejected', payment_reviewed_by = ?, payment_reviewed_at = ?,
+           rejection_reason = ?
            WHERE id = ? AND payment_status != 'paid'`,
         )
-        .run(adminId, nowIso(), orderId);
+        .run(adminId, nowIso(), trimmed, orderId);
       return { ok: true as const, order: this.loadOrder(orderId)!, already: false };
     });
   }

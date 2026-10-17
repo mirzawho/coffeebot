@@ -87,9 +87,10 @@ async function main(): Promise<void> {
     persona: persona.text,
     customers,
     loyalty,
+    notifications,
     profileEdit: new TextCaptureFlow(),
     depositFlow: new TextCaptureFlow(),
-    fulfillmentTimeFlow: new TextCaptureFlow(),
+    rejectReasonFlow: new TextCaptureFlow(),
   };
 
   const bot = createBot(botApp);

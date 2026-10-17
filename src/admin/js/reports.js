@@ -109,7 +109,23 @@ const ReportsPage = (() => {
         return b;
       };
       actions.appendChild(mk("✅ تأیید پرداخت", `/api/admin/orders/${o.orderNumber}/payment/approve`, ""));
-      actions.appendChild(mk("❌ رد رسید", `/api/admin/orders/${o.orderNumber}/payment/reject`, "ghost"));
+      // Reject asks for a reason — it is shown to the customer next to the
+      // receipt image. Cancelling the prompt aborts the rejection.
+      const rejectBtn = el("button", { class: "btn ghost", type: "button", text: "❌ رد رسید" });
+      rejectBtn.addEventListener("click", async () => {
+        const reason = prompt("دلیل رد رسید (برای مشتری ارسال می‌شود):");
+        if (reason === null) return; // cancelled
+        rejectBtn.disabled = true;
+        try {
+          await Api.post(`/api/admin/orders/${o.orderNumber}/payment/reject`, reason.trim() ? { reason: reason.trim() } : {});
+          toast("انجام شد");
+          await onChanged();
+        } catch (err) {
+          toast(err.message || "انجام نشد", true);
+          rejectBtn.disabled = false;
+        }
+      });
+      actions.appendChild(rejectBtn);
       card.appendChild(actions);
     }
     return card;

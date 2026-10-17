@@ -4,27 +4,33 @@ import { pushHistory } from "../context";
 import {
   cardCopyKeyboard,
   cartKeyboard,
-  checkoutKeyboard,
   clearConfirmKeyboard,
-  fulfillmentKeyboard,
   mainMenu,
   offerKeyboard,
   paymentMethodKeyboard,
+  placedFulfillmentKeyboard,
+  receiptKeyboard,
 } from "../keyboards";
 import {
   AI_FALLBACK_TEXT,
   cartText,
-  confirmSummaryText,
-  DELIVERY_PROMPT_TEXT,
   HELP_TEXT,
   NO_ORDERS_TEXT,
+  ORDER_PLACED_LEAD_TEXT,
+  orderPlacedSummaryText,
   orderStatusText,
   PAYMENT_CHOICE_PROMPT_TEXT,
+  paymentRejectedCustomerText,
+  priceChangedText,
   productCardText,
+  quickFulfillmentTimeLabel,
+  RECEIPT_PLACED_LEAD_TEXT,
   RECEIPT_PROMPT_TEXT,
   RECEIPT_WRONG_STATE_TEXT,
   UNSUPPORTED_TEXT,
   WELCOME_TEXT,
+  walletPaymentSummaryText,
+  type QuickTimeChoice,
 } from "../format";
 import { MAX_AI_OFFERS, MAX_ITEM_QUANTITY, MAX_USER_MESSAGE_LENGTH } from "../../utils/ids";
 import { FALLBACK_REPLY, type AiResult } from "../../services/ollama";
@@ -33,7 +39,7 @@ import { handleProfileWizardText, startProfileWizard } from "../profile-wizard";
 import { validateReceipt } from "../receipt";
 import { isIdentityQuestion, buildIdentityReply } from "../identity";
 import { log } from "../../utils/logger";
-import { showHelp, showMainMenu, showCart, startCheckoutFlow, sendConfirmStage, sendFulfillmentChoice } from "./callbacks";
+import { finalizeOrder, showHelp, showMainMenu, showCart, startCheckoutFlow } from "./callbacks";
 import { withTypingIndicator } from "../typing";
 import { walletKeyboard } from "../keyboards";
 import { formatMoney } from "../../utils/money";
@@ -111,10 +117,10 @@ async function handleText(ctx: Context, app: BotApp, text: string): Promise<void
     const wasActive =
       app.profileEdit.isActive(userId) ||
       app.depositFlow.isActive(userId) ||
-      app.fulfillmentTimeFlow.isActive(userId);
+      app.rejectReasonFlow.isActive(userId);
     app.profileEdit.clear(userId);
     app.depositFlow.clear(userId);
-    app.fulfillmentTimeFlow.clear(userId);
+    app.rejectReasonFlow.clear(userId);
     if (wasActive) {
       await ctx.reply("عملیات لغو شد.", { reply_markup: mainMenu(app.cart.lineCount(userId)) });
       return;
@@ -124,9 +130,18 @@ async function handleText(ctx: Context, app: BotApp, text: string): Promise<void
     return;
   }
 
-  // Active text-capture flows take precedence (profile wizard, deposit amount,
-  // fulfillment time). The step is read before clearing so multi-field
-  // wizards know which question was last asked.
+  // Admin's rejection reason: captured before every other flow so an admin's
+  // text is never consumed by AI/checkout state while they're mid-review.
+  if (app.rejectReasonFlow.isActive(userId)) {
+    const orderId = Number(app.rejectReasonFlow.step(userId));
+    app.rejectReasonFlow.clear(userId);
+    await applyRejectReason(ctx, app, Number.isInteger(orderId) ? orderId : null, text);
+    return;
+  }
+
+  // Active text-capture flows take precedence (profile wizard, deposit amount).
+  // The step is read before clearing so multi-field wizards know which question
+  // was last asked.
   if (app.profileEdit.isActive(userId)) {
     const step = app.profileEdit.step(userId);
     app.profileEdit.clear(userId);
@@ -136,11 +151,6 @@ async function handleText(ctx: Context, app: BotApp, text: string): Promise<void
   if (app.depositFlow.isActive(userId)) {
     app.depositFlow.clear(userId);
     await applyDepositAmount(ctx, app, text);
-    return;
-  }
-  if (app.fulfillmentTimeFlow.isActive(userId)) {
-    app.fulfillmentTimeFlow.clear(userId);
-    await applyFulfillmentTime(ctx, app, text);
     return;
   }
 
@@ -166,27 +176,38 @@ async function handleText(ctx: Context, app: BotApp, text: string): Promise<void
   }
 
   if (cart.state === "checkout_receipt") {
-    await ctx.reply(RECEIPT_PROMPT_TEXT, { reply_markup: checkoutKeyboard(userId, "receipt", app.tokens) });
+    await ctx.reply(RECEIPT_PROMPT_TEXT, { reply_markup: receiptKeyboard() });
     return;
   }
 
-  if (cart.state === "checkout_fulfillment") {
-    await ctx.reply("برای انتخاب روش تحویل از دکمه‌ها استفاده کنید.", {
-      reply_markup: fulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+  if (cart.state === "checkout_fulfillment" || cart.state === "checkout_confirm") {
+    if (cart.paymentMethod === "wallet") {
+      // Wallet: the fulfillment keyboard carries the only way forward.
+      const { total, payment } = app.orders.getPaymentInstructions(userId);
+      await ctx.reply(
+        walletPaymentSummaryText(total, payment.currency, app.customers.getBalance(userId)),
+        {
+          reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+        },
+      );
+      return;
+    }
+    // Card with the receipt attached but placement interrupted — retry.
+    await finalizeOrder(ctx, app, {});
+    return;
+  }
+
+  if (cart.state === "checkout_placed") {
+    // A price change parked the placement — re-offer the retry, no AI.
+    const { total, payment } = app.orders.getPaymentInstructions(userId);
+    await ctx.reply(priceChangedText(total, payment.currency), {
+      reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
     });
     return;
   }
 
-  if (cart.state === "checkout_confirm") {
-    const notes = text.slice(0, 500);
-    const res = app.orders.setDeliveryNotes(userId, notes);
-    if (!res.ok) {
-      await ctx.reply(res.error);
-      return;
-    }
-    await sendConfirmStage(ctx, app);
-    return;
-  }
+  // Free-text edits for a recently placed order («فردا», «تحویل در کافه»).
+  if (await tryApplyPlacedOrderText(ctx, app, text)) return;
 
   // browsing: natural-language ordering via AI (optional — buttons always work).
   await handleNaturalLanguage(ctx, app, text.slice(0, MAX_USER_MESSAGE_LENGTH));
@@ -530,18 +551,22 @@ async function handleReceiptMedia(
   if (cart.state !== "checkout_receipt" && cart.state !== "checkout_payment") {
     // Outside checkout, product images etc. are not used — be explicit.
     if (cart.state === "browsing") {
+      const placed = app.orders.editableOrderFor(userId);
+      if (placed) {
+        // A re-sent screenshot after the order exists — point at the summary.
+        await ctx.reply(RECEIPT_WRONG_STATE_TEXT, {
+          reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+        });
+        return;
+      }
       await ctx.reply("برای ارسال رسید، ابتدا «پرداخت و ثبت سفارش» را از سبد خرید بزنید.", {
         reply_markup: mainMenu(app.cart.lineCount(userId)),
       });
       return;
     }
-    // Fulfillment/confirm stages: the receipt is already recorded — a re-sent
-    // or duplicate screenshot must not silently replace it.
+    // Wallet awaiting fulfillment, or a placement retry: the receipt is settled.
     await ctx.reply(RECEIPT_WRONG_STATE_TEXT, {
-      reply_markup:
-        cart.state === "checkout_fulfillment"
-          ? fulfillmentKeyboard(!!app.customers.getProfile(userId)?.address)
-          : checkoutKeyboard(userId, "confirm", app.tokens),
+      reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
     });
     return;
   }
@@ -557,13 +582,40 @@ async function handleReceiptMedia(
     return;
   }
 
-  const res = app.orders.attachReceipt(userId, validation.fileId, validation.messageId);
+  // The receipt places the order immediately (defaults: pickup, now) — the
+  // customer only confirms delivery details with the buttons below.
+  const name = ctx.from?.first_name
+    ? `${ctx.from.first_name}${ctx.from.last_name ? " " + ctx.from.last_name : ""}`
+    : null;
+  const res = app.orders.placeOrderAfterReceipt(userId, validation.fileId, validation.messageId, name);
   if (!res.ok) {
-    await ctx.reply(res.error);
+    if (res.reason === "price_changed") {
+      // The receipt is kept; the retry keyboard re-places at the new total.
+      const { total, payment } = app.orders.getPaymentInstructions(userId);
+      await ctx.reply(priceChangedText(total, payment.currency), {
+        reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+      });
+      return;
+    }
+    await ctx.reply(res.reason === "empty" ? "سبد خرید شما خالی است." : res.error, {
+      reply_markup: mainMenu(app.cart.lineCount(userId)),
+    });
     return;
   }
-  await ctx.reply("✅ رسید دریافت شد.");
-  await sendFulfillmentChoice(ctx, app);
+  if (ctx.from) {
+    app.customers.recordSender(userId, {
+      firstName: ctx.from.first_name,
+      lastName: ctx.from.last_name,
+      username: ctx.from.username,
+    });
+  }
+  await ctx.reply(
+    orderPlacedSummaryText(res.order, {
+      lead: RECEIPT_PLACED_LEAD_TEXT,
+      awaitingFulfillment: true,
+    }),
+    { reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address) },
+  );
 }
 
 /**
@@ -575,22 +627,70 @@ async function applyProfileEdit(ctx: Context, app: BotApp, text: string, step = 
   await handleProfileWizardText(ctx, app, text, step);
 }
 
+/** Parse a fulfillment method out of free text (conservative patterns). */
+function parseFulfillmentMethod(text: string): "delivery" | "pickup" | null {
+  if (/(ارسال|پیک|آدرس|ارسال به)/i.test(text)) return "delivery";
+  if (/(حضوری|خودم|کافه|تحویل)/i.test(text)) return "pickup";
+  return null;
+}
+
 /**
- * Capture the requested delivery/pickup time («ساعت ۵ عصر», «الان»).
- * «پیش‌فرض»/skip leaves it empty — the café prepares the order ASAP.
+ * Parse a fulfillment time out of free text. Returns a concrete label, `null`
+ * for an explicit reset, or `undefined` when the text is not a time at all.
  */
-async function applyFulfillmentTime(ctx: Context, app: BotApp, text: string): Promise<void> {
-  const userId = ctx.from!.id;
-  const cart = app.cart.get(userId);
-  if (!cart || cart.state !== "checkout_confirm") {
-    await ctx.reply("این مرحله دیگر معتبر نیست؛ دوباره از «پرداخت و ثبت سفارش» شروع کنید.", {
-      reply_markup: mainMenu(app.cart.lineCount(userId)),
-    });
-    return;
+function parseFulfillmentTime(
+  text: string,
+  now: Date,
+  timeZone: string,
+): string | null | undefined {
+  const t = text.trim();
+  if (/^(الان|همین الان|فوری|فورا|asap)$/i.test(t)) {
+    return quickFulfillmentTimeLabel("now", now, timeZone);
   }
-  const skip = /^(پیش‌فرض|پیشفرض|پیش فرض|الان نه|رد|نه|-|—|skip|default)$/i.test(text.trim());
-  app.cart.setFulfillmentTime(userId, skip ? null : text.trim());
-  await sendConfirmStage(ctx, app);
+  if (/^فردا/.test(t)) {
+    return quickFulfillmentTimeLabel("tomorrow", now, timeZone);
+  }
+  if (/^(۵|5)\s*دقیقه/.test(t)) {
+    return quickFulfillmentTimeLabel("5m", now, timeZone);
+  }
+  if (/^(۱۰|10)\s*دقیقه/.test(t)) {
+    return quickFulfillmentTimeLabel("10m", now, timeZone);
+  }
+  if (/^ساعت/.test(t)) {
+    return t.slice(0, 100);
+  }
+  if (/^(پیش‌فرض|پیشفرض|پیش فرض|default)$/i.test(t)) {
+    return null;
+  }
+  return undefined;
+}
+
+/**
+ * Free text about a recently placed order («فردا», «تحویل در کافه», «ساعت ۵
+ * عصر») edits it in place; anything unrecognized falls through to the AI.
+ * Returns true when the message was consumed as a fulfillment edit.
+ */
+async function tryApplyPlacedOrderText(ctx: Context, app: BotApp, text: string): Promise<boolean> {
+  const userId = ctx.from!.id;
+  const order = app.orders.editableOrderFor(userId);
+  if (!order) return false;
+  const method = parseFulfillmentMethod(text);
+  const time = parseFulfillmentTime(text, new Date(), app.config.timezone);
+  if (!method && time === undefined) return false;
+  const update: { method?: "delivery" | "pickup"; time?: string | null } = {};
+  if (method) update.method = method;
+  if (time !== undefined) update.time = time;
+  const r = app.orders.updateFulfillment(order.id, userId, update);
+  if (!r.ok) {
+    await ctx.reply(r.error, {
+      reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+    });
+    return true;
+  }
+  await ctx.reply(orderPlacedSummaryText(r.order, { lead: ORDER_PLACED_LEAD_TEXT }), {
+    reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+  });
+  return true;
 }
 
 /** Parse a deposit amount, create the pending request, show payment instructions. */
@@ -630,5 +730,55 @@ async function applyDepositAmount(ctx: Context, app: BotApp, text: string): Prom
         .row()
         .text("🏠 منوی اصلی", "m"),
     },
+  );
+}
+
+/**
+ * Admin typed the rejection reason for a card receipt (armed by the لغو
+ * button). Persists the rejection with the reason, then notifies the customer
+ * with BOTH the receipt image and the reason text in one photo message.
+ */
+async function applyRejectReason(
+  ctx: Context,
+  app: BotApp,
+  orderId: number | null,
+  text: string,
+): Promise<void> {
+  const adminId = ctx.from!.id;
+  if (!app.config.adminIds.has(adminId)) return; // flow is admin-only; belt & braces
+  const reason = text.trim().slice(0, 500);
+  if (!reason) {
+    // Re-arm so the admin can simply type the reason again.
+    if (orderId !== null) app.rejectReasonFlow.expect(adminId, String(orderId));
+    await ctx.reply("دلیل نمی‌تواند خالی باشد. دوباره بنویسید یا /cancel بزنید.");
+    return;
+  }
+  const order = orderId !== null ? app.orders.loadOrder(orderId) : null;
+  if (!order || order.paymentStatus === "paid" || order.paymentStatus === "rejected") {
+    await ctx.reply("این سفارش دیگر قابل بررسی نیست.");
+    return;
+  }
+  const r = app.orders.markPaymentRejected(orderId!, adminId, reason);
+  if (!r.ok) {
+    await ctx.reply(r.error);
+    return;
+  }
+  if (!r.already) {
+    // Persist-before-notify: markPaymentRejected already committed. Same refKey
+    // as the panel path, so a later panel reject is a no-op for the customer.
+    app.notifications.enqueue(
+      "customer_notice",
+      `payment_rejected_${r.order.orderNumber}`,
+      [r.order.customerTelegramId],
+      {
+        text: paymentRejectedCustomerText(r.order.orderNumber, reason),
+        ...(r.order.receiptFileId ? { photoFileId: r.order.receiptFileId } : {}),
+      },
+    );
+  }
+  await ctx.reply(
+    r.already
+      ? "این رسید قبلاً رد شده بود؛ دلیل جدیدی ثبت نشد."
+      : "رسید رد شد و دلیل به‌همراه تصویر رسید برای مشتری ارسال شد.",
   );
 }

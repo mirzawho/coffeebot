@@ -5,6 +5,7 @@ import type { NotificationService, NotificationRow } from "../services/notificat
 import type { ReportService } from "../services/reports";
 import type { OrdersService } from "../services/orders";
 import { buildOrderUpdateText } from "../services/reports";
+import { receiptReviewKeyboard } from "../bot/keyboards";
 import { log } from "../utils/logger";
 
 const TICK_MS = 30_000;
@@ -129,10 +130,19 @@ export class Scheduler {
     }
 
     if (n.kind === "customer_notice") {
-      // Direct customer message; payload carries the final text.
-      const notice = JSON.parse(n.payload) as { text?: string };
+      // Direct customer message; payload carries the final text and optionally
+      // a receipt photo (rejection notices send image + reason together).
+      const notice = JSON.parse(n.payload) as { text?: string; photoFileId?: string };
       if (!notice.text) throw new Error("customer_notice payload missing text");
-      await this.deps.bot.api.sendMessage(n.recipientId, notice.text);
+      if (notice.photoFileId) {
+        // One atomic sendPhoto: a retry after a partial failure can never
+        // double-send, and the reason rides as the caption (short by design).
+        await this.deps.bot.api.sendPhoto(n.recipientId, notice.photoFileId, {
+          caption: notice.text.slice(0, 1024),
+        });
+      } else {
+        await this.deps.bot.api.sendMessage(n.recipientId, notice.text);
+      }
       return;
     }
 
@@ -151,13 +161,20 @@ export class Scheduler {
       const { text, receiptFileId } = buildOrderUpdateText(order);
       await this.deps.bot.api.sendMessage(n.recipientId, text);
       if (receiptFileId) {
-        // Best effort: attach the receipt photo if the bot can re-send the file_id.
+        // The photo carries the review buttons (تأیید/لغو). If Telegram cannot
+        // re-send the file, fall back to a text message with the SAME keyboard
+        // so the admin still gets an actionable prompt.
+        const reviewKb = receiptReviewKeyboard(order.id);
         try {
           await this.deps.bot.api.sendPhoto(n.recipientId, receiptFileId, {
             caption: `رسید سفارش ${order.orderNumber} (تأییدنشده)`,
+            reply_markup: reviewKb,
           });
         } catch (photoErr) {
           log.warn("receipt forward failed", { err: String(photoErr) });
+          await this.deps.bot.api.sendMessage(n.recipientId, `🧾 رسید سفارش ${order.orderNumber}`, {
+            reply_markup: reviewKb,
+          });
         }
       }
       return;

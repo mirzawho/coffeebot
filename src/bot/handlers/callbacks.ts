@@ -5,28 +5,30 @@ import {
   cardCopyKeyboard,
   cartKeyboard,
   categoriesKeyboard,
-  checkoutKeyboard,
   clearConfirmKeyboard,
-  fulfillmentKeyboard,
   mainMenu,
   paymentMethodKeyboard,
+  placedFulfillmentKeyboard,
   productKeyboard,
   productsKeyboard,
 } from "../keyboards";
 import {
   cartText,
   checkoutStartText,
-  confirmSummaryText,
-  fulfillmentPromptText,
-  FULFILLMENT_TIME_PROMPT_TEXT,
   HELP_TEXT,
-  orderConfirmedText,
+  ORDER_PLACED_LEAD_TEXT,
+  orderPlacedSummaryText,
   orderSummaryText,
   paymentText,
+  priceChangedText,
   productDetailText,
+  quickFulfillmentTimeLabel,
+  RECEIPT_PLACED_LEAD_TEXT,
+  REJECT_REASON_PROMPT_TEXT,
   STALE_TEXT,
   walletPaymentSummaryText,
   WELCOME_TEXT,
+  type QuickTimeChoice,
 } from "../format";
 import { formatMoney, formatAmount } from "../../utils/money";
 import { toPersianDigits } from "../../utils/dates";
@@ -35,6 +37,7 @@ import { log } from "../../utils/logger";
 import { cardToCardAvailable } from "../../services/settings";
 import { walletKeyboard, ratingKeyboard } from "../keyboards";
 import { NO_ORDERS_TEXT, customerOrderDetailText, FULFILLMENT_LABELS } from "../format";
+import type { Order } from "../../services/orders";
 import {
   profileWizardCancel,
   profileWizardConfirm,
@@ -166,12 +169,27 @@ export async function startCheckoutFlow(ctx: Context, app: BotApp): Promise<void
       await sendCardPaymentStage(ctx, app, true);
       return;
     }
-    if (cart.state === "checkout_fulfillment") {
-      await sendFulfillmentChoice(ctx, app);
+    if (cart.state === "checkout_fulfillment" || cart.state === "checkout_confirm") {
+      if (cart.paymentMethod === "wallet") {
+        // Wallet: the order is charged on the delivery/time press.
+        const { total, payment } = app.orders.getPaymentInstructions(userId);
+        await ctx.reply(
+          walletPaymentSummaryText(total, payment.currency, app.customers.getBalance(userId)),
+          {
+            reply_markup: placedFulfillmentKeyboard(
+              !!app.customers.getProfile(userId)?.address,
+            ),
+          },
+        );
+        return;
+      }
+      // Card with the receipt attached but placement interrupted — retry.
+      await finalizeOrder(ctx, app, {});
       return;
     }
-    if (cart.state === "checkout_confirm") {
-      await sendConfirmStage(ctx, app);
+    if (cart.state === "checkout_placed") {
+      // A price change interrupted the placement — retry at the new total.
+      await finalizeOrder(ctx, app, {});
       return;
     }
   }
@@ -230,31 +248,99 @@ async function sendCardPaymentStage(ctx: Context, app: BotApp, withSummary: bool
   await ctx.reply(text, { reply_markup: copyKb });
 }
 
-export async function sendConfirmStage(ctx: Context, app: BotApp): Promise<void> {
-  const userId = ctx.from!.id;
-  const cart = app.cart.get(userId);
-  // After-hours-aware totals — what confirmOrder will actually charge.
-  const { total, lines, payment } = app.orders.getPaymentInstructions(userId);
-  const currency = payment.currency;
-  const balance = app.customers.getBalance(userId);
-  const summary = confirmSummaryText(lines, total, currency, cart?.deliveryNotes ?? null, {
-    method: cart?.fulfillmentMethod ?? null,
-    time: cart?.fulfillmentTime ?? null,
-  });
-  const walletLine = balance > 0 ? `\n\n💰 موجودی کیف پول: ${formatMoney(balance, currency)}` : "";
-  await ctx.reply(summary + walletLine, {
-    reply_markup: checkoutKeyboard(userId, "confirm", app.tokens),
-  });
+/** Edit the pressed message in place; fall back to a fresh reply. */
+async function sendOrEditPlaced(
+  ctx: Context,
+  text: string,
+  kb: InlineKeyboard,
+  edit: boolean,
+): Promise<void> {
+  if (edit) {
+    try {
+      await ctx.editMessageText(text, { reply_markup: kb });
+      return;
+    } catch (err) {
+      // Same button pressed twice — the text did not change.
+      if (String(err).includes("message is not modified")) return;
+      /* otherwise fall through to a fresh message */
+    }
+  }
+  await ctx.reply(text, { reply_markup: kb });
 }
 
-/** Delivery-vs-pickup question, shown after payment/receipt. */
-export async function sendFulfillmentChoice(ctx: Context, app: BotApp): Promise<void> {
+/**
+ * Place the order now (card: after the receipt / on a fulfillment press;
+ * wallet: on the delivery/time press) and show the placed summary. `edit`
+ * rewrites the message the customer just pressed instead of stacking replies.
+ */
+export async function finalizeOrder(
+  ctx: Context,
+  app: BotApp,
+  opts: { payWithWallet?: boolean; edit?: boolean },
+): Promise<void> {
   const userId = ctx.from!.id;
-  const profile = app.customers.getProfile(userId);
-  const hasAddress = !!profile?.address;
-  await ctx.reply(fulfillmentPromptText(hasAddress, profile?.address ?? null), {
-    reply_markup: fulfillmentKeyboard(hasAddress),
+  const name = ctx.from?.first_name
+    ? `${ctx.from.first_name}${ctx.from.last_name ? " " + ctx.from.last_name : ""}`
+    : null;
+  const result = app.orders.confirmOrder(userId, name, opts.payWithWallet);
+  if (!result.ok) {
+    if (result.reason === "price_changed") {
+      const currency = app.orders.getPaymentInstructions(userId).payment.currency;
+      await sendOrEditPlaced(
+        ctx,
+        priceChangedText(result.total, currency),
+        placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+        opts.edit === true,
+      );
+      return;
+    }
+    await ctx.reply(result.reason === "empty" ? "سبد خرید شما خالی است." : result.error, {
+      reply_markup: mainMenu(app.cart.lineCount(userId)),
+    });
+    return;
+  }
+  // Record the customer's Telegram identity so the admin panel can show a
+  // name/username and link to their chat.
+  if (ctx.from) {
+    app.customers.recordSender(userId, {
+      firstName: ctx.from.first_name,
+      lastName: ctx.from.last_name,
+      username: ctx.from.username,
+    });
+  }
+  const isWallet = result.order.paymentMethod === "wallet";
+  const text = orderPlacedSummaryText(result.order, {
+    lead: isWallet ? ORDER_PLACED_LEAD_TEXT : RECEIPT_PLACED_LEAD_TEXT,
+    walletRemaining: isWallet ? app.customers.getBalance(userId) : undefined,
   });
+  await sendOrEditPlaced(
+    ctx,
+    text,
+    placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+    opts.edit === true,
+  );
+}
+
+/** Re-render the placed-order summary after a fulfillment edit. */
+async function editPlacedMessage(ctx: Context, app: BotApp, order: Order): Promise<void> {
+  const userId = ctx.from!.id;
+  await sendOrEditPlaced(
+    ctx,
+    orderPlacedSummaryText(order, { lead: ORDER_PLACED_LEAD_TEXT }),
+    placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+    true,
+  );
+}
+
+/** The cart can still place an order (receipt attached or wallet awaiting). */
+function canPlaceFromCart(app: BotApp, userId: number): boolean {
+  const cart = app.cart.get(userId);
+  return (
+    !!cart &&
+    (cart.state === "checkout_fulfillment" ||
+      cart.state === "checkout_confirm" ||
+      cart.state === "checkout_placed")
+  );
 }
 
 /** Register all callback-query handlers. */
@@ -465,9 +551,11 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
       return;
     }
     if (method === "wallet") {
-      // Wallet is charged at final confirm; first ask how the order is received.
-      await ctx.reply(walletPaymentSummaryText(res.total, app.orders.getPaymentInstructions(userId).payment.currency, res.balance));
-      await sendFulfillmentChoice(ctx, app);
+      // Wallet is charged when the customer picks delivery/time below.
+      const { payment } = app.orders.getPaymentInstructions(userId);
+      await ctx.reply(walletPaymentSummaryText(res.total, payment.currency, res.balance), {
+        reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+      });
       return;
     }
     await sendCardPaymentStage(ctx, app, false);
@@ -475,11 +563,12 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
   }
 
   if (data === "fm:d" || data === "fm:p") {
-    // Fulfillment choice: delivery (needs a saved address) or pickup. The
-    // server revalidates the state; delivery without an address is refused.
+    // Delivery vs pickup on the fulfillment keyboard. Before the order exists
+    // this places it; afterwards it edits the placed order in place.
     const method = data === "fm:d" ? "delivery" : "pickup";
-    const cart = app.cart.get(userId);
-    if (!cart || cart.state !== "checkout_fulfillment") {
+    const placing = canPlaceFromCart(app, userId);
+    const placed = placing ? null : app.orders.editableOrderFor(userId);
+    if (!placing && !placed) {
       await ctx.answerCallbackQuery({ text: STALE_TEXT, show_alert: true });
       return;
     }
@@ -493,66 +582,104 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
         return;
       }
     }
-    app.cart.setFulfillmentMethod(userId, method);
-    app.fulfillmentTimeFlow.expect(userId, "time");
-    await ctx.reply(FULFILLMENT_TIME_PROMPT_TEXT);
+    if (placing) {
+      app.cart.setFulfillmentMethod(userId, method);
+      const cart = app.cart.get(userId);
+      await finalizeOrder(ctx, app, {
+        payWithWallet: cart?.paymentMethod === "wallet",
+        edit: true,
+      });
+      return;
+    }
+    const updated = app.orders.updateFulfillment(placed!.id, userId, { method });
+    if (!updated.ok) {
+      await ctx.answerCallbackQuery({ text: updated.error, show_alert: true });
+      return;
+    }
+    await editPlacedMessage(ctx, app, updated.order);
     return;
   }
 
-  if (data === "skip") {
-    const cart = app.cart.get(userId);
-    if (!cart || cart.state !== "checkout_confirm") {
+  if (data.startsWith("ft:")) {
+    // Quick-pick fulfillment time: places the order (wallet) or edits the
+    // placed one, same as the delivery buttons.
+    const choice = data.slice(3) as QuickTimeChoice;
+    const placing = canPlaceFromCart(app, userId);
+    const placed = placing ? null : app.orders.editableOrderFor(userId);
+    if ((!placing && !placed) || !["now", "5m", "10m", "1h", "tomorrow"].includes(choice)) {
       await ctx.answerCallbackQuery({ text: STALE_TEXT, show_alert: true });
       return;
     }
-    app.orders.setDeliveryNotes(userId, null);
-    await sendConfirmStage(ctx, app);
+    const label = quickFulfillmentTimeLabel(choice, new Date(), app.config.timezone);
+    if (placing) {
+      app.cart.setFulfillmentTime(userId, label);
+      const cart = app.cart.get(userId);
+      await finalizeOrder(ctx, app, {
+        payWithWallet: cart?.paymentMethod === "wallet",
+        edit: true,
+      });
+      return;
+    }
+    const updated = app.orders.updateFulfillment(placed!.id, userId, { time: label });
+    if (!updated.ok) {
+      await ctx.answerCallbackQuery({ text: updated.error, show_alert: true });
+      return;
+    }
+    await editPlacedMessage(ctx, app, updated.order);
     return;
   }
 
-  if (data.startsWith("cf:")) {
-    const tok = data.slice(3);
-    if (!app.tokens.consume(userId, tok, "cf")) {
-      await ctx.answerCallbackQuery({ text: "سفارش قبلاً ثبت شد", show_alert: true });
+  // ---- admin: card-receipt review (buttons on the forwarded receipt) ----
+
+  if (data.startsWith("oa:yes:") || data.startsWith("oa:no:")) {
+    const approve = data.startsWith("oa:yes:");
+    const orderId = Number(data.slice(approve ? 7 : 6));
+    if (!app.config.adminIds.has(userId)) {
+      await ctx.answerCallbackQuery({ text: "دسترسی غیرمجاز", show_alert: true });
       return;
     }
-    const cart = app.cart.get(userId);
-    if (!cart || cart.state !== "checkout_confirm") {
+    if (!Number.isInteger(orderId)) {
       await ctx.answerCallbackQuery({ text: STALE_TEXT, show_alert: true });
       return;
     }
-    const name = ctx.from?.first_name ? `${ctx.from.first_name}${ctx.from.last_name ? " " + ctx.from.last_name : ""}` : null;
-    // The payment method comes from the cart (chosen at the payment stage).
-    const result = app.orders.confirmOrder(userId, name);
-    if (!result.ok) {
-      if (result.reason === "price_changed") {
-        await ctx.reply(
-          `⚠️ قیمت برخی اقلام تغییر کرده است.\nمبلغ جدید: ${formatMoney(result.total, app.orders.getPaymentInstructions(userId).payment.currency)}\n\nلطفاً دوباره تأیید کنید.`,
-          { reply_markup: checkoutKeyboard(userId, "confirm", app.tokens) },
-        );
+    const order = app.orders.loadOrder(orderId);
+    if (!order || order.paymentMethod !== "card_to_card" || !order.receiptFileId) {
+      await ctx.answerCallbackQuery({ text: STALE_TEXT, show_alert: true });
+      return;
+    }
+    if (approve) {
+      const r = app.orders.markPaymentPaid(orderId, userId);
+      if (!r.ok) {
+        await ctx.answerCallbackQuery({ text: r.error, show_alert: true });
         return;
       }
-      await ctx.reply(result.reason === "empty" ? "سبد خرید شما خالی است." : result.error, {
-        reply_markup: mainMenu(app.cart.lineCount(userId)),
-      });
+      if (!r.already) {
+        // Same refKey/text as the panel path — a later panel press is a no-op.
+        app.notifications.enqueue(
+          "customer_notice",
+          `payment_approved_${r.order.orderNumber}`,
+          [r.order.customerTelegramId],
+          { text: `✅ پرداخت سفارش ${r.order.orderNumber} تأیید شد.` },
+        );
+      }
+      await ctx.answerCallbackQuery({ text: r.already ? "این رسید قبلاً بررسی شده است" : "پرداخت تأیید شد ✓" });
+      // Strip the buttons so the resolved message cannot be re-pressed.
+      await ctx.editMessageReplyMarkup().catch(() => {});
       return;
     }
-    // Record the customer's Telegram identity so the admin panel can show a
-    // name/username and link to their chat.
-    if (ctx.from) {
-      app.customers.recordSender(userId, {
-        firstName: ctx.from.first_name,
-        lastName: ctx.from.last_name,
-        username: ctx.from.username,
-      });
+    // Reject: the reason is captured from the admin's next text message, then
+    // the rejection + customer notice happen together (messages.ts).
+    if (order.paymentStatus === "rejected") {
+      await ctx.answerCallbackQuery({ text: "این رسید قبلاً رد شده است", show_alert: true });
+      return;
     }
-    const balance = app.customers.getBalance(userId);
-    const currency = app.orders.getPaymentInstructions(userId).payment.currency;
-    const walletLine =
-      result.order.paymentMethod === "wallet"
-        ? `\n\n💰 پرداخت از کیف پول انجام شد.\nموجودی باقی‌مانده: ${formatMoney(balance, currency)}`
-        : "";
-    await ctx.reply(orderConfirmedText(result.order) + walletLine, { reply_markup: mainMenu() });
+    if (order.paymentStatus === "paid") {
+      await ctx.answerCallbackQuery({ text: "پرداخت این سفارش قبلاً تأیید شده است", show_alert: true });
+      return;
+    }
+    app.rejectReasonFlow.expect(userId, String(orderId));
+    await ctx.answerCallbackQuery({ text: "دلیل رد را تایپ کنید" });
+    await ctx.reply(REJECT_REASON_PROMPT_TEXT);
     return;
   }
 

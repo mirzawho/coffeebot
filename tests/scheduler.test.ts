@@ -94,6 +94,7 @@ describe("scheduler report delivery", () => {
           sent.push({ chatId, text });
           return {};
         },
+        sendPhoto: async () => ({}),
       },
     } as any;
 
@@ -102,9 +103,10 @@ describe("scheduler report delivery", () => {
     reports.trySend(order.businessDate);
     await scheduler.tick();
 
-    // The tick also catches up past dates, so scope to this report's content.
+    // The tick also catches up past dates, and card orders carry their own
+    // order_update notice — scope to the recipients, not the message count.
     const forThisReport = sent.filter((s) => s.text.includes(order.orderNumber));
-    expect(forThisReport.map((s) => s.chatId).sort()).toEqual([111, 222]);
+    expect([...new Set(forThisReport.map((s) => s.chatId))].sort()).toEqual([111, 222]);
     expect(notif.allReportDelivered(order.businessDate)).toBe(true);
   });
 
@@ -131,5 +133,92 @@ describe("scheduler report delivery", () => {
       expect(r.attempts).toBeGreaterThanOrEqual(1);
     }
     expect(notif.allReportDelivered(order.businessDate)).toBe(false);
+  });
+});
+
+describe("receipt review forwarding", () => {
+  test("order_update forwards the receipt photo with تأیید/لغو buttons", async () => {
+    const order = placeOrder(1, "Ali");
+    const photos: { chatId: number; fileId: string; kb: any }[] = [];
+    const bot = {
+      api: {
+        sendMessage: async () => ({}),
+        sendPhoto: async (chatId: number, fileId: string, opts: any) => {
+          photos.push({ chatId, fileId, kb: opts?.reply_markup });
+          return {};
+        },
+      },
+    } as any;
+    const scheduler = new Scheduler({ db, bot, reports, notifications: notif, businessHours: bh, orders });
+    await scheduler.tick();
+
+    expect(photos.length).toBe(2); // both report recipients
+    expect(photos[0]!.fileId).toBe("file-1");
+    const cbs = photos[0]!.kb.inline_keyboard.flat().map((b: any) => b.callback_data);
+    expect(cbs).toEqual([`oa:yes:${order.id}`, `oa:no:${order.id}`]);
+  });
+
+  test("a failed receipt photo falls back to a text message with the same buttons", async () => {
+    const order = placeOrder(1, "Ali");
+    const msgs: { text: string; kb: any }[] = [];
+    const bot = {
+      api: {
+        sendMessage: async (_chat: number, text: string, opts?: any) => {
+          msgs.push({ text, kb: opts?.reply_markup });
+          return {};
+        },
+        sendPhoto: async () => {
+          throw new Error("telegram: failed to get file");
+        },
+      },
+    } as any;
+    const scheduler = new Scheduler({ db, bot, reports, notifications: notif, businessHours: bh, orders });
+    await scheduler.tick();
+
+    const fallback = msgs.find((m) => m.kb?.inline_keyboard);
+    expect(fallback).toBeDefined();
+    const cbs = fallback!.kb.inline_keyboard.flat().map((b: any) => b.callback_data);
+    expect(cbs).toEqual([`oa:yes:${order.id}`, `oa:no:${order.id}`]);
+  });
+
+  test("customer_notice with a photo is one sendPhoto (reason rides as the caption)", async () => {
+    const photos: { chatId: number; caption: string }[] = [];
+    const bot = {
+      api: {
+        sendMessage: async () => ({}),
+        sendPhoto: async (chatId: number, _file: string, opts: any) => {
+          photos.push({ chatId, caption: opts?.caption });
+          return {};
+        },
+      },
+    } as any;
+    notif.enqueue("customer_notice", "payment_rejected_CN-1", [555], {
+      text: "⚠️ رسید تأیید نشد.\n\nدلیل: مبلغ کم است",
+      photoFileId: "receipt-abc",
+    });
+    const scheduler = new Scheduler({ db, bot, reports, notifications: notif, businessHours: bh, orders });
+    await scheduler.tick();
+
+    expect(photos).toEqual([{ chatId: 555, caption: "⚠️ رسید تأیید نشد.\n\nدلیل: مبلغ کم است" }]);
+  });
+
+  test("customer_notice without a photo still uses sendMessage", async () => {
+    const texts: { chatId: number; text: string }[] = [];
+    const bot = {
+      api: {
+        sendMessage: async (chatId: number, text: string) => {
+          texts.push({ chatId, text });
+          return {};
+        },
+        sendPhoto: async () => ({}),
+      },
+    } as any;
+    notif.enqueue("customer_notice", "payment_approved_CN-2", [555], {
+      text: "✅ پرداخت تأیید شد.",
+    });
+    const scheduler = new Scheduler({ db, bot, reports, notifications: notif, businessHours: bh, orders });
+    await scheduler.tick();
+
+    expect(texts.some((t) => t.chatId === 555 && t.text === "✅ پرداخت تأیید شد.")).toBe(true);
   });
 });

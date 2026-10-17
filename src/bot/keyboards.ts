@@ -20,8 +20,9 @@ import { toPersianDigits } from "../utils/dates";
  *  clry:<tok>   confirmed clear
  *  co           start checkout ("پرداخت و ثبت سفارش" — from the cart view)
  *  pm:w / pm:c  choose wallet / card-to-card payment
- *  skip         skip delivery notes
- *  cf:<tok>     final confirm
+ *  fm:d / fm:p  delivery / pickup on the placed order
+ *  ft:<quick>   quick-pick fulfillment time (now|5m|10m|tomorrow)
+ *  oa:yes:<orderId> / oa:no:<orderId>   admin: approve / reject a card receipt
  *  cx           cancel checkout
  *  hlp          help
  */
@@ -155,20 +156,38 @@ export function clearConfirmKeyboard(telegramId: number, tokens: TokenService): 
   return new InlineKeyboard().text("بله، خالی شود", `clry:${tok}`).text("انصراف", "cart");
 }
 
-export function checkoutKeyboard(
-  telegramId: number,
-  stage: "receipt" | "confirm",
-  tokens: TokenService,
-): InlineKeyboard {
-  if (stage === "receipt") {
-    return new InlineKeyboard().text("🛒 سبد خرید", "cart").text("❌ انصراف از خرید", "cx");
-  }
-  const tok = tokens.mint(telegramId, "cf");
+/** Receipt-stage keyboard: back to the cart, or cancel the purchase. */
+export function receiptKeyboard(): InlineKeyboard {
+  return new InlineKeyboard().text("🛒 سبد خرید", "cart").text("❌ انصراف از خرید", "cx");
+}
+
+/**
+ * Fulfillment + quick-time picker shown with the placed order (and on the
+ * wallet summary). Defaults are already applied (pickup, now) — a press
+ * updates the order in place. The delivery button needs a saved address.
+ */
+export function placedFulfillmentKeyboard(hasAddress: boolean): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  if (hasAddress) kb.text("🛵 ارسال به ما", "fm:d");
+  kb.text("🏪 تحویل در کافه", "fm:p");
+  kb.row()
+    .text("⚡ الان", "ft:now")
+    .text("📅 فردا", "ft:tomorrow");
+  kb.row()
+    .text("🕐 ۵ دقیقه بعد", "ft:5m")
+    .text("🕐 ۱۰ دقیقه بعد", "ft:10m");
+  return kb;
+}
+
+/**
+ * Attached to the receipt photo forwarded to the admin. تأیید marks the order
+ * paid immediately; لغو asks the admin for a rejection reason first (captured
+ * by the reject-reason text flow).
+ */
+export function receiptReviewKeyboard(orderId: number): InlineKeyboard {
   return new InlineKeyboard()
-    .text("✅ تأیید و ثبت نهایی", `cf:${tok}`)
-    .row()
-    .text("🛒 سبد خرید", "cart")
-    .text("❌ انصراف", "cx");
+    .text("✅ تأیید", `oa:yes:${orderId}`)
+    .text("❌ لغو", `oa:no:${orderId}`);
 }
 
 /**
@@ -206,10 +225,6 @@ export function cardCopyKeyboard(amount: number | null, cardNumber: string | nul
   return kb;
 }
 
-export function deliveryKeyboard(): InlineKeyboard {
-  return new InlineKeyboard().text("⏭ بدون یادداشت", "skip").text("🛒 سبد خرید", "cart");
-}
-
 /**
  * Profile-wizard controls. «بعدی» keeps the saved value for the current field
  * (only offered when one exists); «تأیید» saves what has been collected so far.
@@ -219,19 +234,6 @@ export function profileWizardKeyboard(step: "name" | "phone" | "address", canSki
   if (canSkip) kb.text("⏭ بعدی", "pf:skip");
   if (step === "address") kb.text("✅ تأیید و ذخیره", "pf:ok");
   kb.row().text("❌ لغو", "pf:cancel");
-  return kb;
-}
-
-/**
- * Fulfillment picker after payment: delivery (if the customer has an address)
- * or pickup. The delivery button is only rendered when an address exists —
- * the server revalidates on press anyway.
- */
-export function fulfillmentKeyboard(hasAddress: boolean): InlineKeyboard {
-  const kb = new InlineKeyboard();
-  if (hasAddress) kb.text("🛵 ارسال به آدرس من", "fm:d").row();
-  kb.text("🏪 خودم می‌آم تحویل بگیرم", "fm:p").row();
-  kb.text("❌ انصراف", "cx");
   return kb;
 }
 
