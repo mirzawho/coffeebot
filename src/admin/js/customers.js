@@ -8,10 +8,25 @@ const CustomersPage = (() => {
   let currency = "تومان";
   let rows = [];
   let query = "";
+  let membershipFilter = ""; // "" | "member" | "not_member" | "unknown" | "none"
   let listBox = null;
 
   function setData(cur) {
     currency = cur || "تومان";
+  }
+
+  // ---------- membership helpers ----------
+
+  const MEMBERSHIP_BADGE = {
+    member: { cls: "badge", text: "عضو کانال" },
+    not_member: { cls: "badge off", text: "عضو نیست" },
+    unknown: { cls: "badge warn", text: "بررسی ناموفق" },
+  };
+
+  function membershipBadge(m) {
+    if (!m) return null;
+    const b = MEMBERSHIP_BADGE[m.status] || { cls: "badge", text: m.statusLabel || "—" };
+    return el("span", { class: b.cls, text: b.text });
   }
 
   // ---------- list ----------
@@ -34,7 +49,9 @@ const CustomersPage = (() => {
       el(
         "div",
         { class: "row-main" },
-        el("div", { class: "row-title", text: name }),
+        el("div", { class: "row-title" },
+          name,
+          c.membership ? el("span", { style: "margin-inline-start:6px" }, membershipBadge(c.membership)) : null),
         el("div", { class: "row-sub", text: sub }),
       ),
       el(
@@ -45,6 +62,14 @@ const CustomersPage = (() => {
       ),
     );
   }
+
+  const MEMBERSHIP_FILTERS = [
+    { value: "", label: "همه" },
+    { value: "member", label: "عضو" },
+    { value: "not_member", label: "غیرعضو" },
+    { value: "unknown", label: "نامشخص" },
+    { value: "none", label: "بررسی‌نشده" },
+  ];
 
   function render(container) {
     container.innerHTML = "";
@@ -65,7 +90,18 @@ const CustomersPage = (() => {
       el("span", { class: "search-icon", html: icons.search }),
       search,
     );
-    container.appendChild(el("div", { class: "card filter-bar" }, searchWrap));
+    const filterSeg = Ui.segmented(
+      MEMBERSHIP_FILTERS.map((f) => ({ value: f.value, label: f.label })),
+      membershipFilter,
+    );
+    filterSeg.root.querySelectorAll("button").forEach((b, i) => {
+      b.addEventListener("click", () => {
+        membershipFilter = MEMBERSHIP_FILTERS[i].value;
+        void loadList();
+      });
+    });
+    container.appendChild(el("div", { class: "card filter-bar" }, searchWrap,
+      el("div", { style: "margin-top:8px" }, filterSeg.root)));
 
     listBox = el("div", { style: "margin-top:12px" });
     container.appendChild(listBox);
@@ -81,7 +117,10 @@ const CustomersPage = (() => {
     box.innerHTML = "";
     box.appendChild(loadingState());
     try {
-      const qs = query ? `?q=${encodeURIComponent(query)}` : "";
+      const params = new URLSearchParams();
+      if (query) params.set("q", query);
+      if (membershipFilter) params.set("membership", membershipFilter);
+      const qs = params.toString() ? `?${params.toString()}` : "";
       const res = await Api.get(`/api/admin/customers${qs}`);
       if (token !== loadToken) return;
       rows = res;
@@ -127,10 +166,20 @@ const CustomersPage = (() => {
     );
   }
 
-  function orderRow(o) {
+  function orderRow(o, customerId) {
     return el(
-      "div",
-      { class: "row" },
+      "button",
+      {
+        class: "row tappable order-row",
+        type: "button",
+        // The shared detail sheet reads the order fresh by number (so it is
+        // guaranteed to belong to the list it came from). On close the
+        // profile re-opens on the orders tab with refreshed data.
+        onClick: () =>
+          OrderDetail.open(o.orderNumber, {
+            onClose: () => openDetail(customerId, "orders"),
+          }),
+      },
       el(
         "div",
         { class: "row-main" },
@@ -138,7 +187,12 @@ const CustomersPage = (() => {
           el("span", { class: "badge", text: o.fulfillmentLabel, style: "margin-inline-start:6px" })),
         el("div", { class: "row-sub", text: `${o.jalaliDate} · ${o.paymentMethodLabel} · ${o.paymentLabel}` }),
       ),
-      el("span", { class: "row-end order-total", text: moneyWithCurrency(o.totalAmount, o.currency) }),
+      el(
+        "span",
+        { class: "row-end" },
+        el("span", { class: "order-total", text: moneyWithCurrency(o.totalAmount, o.currency) }),
+        el("span", { class: "chev", html: icons.chevron }),
+      ),
     );
   }
 
@@ -297,7 +351,7 @@ const CustomersPage = (() => {
 
   // ---------- detail ----------
 
-  async function openDetail(id) {
+  async function openDetail(id, initialTab) {
     const box = el("div", {}, loadingState());
     openSheet("پروفایل مشتری", box);
     let d;
@@ -348,6 +402,8 @@ const CustomersPage = (() => {
           infoRow("آدرس", d.profile?.address || "ثبت نشده", false),
         ),
       );
+      // Channel membership (cached last verification + manual recheck).
+      wrap.appendChild(membershipCard(d, id));
       wrap.appendChild(
         el(
           "div",
@@ -368,7 +424,7 @@ const CustomersPage = (() => {
     };
 
     const ordersPanel = () =>
-      section("", d.orders.map(orderRow), "هنوز سفارشی ثبت نکرده است.");
+      section("", d.orders.map((o) => orderRow(o, id)), "هنوز سفارشی ثبت نکرده است.");
 
     const txPanel = () =>
       section("", d.transactions.map(txRow), "تراکنشی ثبت نشده است.");
@@ -402,7 +458,7 @@ const CustomersPage = (() => {
           { key: "tx", label: "تراکنش‌ها", icon: icons.chart, build: txPanel },
           { key: "wallet", label: "کیف پول", icon: icons.wallet, build: walletPanel },
         ],
-        "profile",
+        initialTab || "profile",
       ),
     );
   }
@@ -418,6 +474,58 @@ const CustomersPage = (() => {
         style: "font-weight:600;color:var(--text)",
       }, isolateLtr ? el("span", { class: "ltr", text: value }) : value),
     );
+  }
+
+  /** Channel-membership card: cached status, last check time, manual recheck. */
+  function membershipCard(d, customerId) {
+    const m = d.membership || {};
+    const statusValue = m.status
+      ? el("span", {}, membershipBadge({ status: m.status, statusLabel: m.statusLabel }))
+      : el("span", { style: "font-weight:600;color:var(--text)", text: "هنوز بررسی نشده" });
+    const statusRow = el(
+      "div",
+      { class: "row", style: "padding:10px 0" },
+      el("div", { class: "row-main" }, el("div", { class: "row-sub", text: "وضعیت" })),
+      el("span", { class: "row-end" }, statusValue),
+    );
+    const checkBtn = el("button", {
+      class: "btn small",
+      type: "button",
+      style: "margin-top:10px;width:auto",
+      text: "بررسی مجدد",
+      disabled: !m.configuredChannel,
+      onClick: () => void runMembershipCheck(customerId, d),
+    });
+    return el(
+      "div",
+      { class: "card", style: "padding:10px 14px;margin-bottom:14px" },
+      el("div", { class: "section-label", style: "margin:0 0 4px", text: "عضویت کانال" }),
+      statusRow,
+      infoRow("کانال", m.configuredChannel || "تنظیم نشده", true),
+      m.channel && m.channel !== m.configuredChannel
+        ? infoRow("کانالِ بررسی‌شده", m.channel, true)
+        : null,
+      infoRow("آخرین بررسی", m.checkedAt || "—", false),
+      m.enforcementEnabled
+        ? el("div", { class: "field-hint", style: "margin:4px 0 0", text: "الزام عضویت فعال است؛ مشتریان غیرعضو نمی‌توانند از ربات استفاده کنند." })
+        : el("div", { class: "field-hint", style: "margin:4px 0 0", text: "الزام عضویت غیرفعال است (فقط نمایش وضعیت)." }),
+      !m.configuredChannel
+        ? el("div", { class: "field-hint", style: "margin:4px 0 0", text: "برای بررسی، ابتدا کانال را در تنظیمات عضویت کانال پیکربندی کنید." })
+        : null,
+      checkBtn,
+    );
+  }
+
+  async function runMembershipCheck(customerId, current) {
+    try {
+      const r = await Api.post(`/api/admin/customers/${customerId}/membership-check`, {});
+      const label = r.statusLabel || r.status;
+      toast(`وضعیت عضویت: ${label}`);
+      // Refresh the detail sheet with the fresh result.
+      void openDetail(customerId);
+    } catch (err) {
+      toast(err.message || "بررسی عضویت انجام نشد", true);
+    }
   }
 
   // ---------- public ----------

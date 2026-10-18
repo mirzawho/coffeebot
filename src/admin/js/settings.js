@@ -16,6 +16,7 @@ const SettingsPage = (() => {
   let admins = []; // [{ id, label, username }]
   let aiSettings = null;
   let notifSettings = null;
+  let membershipSettings = null; // { enabled, channel, channelUrl, message, messageIsDefault }
   let currency = "تومان";
 
   function hoursSummary() {
@@ -99,6 +100,7 @@ const SettingsPage = (() => {
       settingsRow(icons.report, "گزارش روزانه", reportSummary(), openReportSheet),
       settingsRow(icons.gear, "هوش مصنوعی", aiSummary(), openAiSheet),
       settingsRow(icons.check, "اعلان‌های مشتری", notifSummary(), openNotifSheet),
+      settingsRow(icons.users, "عضویت کانال", membershipSummary(), openMembershipSheet),
     );
     container.appendChild(list);
   }
@@ -351,7 +353,7 @@ const SettingsPage = (() => {
 
   async function load() {
     try {
-      const [prof, pay, hrs, rep, adminList, ai, notif] = await Promise.all([
+      const [prof, pay, hrs, rep, adminList, ai, notif, memb] = await Promise.all([
         Api.get("/api/admin/me"),
         Api.get("/api/admin/settings/payment"),
         Api.get("/api/admin/business-hours"),
@@ -359,6 +361,7 @@ const SettingsPage = (() => {
         Api.get("/api/admin/admins"),
         Api.get("/api/admin/ai-settings"),
         Api.get("/api/admin/notification-settings"),
+        Api.get("/api/admin/settings/channel-membership"),
       ]);
       profile = prof;
       payment = pay;
@@ -367,6 +370,7 @@ const SettingsPage = (() => {
       admins = adminList;
       aiSettings = ai;
       notifSettings = notif;
+      membershipSettings = memb;
       currency = pay.currency || "تومان";
       renderSettingsPage();
     } catch (err) {
@@ -391,6 +395,81 @@ const SettingsPage = (() => {
     parts.push(notifSettings.askDeliveryRating ? "امتیاز تحویل: روشن" : "امتیاز تحویل: خاموش");
     parts.push(notifSettings.notifyWalletChanges ? "تغییر کیف پول: روشن" : "تغییر کیف پول: خاموش");
     return parts.join(" · ");
+  }
+
+  function membershipSummary() {
+    if (!membershipSettings) return "";
+    if (!membershipSettings.enabled) return "غیرفعال";
+    return membershipSettings.channel ? `فعال · ${membershipSettings.channel}` : "فعال · کانالی تنظیم نشده";
+  }
+
+  function openMembershipSheet() {
+    const enabledSw = switchField(
+      "الزام عضویت در کانال",
+      membershipSettings.enabled,
+      "مشتریان برای استفاده از ربات باید عضو کانال باشند",
+    );
+    const channelF = field("شناسه کانال", textInput(membershipSettings.channel || "", { maxlength: 64, placeholder: "@my_cafe_channel یا https://t.me/my_cafe_channel" }), {
+      hint: "یوزرنیم عمومی کانال (لینک دعوت پشتیبانی نمی‌شود). ربات باید ادمین کانال باشد.",
+    });
+    const messageInput = el("textarea", { maxlength: 500, rows: "3" });
+    messageInput.value = membershipSettings.messageIsDefault ? "" : membershipSettings.message || "";
+    const messageF = field("پیام عضویت (اختیاری)", messageInput, {
+      hint: "خالی بگذارید تا پیام پیش‌فرض نمایش داده شود.",
+    });
+
+    // The channel link is shown clearly so the operator can verify it.
+    const linkPreview = el("div", { class: "field-hint", style: "margin:0 0 12px" });
+    function syncLink() {
+      if (membershipSettings.channelUrl && !channelF.input.value.trim()) {
+        linkPreview.textContent = `لینک عضویت: ${membershipSettings.channelUrl}`;
+      } else {
+        const raw = channelF.input.value.trim();
+        const m = raw.match(/^(?:@|https?:\/\/(?:www\.)?t\.me\/)?([A-Za-z][A-Za-z0-9_]{4,31})/);
+        linkPreview.textContent = m ? `لینک عضویت: https://t.me/${m[1]}` : "";
+      }
+    }
+    channelF.input.addEventListener("input", syncLink);
+    syncLink();
+
+    const formError = el("div", { class: "form-error" });
+    formError.hidden = true;
+    const saveBtn = el("button", { class: "btn", type: "submit", text: "ذخیره" });
+    const form = el(
+      "form",
+      { novalidate: "" },
+      formError,
+      el("div", { class: "card", style: "padding:4px 14px;margin-bottom:14px" },
+        enabledSw.root),
+      channelF.root,
+      linkPreview,
+      messageF.root,
+      el("div", { class: "field-hint", style: "margin:0 0 12px",
+        text: "نکته: برای بررسی عضویت، ربات باید در کانال عضو و ادمین باشد (دسترسی «مشاهده اعضا»). در غیر این صورت وضعیت «بررسی ناموفق» نمایش داده می‌شود و مشتریان مسدود نمی‌شوند." }),
+      el("div", { class: "form-actions" }, saveBtn, el("button", { class: "btn ghost", type: "button", text: "انصراف", onClick: closeSheet })),
+    );
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      formError.hidden = true;
+      saveBtn.disabled = true;
+      try {
+        membershipSettings = await Api.put("/api/admin/settings/channel-membership", {
+          enabled: enabledSw.input.checked,
+          channel: channelF.input.value.trim(),
+          message: messageInput.value.trim(),
+        });
+        toast("تنظیمات عضویت کانال ذخیره شد");
+        closeSheet();
+        renderSettingsPage();
+      } catch (err) {
+        formError.textContent = err.message || "ذخیره انجام نشد";
+        formError.hidden = false;
+        saveBtn.disabled = false;
+      }
+    });
+
+    openSheet("عضویت کانال", form);
   }
 
   function openAiSheet() {

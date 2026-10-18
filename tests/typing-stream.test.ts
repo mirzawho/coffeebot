@@ -13,6 +13,7 @@ import { TokenService } from "../src/bot/tokens";
 import { CustomersService } from "../src/services/customers";
 import { LoyaltyService } from "../src/services/loyalty";
 import { NotificationService } from "../src/services/notifications";
+import { ChannelMembershipService } from "../src/services/membership";
 import { registerMessageHandlers } from "../src/bot/handlers/messages";
 import type { BotApp } from "../src/bot/context";
 import { TextCaptureFlow } from "../src/bot/context";
@@ -160,6 +161,7 @@ function buildApp(aiResult: AiResult | ((input: AiInput) => AiResult), persona =
     persona,
     customers: new CustomersService(db),
     loyalty: new LoyaltyService(db),
+    membership: new ChannelMembershipService(db),
     notifications: new NotificationService(db),
     profileEdit: new TextCaptureFlow(),
     depositFlow: new TextCaptureFlow(),

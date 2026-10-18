@@ -142,6 +142,15 @@ export class NotificationService {
   }
 
   /**
+   * Remember the Telegram message a notification was delivered as, so a later
+   * review decision (bot keyboard or admin panel) can edit that message in
+   * place — e.g. rewriting the receipt caption after approval.
+   */
+  recordMessageId(id: number, messageId: number): void {
+    this.db.query("UPDATE notifications SET notification_id = ? WHERE id = ?").run(messageId, id);
+  }
+
+  /**
    * Record a failed attempt. Retries with bounded exponential backoff up to
    * MAX_ATTEMPTS, then keeps the row as 'failed' with the last error retained.
    */

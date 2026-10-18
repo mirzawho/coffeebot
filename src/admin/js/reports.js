@@ -1,14 +1,15 @@
-/* Reports page: browse orders by date (or a short range) with detail dialog. */
+/* Reports page: browse orders by date (or a short range).
+ * Detail, payment review, edit and lifecycle actions live in the shared
+ * OrderDetail sheet — one implementation for this page and the customer
+ * profile's orders tab. */
 "use strict";
 
 const ReportsPage = (() => {
-  const { el, icons, openSheet, field, textInput, loadingState, errorState,
-    emptyState, moneyWithCurrency, faDigits, jalaliLabel, esc } = Ui;
+  const { el, icons, loadingState, errorState, emptyState, moneyWithCurrency, faDigits, jalaliLabel } = Ui;
 
   let businessDate = null; // today in the cafe's timezone (from /api/admin/me)
   let from = null;
   let to = null;
-  let orders = null;
   let listBox = null; // current DOM container for the order list
 
   function init(today) {
@@ -44,7 +45,13 @@ const ReportsPage = (() => {
             : null;
     return el(
       "button",
-      { class: "row tappable order-row", type: "button", onClick: () => openDetail(o) },
+      {
+        class: "row tappable order-row",
+        type: "button",
+        // Any change inside the sheet (payment, status, edit) refreshes the
+        // list behind it so row badges and totals stay in sync.
+        onClick: () => OrderDetail.open(o.orderNumber, { onChanged: () => void loadOrders() }),
+      },
       el(
         "div",
         { class: "row-main" },
@@ -58,217 +65,6 @@ const ReportsPage = (() => {
         el("span", { class: "chev", html: icons.chevron }),
       ),
     );
-  }
-
-  /** Payment card: method, status, receipt preview, approve/reject actions. */
-  function paymentCard(o, onChanged) {
-    const card = el(
-      "div",
-      { class: "card", style: "padding:12px 14px;margin-bottom:14px" },
-      el(
-        "div",
-        { style: "display:flex;justify-content:space-between;font-weight:700" },
-        el("span", { text: "پرداخت" }),
-        el("span", { text: o.paymentMethodLabel }),
-      ),
-      el("div", { style: "font-size:13px;color:var(--muted);margin-top:6px", text: `وضعیت: ${o.paymentLabel}` }),
-    );
-
-    if (o.hasReceipt) {
-      const img = el("img", {
-        src: `/api/admin/orders/${encodeURIComponent(o.orderNumber)}/receipt/image`,
-        alt: "تصویر رسید پرداخت",
-        loading: "lazy",
-        style: "width:100%;border-radius:10px;margin-top:10px;background:var(--surface-2)",
-      });
-      img.addEventListener("error", () => {
-        img.replaceWith(
-          el("div", { style: "font-size:12.5px;color:var(--faint);margin-top:10px", text: "پیش‌نمایش رسید در دسترس نیست." }),
-        );
-      });
-      card.appendChild(img);
-    }
-
-    // Only card-to-card orders carry a receipt to review; wallet orders are
-    // already paid when they are created.
-    if (o.paymentMethod === "card_to_card" && o.paymentStatus !== "paid") {
-      const actions = el("div", { class: "form-actions", style: "margin-top:12px" });
-      const mk = (label, path, cls) => {
-        const b = el("button", { class: `btn ${cls}`, type: "button", text: label });
-        b.addEventListener("click", async () => {
-          b.disabled = true;
-          try {
-            await Api.post(path, {});
-            toast("انجام شد");
-            await onChanged();
-          } catch (err) {
-            toast(err.message || "انجام نشد", true);
-            b.disabled = false;
-          }
-        });
-        return b;
-      };
-      actions.appendChild(mk("✅ تأیید پرداخت", `/api/admin/orders/${o.orderNumber}/payment/approve`, ""));
-      // Reject asks for a reason — it is shown to the customer next to the
-      // receipt image. Cancelling the prompt aborts the rejection.
-      const rejectBtn = el("button", { class: "btn ghost", type: "button", text: "❌ رد رسید" });
-      rejectBtn.addEventListener("click", async () => {
-        const reason = prompt("دلیل رد رسید (برای مشتری ارسال می‌شود):");
-        if (reason === null) return; // cancelled
-        rejectBtn.disabled = true;
-        try {
-          await Api.post(`/api/admin/orders/${o.orderNumber}/payment/reject`, reason.trim() ? { reason: reason.trim() } : {});
-          toast("انجام شد");
-          await onChanged();
-        } catch (err) {
-          toast(err.message || "انجام نشد", true);
-          rejectBtn.disabled = false;
-        }
-      });
-      actions.appendChild(rejectBtn);
-      card.appendChild(actions);
-    }
-    return card;
-  }
-
-  function openDetail(o) {
-    const items = el(
-      "div",
-      { class: "card list-card", style: "margin-bottom:14px" },
-      ...o.items.map((it) =>
-        el(
-          "div",
-          { class: "row" },
-          el(
-            "div",
-            { class: "row-main" },
-            el("div", { class: "row-title", text: it.variantName ? `${it.productName} — ${it.variantName}` : it.productName }),
-            el("div", { class: "row-sub", text: `${faDigits(it.quantity)} × ${faDigits(it.unitPrice)}` }),
-          ),
-          el("span", { class: "row-end order-total", text: moneyWithCurrency(it.lineTotal, o.currency) }),
-        ),
-      ),
-    );
-
-    const box = el(
-      "div",
-      {},
-      el(
-        "div",
-        { class: "card", style: "padding:12px 14px;margin-bottom:14px" },
-        el("div", { style: "font-weight:700;margin-bottom:4px", text: o.orderNumber }),
-        el("div", { style: "font-size:13px;color:var(--muted)", text: `${o.jalaliDate} — ساعت ${faDigits(o.time)}` }),
-        el("div", { style: "font-size:13px;color:var(--muted)", text: `مشتری: ${o.customerName || "بدون نام"}` }),
-        o.fulfillmentMethod
-          ? el("div", {
-              style: "font-size:13px;color:var(--muted);margin-top:4px",
-              text: `تحویل: ${o.fulfillmentMethodLabel || "—"}${o.deliveryTime ? ` — ${o.deliveryTime}` : ""}`,
-            })
-          : null,
-        el("span", { class: "badge warn", text: o.statusLabel, style: "margin-top:6px" }),
-      ),
-      el("div", { class: "field-label", text: "اقلام سفارش" }),
-      items,
-      el(
-        "div",
-        { class: "card", style: "padding:12px 14px" },
-        el(
-          "div",
-          { style: "display:flex;justify-content:space-between;font-weight:700" },
-          el("span", { text: "جمع کل" }),
-          el("span", { text: moneyWithCurrency(o.totalAmount, o.currency) }),
-        ),
-        o.deliveryNotes
-          ? el("div", { style: "font-size:13px;color:var(--muted);margin-top:8px", text: `یادداشت تحویل: ${o.deliveryNotes}` })
-          : null,
-      ),
-      paymentCard(o, async () => {
-        openSheet("جزئیات سفارش", await reloadDetail(o));
-      }),
-    );
-
-    // Lifecycle actions — server validates every transition; buttons disable
-    // while a request is pending to prevent duplicate submissions.
-    const actions = el("div", { class: "form-actions" });
-    const mkAction = (label, path, cls) => {
-      const b = el("button", { class: `btn ${cls}`, type: "button", text: label });
-      b.addEventListener("click", async () => {
-        b.disabled = true;
-        try {
-          await Api.post(path, {});
-          toast("انجام شد");
-          openSheet("جزئیات سفارش", await reloadDetail(o));
-        } catch (err) {
-          toast(err.message || "انجام نشد", true);
-          b.disabled = false;
-        }
-      });
-      return b;
-    };
-    if (o.fulfillmentStatus === "pending") {
-      actions.appendChild(mkAction("✅ تأیید سفارش", `/api/admin/orders/${o.orderNumber}/confirm`, ""));
-    } else if (o.fulfillmentStatus === "confirmed") {
-      actions.appendChild(mkAction("📦 تحویل داده شد", `/api/admin/orders/${o.orderNumber}/deliver`, ""));
-    }
-    if (actions.childElementCount > 0) box.appendChild(actions);
-    openSheet("جزئیات سفارش", box);
-  }
-
-  /** Re-fetch the order by number and rebuild the detail sheet. */
-  async function reloadDetail(o) {
-    const list = await Api.get(`/api/admin/orders?businessDate=${o.businessDate}`);
-    const fresh = (list || []).find((x) => x.orderNumber === o.orderNumber) || o;
-    const items = el(
-      "div",
-      { class: "card list-card", style: "margin-bottom:14px" },
-      ...fresh.items.map((it) =>
-        el(
-          "div",
-          { class: "row" },
-          el(
-            "div",
-            { class: "row-main" },
-            el("div", { class: "row-title", text: it.variantName ? `${it.productName} — ${it.variantName}` : it.productName }),
-            el("div", { class: "row-sub", text: `${faDigits(it.quantity)} × ${faDigits(it.unitPrice)}` }),
-          ),
-          el("span", { class: "row-end order-total", text: moneyWithCurrency(it.lineTotal, fresh.currency) }),
-        ),
-      ),
-    );
-    const box = el(
-      "div",
-      {},
-      el(
-        "div",
-        { class: "card", style: "padding:12px 14px;margin-bottom:14px" },
-        el("div", { style: "font-weight:700;margin-bottom:4px", text: fresh.orderNumber }),
-        el("div", { style: "font-size:13px;color:var(--muted)", text: `${fresh.jalaliDate} — ساعت ${faDigits(fresh.time)}` }),
-        el("div", { style: "font-size:13px;color:var(--muted)", text: `مشتری: ${fresh.customerName || "بدون نام"}` }),
-        fresh.fulfillmentMethod
-          ? el("div", {
-              style: "font-size:13px;color:var(--muted);margin-top:4px",
-              text: `تحویل: ${fresh.fulfillmentMethodLabel || "—"}${fresh.deliveryTime ? ` — ${fresh.deliveryTime}` : ""}`,
-            })
-          : null,
-        el("span", { class: "badge warn", text: fresh.statusLabel, style: "margin-top:6px" }),
-      ),
-      el("div", { class: "field-label", text: "اقلام سفارش" }),
-      items,
-      el(
-        "div",
-        { class: "card", style: "padding:12px 14px" },
-        el(
-          "div",
-          { style: "display:flex;justify-content:space-between;font-weight:700" },
-          el("span", { text: "جمع کل" }),
-          el("span", { text: moneyWithCurrency(fresh.totalAmount, fresh.currency) }),
-        ),
-      ),
-      paymentCard(fresh, async () => {
-        openSheet("جزئیات سفارش", await reloadDetail(fresh));
-      }),
-    );
-    return box;
   }
 
   function render(container) {
@@ -326,7 +122,7 @@ const ReportsPage = (() => {
     try {
       const res = await Api.get(apiPath());
       if (token !== loadToken) return; // a newer filter change superseded this load
-      orders = res;
+      const orders = res;
       box.innerHTML = "";
       if (!orders.length) {
         box.appendChild(

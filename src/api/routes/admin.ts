@@ -23,11 +23,16 @@ import {
   updateReportSettings,
   getSetting,
 } from "../../services/settings";
+import {
+  getMembershipSettings,
+  updateMembershipSettings,
+  type MembershipStatus,
+} from "../../services/membership";
 import { formatMoney, parseAmountInput } from "../../utils/money";
 import { formatJalaliFa, isValidDate } from "../../utils/dates";
-import { paymentRejectedCustomerText } from "../../bot/format";
+import { paymentRejectedCustomerText, receiptApprovedCaption, receiptRejectedCaption } from "../../bot/format";
 import { log } from "../../utils/logger";
-import type { Order } from "../../services/orders";
+import type { AdminOrderUpdate, Order } from "../../services/orders";
 
 interface RouteCtx {
   app: ApiApp;
@@ -163,7 +168,10 @@ const WALLET_TX_LABELS: Record<string, string> = {
 };
 
 /** Admin-facing order shape: no DB ids, no Telegram ids. `statusLabel` is what
- * the UI shows; the raw `status` stays for API compatibility/consumers. */
+ * the UI shows; the raw `status` stays for API compatibility/consumers.
+ * `fulfillmentStatus` drives the lifecycle buttons (only valid transitions are
+ * offered). Item product/variant ids are catalog ids — the same ids the
+ * products API already exposes to admins — required for editing lines. */
 function orderDto(o: Order, timezone: string) {
   return {
     orderNumber: o.orderNumber,
@@ -175,6 +183,7 @@ function orderDto(o: Order, timezone: string) {
     currency: o.currency,
     status: o.status,
     statusLabel: ORDER_STATUS_LABELS[o.status] ?? "ثبت شده",
+    fulfillmentStatus: o.fulfillmentStatus,
     fulfillmentLabel: FULFILLMENT_LABELS[o.fulfillmentStatus] ?? "ثبت شده",
     paymentLabel: PAYMENT_STATUS_LABELS[o.paymentStatus] ?? "—",
     paymentMethodLabel: PAYMENT_METHOD_LABELS[o.paymentMethod] ?? "—",
@@ -186,6 +195,8 @@ function orderDto(o: Order, timezone: string) {
     deliveryTime: o.deliveryTime,
     hasReceipt: !!o.receiptFileId,
     items: o.items.map((it) => ({
+      productId: it.productId,
+      variantId: it.variantId,
       productName: it.productName,
       variantName: it.variantName,
       quantity: it.quantity,
@@ -601,6 +612,57 @@ route("GET", "/api/admin/orders", ({ app, url }) => {
   return json(app.orders.listRecent(50).map((o) => orderDto(o, tz)));
 });
 
+/**
+ * One order by its human-readable number — the detail view's data source.
+ * The reports page and the customer profile both open details from a list
+ * row, so both can fetch the same authoritative snapshot by order number.
+ */
+route("GET", "/api/admin/orders/:ref", ({ app, params }) => {
+  const order = app.orders.findByNumber(decodeURIComponent(params.ref));
+  if (!order) return json({ error: "سفارش یافت نشد" }, 404);
+  return json(orderDto(order, app.config.timezone));
+});
+
+/**
+ * Admin edit of a placed order. Items are revalidated and repriced
+ * server-side against the live menu (after-hours aware); the scheduled time,
+ * fulfillment method and delivery notes are editable fields the order already
+ * has. Delivered/cancelled orders are frozen; wallet-funded orders have their
+ * ledger reconciled atomically inside the service transaction.
+ */
+route("PUT", "/api/admin/orders/:ref", async ({ app, user, params, req }) => {
+  const order = app.orders.findByNumber(decodeURIComponent(params.ref));
+  if (!order) return badRequest("سفارش یافت نشد");
+  const body = (await readJson(req)) as Record<string, unknown> | null;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return badRequest("JSON نامعتبر است");
+  }
+  const update: AdminOrderUpdate = {};
+  if ("items" in body) {
+    update.items = Array.isArray(body.items)
+      ? (body.items as AdminOrderUpdate["items"])
+      : [];
+  }
+  if ("deliveryTime" in body) {
+    update.deliveryTime =
+      body.deliveryTime === null || body.deliveryTime === undefined
+        ? null
+        : String(body.deliveryTime);
+  }
+  if ("fulfillmentMethod" in body) {
+    update.fulfillmentMethod = body.fulfillmentMethod as AdminOrderUpdate["fulfillmentMethod"];
+  }
+  if ("deliveryNotes" in body) {
+    update.deliveryNotes =
+      body.deliveryNotes === null || body.deliveryNotes === undefined
+        ? null
+        : String(body.deliveryNotes);
+  }
+  const r = app.orders.adminUpdateOrder(order.id, user.id, update);
+  if (!r.ok) return badRequest(r.error);
+  return json({ ok: true, order: orderDto(r.order, app.config.timezone) });
+});
+
 // AI settings (admin-only; persona is style guidance, never permissions)
 
 route("GET", "/api/admin/ai-settings", ({ app }) => json(getAiSettings(app.db)));
@@ -710,13 +772,29 @@ route("POST", "/api/admin/wallet/deposits/:id/reject", ({ app, user, params }) =
 
 // customer list + detail (admin)
 
+/** Persian labels for channel-membership status (never raw codes in the UI). */
+const MEMBERSHIP_STATUS_LABELS: Record<MembershipStatus, string> = {
+  member: "عضو کانال",
+  not_member: "عضو نیست",
+  unknown: "بررسی ناموفق",
+};
+
 /**
- * Customer directory for the panel: profile, wallet balance, order stats.
- * Telegram ids are values here, never display labels (the UI shows names).
+ * Customer directory for the panel: profile, wallet balance, order stats,
+ * and the last known channel-membership result (cached — never a live
+ * Telegram call per row). Telegram ids are values here, not display labels.
+ *
+ * `membership` query filter: member | not_member | unknown | none
+ * (none = never verified). Filtering happens in SQL over the cached table so
+ * the page stays fast.
  */
 route("GET", "/api/admin/customers", ({ app, url }) => {
   const q = (url.searchParams.get("q") ?? "").trim();
   const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 100, 1), 500);
+  const membershipFilter = (url.searchParams.get("membership") ?? "").trim();
+  if (membershipFilter && !["member", "not_member", "unknown", "none"].includes(membershipFilter)) {
+    return badRequest("فیلتر عضویت نامعتبر است");
+  }
   const rows = app.customers.listCustomerRows(limit);
   const tz = app.config.timezone;
   const filtered = q
@@ -729,8 +807,9 @@ route("GET", "/api/admin/customers", ({ app, url }) => {
         );
       })
     : rows;
-  return json(
-    filtered.map((r) => ({
+  const withMembership = filtered.map((r) => {
+    const record = app.membership.recordFor(r.telegramId);
+    return {
       // The id is the route parameter for opening detail, not rendered text.
       id: r.telegramId,
       name: r.fullName,
@@ -740,8 +819,23 @@ route("GET", "/api/admin/customers", ({ app, url }) => {
       orderCount: r.orderCount,
       orderValue: r.orderValue,
       lastActiveAt: r.lastActiveAt ? isoToLocalDateTime(r.lastActiveAt, tz) : null,
-    })),
-  );
+      membership: record
+        ? {
+            status: record.status,
+            statusLabel: MEMBERSHIP_STATUS_LABELS[record.status] ?? "—",
+            channel: record.channel,
+            checkedAt: isoToLocalDateTime(record.checkedAt, tz),
+          }
+        : null,
+    };
+  });
+  const membershipFiltered = membershipFilter
+    ? withMembership.filter((r) => {
+        if (membershipFilter === "none") return r.membership === null;
+        return r.membership?.status === membershipFilter;
+      })
+    : withMembership;
+  return json(membershipFiltered);
 });
 
 route("GET", "/api/admin/customers/:id", ({ app, params }) => {
@@ -751,6 +845,8 @@ route("GET", "/api/admin/customers/:id", ({ app, params }) => {
   const deposits = app.customers.listDeposits(telegramId, 10);
   const transactions = app.customers.listTransactions(telegramId, 20);
   const ratings = app.loyalty.ratingsForCustomer(telegramId, 10);
+  const membershipSettings = getMembershipSettings(app.db);
+  const membershipRecord = app.membership.recordFor(telegramId);
   return json({
     ...summary,
     profile: summary.profile
@@ -762,6 +858,18 @@ route("GET", "/api/admin/customers/:id", ({ app, params }) => {
           username: summary.profile.username,
         }
       : null,
+    membership: {
+      configuredChannel: membershipSettings.channel,
+      enforcementEnabled: membershipSettings.enabled,
+      status: membershipRecord?.status ?? null,
+      statusLabel: membershipRecord
+        ? (MEMBERSHIP_STATUS_LABELS[membershipRecord.status] ?? "—")
+        : "هنوز بررسی نشده",
+      channel: membershipRecord?.channel ?? null,
+      checkedAt: membershipRecord
+        ? isoToLocalDateTime(membershipRecord.checkedAt, app.config.timezone)
+        : null,
+    },
     orders,
     deposits: deposits.map((d) => ({
       amount: d.amount,
@@ -778,6 +886,63 @@ route("GET", "/api/admin/customers/:id", ({ app, params }) => {
     })),
     ratings,
   });
+});
+
+/**
+ * Admin-requested fresh membership verification for one customer. Uses the
+ * stored Telegram id (never a client-supplied id — the id comes from the
+ * authenticated route param). Bypasses the short-lived cache. Telegram
+ * failures come back as `unknown`, never as `not_member`.
+ */
+route("POST", "/api/admin/customers/:id/membership-check", async ({ app, params }) => {
+  const telegramId = num(params.id);
+  const settings = getMembershipSettings(app.db);
+  if (!settings.channel) {
+    return badRequest("ابتدا کانال را در تنظیمات عضویت کانال پیکربندی کنید");
+  }
+  const result = await app.membership.check(telegramId, { fresh: true });
+  const record = app.membership.recordFor(telegramId);
+  return json({
+    ok: true,
+    status: result.status,
+    statusLabel: MEMBERSHIP_STATUS_LABELS[result.status] ?? "—",
+    channel: record?.channel ?? settings.channel,
+    checkedAt: record ? isoToLocalDateTime(record.checkedAt, app.config.timezone) : null,
+  });
+});
+
+// channel membership settings (admin)
+
+route("GET", "/api/admin/settings/channel-membership", ({ app }) => {
+  const s = getMembershipSettings(app.db);
+  return json({
+    enabled: s.enabled,
+    channel: s.channel ?? "",
+    channelUrl: s.channelUrl,
+    message: s.message,
+    messageIsDefault: s.messageIsDefault,
+  });
+});
+
+route("PUT", "/api/admin/settings/channel-membership", async ({ app, req }) => {
+  const body = await readJson(req);
+  if (!body) return badRequest("JSON نامعتبر است");
+  try {
+    const saved = updateMembershipSettings(app.db, {
+      enabled: body.enabled !== undefined ? !!body.enabled : undefined,
+      channel: body.channel !== undefined ? String(body.channel ?? "") : undefined,
+      message: body.message !== undefined ? String(body.message ?? "") : undefined,
+    });
+    return json({
+      enabled: saved.enabled,
+      channel: saved.channel ?? "",
+      channelUrl: saved.channelUrl,
+      message: saved.message,
+      messageIsDefault: saved.messageIsDefault,
+    });
+  } catch (err) {
+    return badRequest(String(err instanceof Error ? err.message : err));
+  }
 });
 
 /**
@@ -929,8 +1094,35 @@ route("GET", "/api/admin/orders/:ref/receipt/image", async ({ app, params }) => 
   }
 });
 
+/**
+ * Best-effort sync of the delivered Telegram receipt notices after a review
+ * decision made from the panel. The bot keyboard path edits the message it was
+ * pressed on directly; this covers the same decision arriving through the API
+ * so the caption, the keyboard, and the database stay consistent. Failures
+ * never affect the response — the database is the source of truth.
+ */
+async function syncReceiptNotices(app: ApiApp, orderNumber: string, caption: string): Promise<void> {
+  if (!app.bot) return;
+  const rows = app.db
+    .query(
+      `SELECT recipient_id, notification_id FROM notifications
+       WHERE kind = 'order_update' AND ref_key = ? AND notification_id IS NOT NULL`,
+    )
+    .all(orderNumber) as { recipient_id: number; notification_id: number }[];
+  for (const row of rows) {
+    try {
+      await app.bot.api.editMessageCaption(row.recipient_id, row.notification_id, {
+        caption,
+        reply_markup: { inline_keyboard: [] },
+      });
+    } catch (err) {
+      log.warn("receipt notice caption edit failed", { orderNumber, err: String(err) });
+    }
+  }
+}
+
 /** Admin approves a card-to-card payment (receipt accepted → order paid). */
-route("POST", "/api/admin/orders/:ref/payment/approve", ({ app, user, params }) => {
+route("POST", "/api/admin/orders/:ref/payment/approve", async ({ app, user, params }) => {
   const order = app.orders.findByNumber(decodeURIComponent(params.ref));
   if (!order) return badRequest("سفارش یافت نشد");
   const r = app.orders.markPaymentPaid(order.id, user.id);
@@ -943,6 +1135,9 @@ route("POST", "/api/admin/orders/:ref/payment/approve", ({ app, user, params }) 
       `✅ پرداخت سفارش ${r.order.orderNumber} تأیید شد.`,
     );
   }
+  // Re-sync even when `already` so a previously failed caption edit self-heals;
+  // rewriting an identical caption is harmless on Telegram's side.
+  await syncReceiptNotices(app, r.order.orderNumber, receiptApprovedCaption(r.order.orderNumber));
   return json({ ok: true, already: r.already, order: orderDto(r.order, app.config.timezone) });
 });
 
@@ -978,6 +1173,7 @@ route("POST", "/api/admin/orders/:ref/payment/reject", async ({ app, user, param
       r.order.receiptFileId,
     );
   }
+  await syncReceiptNotices(app, r.order.orderNumber, receiptRejectedCaption(r.order.orderNumber));
   return json({ ok: true, already: r.already, order: orderDto(r.order, app.config.timezone) });
 });
 

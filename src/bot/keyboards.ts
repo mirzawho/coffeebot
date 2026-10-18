@@ -165,11 +165,18 @@ export function receiptKeyboard(): InlineKeyboard {
  * Fulfillment + quick-time picker shown with the placed order (and on the
  * wallet summary). Defaults are already applied (pickup, now) — a press
  * updates the order in place. The delivery button needs a saved address.
+ * While the café is closed, «الان»/«۵ دقیقه بعد»/«۱۰ دقیقه بعد» are not
+ * offered — an order placed now belongs to the next business day, so only
+ * «فردا» makes sense as a time choice.
  */
-export function placedFulfillmentKeyboard(hasAddress: boolean): InlineKeyboard {
+export function placedFulfillmentKeyboard(hasAddress: boolean, isOpenNow = true): InlineKeyboard {
   const kb = new InlineKeyboard();
   if (hasAddress) kb.text("🛵 ارسال به ما", "fm:d");
   kb.text("🏪 تحویل در کافه", "fm:p");
+  if (!isOpenNow) {
+    kb.row().text("📅 فردا", "ft:tomorrow");
+    return kb;
+  }
   kb.row()
     .text("⚡ الان", "ft:now")
     .text("📅 فردا", "ft:tomorrow");
@@ -211,6 +218,17 @@ export function paymentMethodKeyboard(opts: {
   }
   kb.text("🛒 سبد خرید", "cart").text("❌ انصراف", "cx");
   return kb;
+}
+
+/**
+ * Join-channel prompt keyboard: a URL button opening the configured public
+ * channel, plus «عضو شدم، بررسی کن» which triggers a fresh membership
+ * verification (handled by the central membership guard).
+ */
+export function joinChannelKeyboard(channelUrl: string): InlineKeyboard {
+  return new InlineKeyboard()
+    .url("➕ عضویت در کانال", channelUrl)
+    .text("✅ عضو شدم، بررسی کن", "ch:check");
 }
 
 /**

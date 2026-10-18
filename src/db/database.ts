@@ -68,6 +68,11 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   report_recipients: "[]",
   last_report_status: "",
   last_report_error: "",
+  // Channel membership enforcement — OFF by default so a fresh install (or an
+  // install that never configures a channel) never blocks customers.
+  channel_membership_enabled: "0",
+  channel_membership_channel: "",
+  channel_membership_message: "",
 };
 
 function seedDefaults(db: Db): void {

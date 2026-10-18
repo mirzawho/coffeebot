@@ -20,6 +20,7 @@ import { TokenService } from "../src/bot/tokens";
 import { CustomersService } from "../src/services/customers";
 import { LoyaltyService } from "../src/services/loyalty";
 import { NotificationService } from "../src/services/notifications";
+import { ChannelMembershipService } from "../src/services/membership";
 import { registerMessageHandlers } from "../src/bot/handlers/messages";
 import { registerCallbackHandlers } from "../src/bot/handlers/callbacks";
 import { registerAdminEntry, adminWebAppUrl, adminEntryKeyboard } from "../src/bot/admin-entry";
@@ -103,6 +104,7 @@ function buildApp(aiResult: AiResult | ((input: AiInput) => AiResult)): BotApp {
     customers: new CustomersService(db),
     loyalty: new LoyaltyService(db),
     notifications: new NotificationService(db),
+    membership: new ChannelMembershipService(db),
     profileEdit: new TextCaptureFlow(),
     depositFlow: new TextCaptureFlow(),
     rejectReasonFlow: new TextCaptureFlow(),
@@ -312,7 +314,7 @@ describe("admin entry point", () => {
 function makeCallbackCtx(data: string, userId = 555) {
   const answers: any[] = [];
   const replies: { text: string; opts?: any }[] = [];
-  const edits: { text: string; opts?: any }[] = [];
+  const edits: { text: string; opts?: any; kind?: string }[] = [];
   return {
     from: { id: userId, first_name: "Cust" },
     callbackQuery: { data },
@@ -325,11 +327,15 @@ function makeCallbackCtx(data: string, userId = 555) {
       return {} as any;
     },
     editMessageText: async (t: string, opts?: any) => {
-      edits.push({ text: t, opts });
+      edits.push({ text: t, opts, kind: "text" });
+      return {} as any;
+    },
+    editMessageCaption: async (other: any) => {
+      edits.push({ text: other?.caption ?? "", opts: other, kind: "caption" });
       return {} as any;
     },
     editMessageReplyMarkup: async () => {
-      edits.push({ text: "", opts: { reply_markup: null } });
+      edits.push({ text: "", opts: { reply_markup: null }, kind: "markup" });
       return {} as any;
     },
     _answers: answers,
@@ -730,36 +736,43 @@ describe("checkout, payment, and receipt via conversation", () => {
   });
 
   test("the placed-order keyboard carries delivery + quick-time buttons", async () => {
-    app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
-    app.orders.startCheckout(555);
-    app.orders.choosePaymentMethod(555, "card_to_card");
-    const bot = fakeBot();
-    registerMessageHandlers(bot, app);
-    registerCallbackHandlers(bot, app);
-    const media = makeMediaCtx("photo");
-    await bot._handlers.get("message:photo")!(media);
+    // The quick-time buttons are only offered while the café is open — pin an
+    // open Monday hour so the expectation is deterministic.
+    setSystemTime(new Date("2026-10-12T10:00:00+03:30"));
+    try {
+      app = appWithSeededCart({ type: "chat", reply: "x", actions: [], needsClarification: false }).app;
+      app.orders.startCheckout(555);
+      app.orders.choosePaymentMethod(555, "card_to_card");
+      const bot = fakeBot();
+      registerMessageHandlers(bot, app);
+      registerCallbackHandlers(bot, app);
+      const media = makeMediaCtx("photo");
+      await bot._handlers.get("message:photo")!(media);
 
-    // The receipt placed the order and the summary offers the new keyboard.
-    const summary = media._replies.find((r) => r.opts?.reply_markup)!;
-    expect(callbacksOf(summary.opts.reply_markup)).toEqual([
-      "fm:p",
-      "ft:now",
-      "ft:tomorrow",
-      "ft:5m",
-      "ft:10m",
-    ]);
+      // The receipt placed the order and the summary offers the new keyboard.
+      const summary = media._replies.find((r) => r.opts?.reply_markup)!;
+      expect(callbacksOf(summary.opts.reply_markup)).toEqual([
+        "fm:p",
+        "ft:now",
+        "ft:tomorrow",
+        "ft:5m",
+        "ft:10m",
+      ]);
 
-    // «۵ دقیقه بعد» resolves to a concrete clock time and refreshes the message.
-    const press = makeCallbackCtx("ft:5m");
-    await bot._handlers.get("callback_query")!(press);
-    const order = app.orders.latestOrderFor(555)!;
-    expect(order.deliveryTime).toMatch(/^ساعت [۰-۹]{1,2}:[۰-۹]{2}$/);
-    expect(press._edits.map((e) => e.text).join("\n")).toContain("تحویل حضوری 🏪");
+      // «۵ دقیقه بعد» resolves to a concrete clock time and refreshes the message.
+      const press = makeCallbackCtx("ft:5m");
+      await bot._handlers.get("callback_query")!(press);
+      const order = app.orders.latestOrderFor(555)!;
+      expect(order.deliveryTime).toMatch(/^ساعت [۰-۹]{1,2}:[۰-۹]{2}$/);
+      expect(press._edits.map((e) => e.text).join("\n")).toContain("تحویل حضوری 🏪");
 
-    // A press with nothing to place and nothing placed is refused.
-    const stale = makeCallbackCtx("ft:now", 999);
-    await bot._handlers.get("callback_query")!(stale);
-    expect(stale._answers.some((a) => a?.show_alert)).toBe(true);
+      // A press with nothing to place and nothing placed is refused.
+      const stale = makeCallbackCtx("ft:now", 999);
+      await bot._handlers.get("callback_query")!(stale);
+      expect(stale._answers.some((a) => a?.show_alert)).toBe(true);
+    } finally {
+      setSystemTime();
+    }
   });
 
   test("delivery without a saved address is refused; pickup always works", async () => {
@@ -1778,6 +1791,59 @@ describe("admin receipt review (confirm/reject keyboard)", () => {
       .query("SELECT COUNT(*) AS c FROM notifications WHERE kind = 'customer_notice' AND ref_key = ?")
       .get(`payment_approved_${built.orderNumber}`) as { c: number };
     expect(after.c).toBe(1);
+  });
+
+  test("admin تأیید rewrites the receipt message caption and strips the keyboard", async () => {
+    const built = await placeCardOrder();
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, built.app);
+    const ctx = makeCallbackCtx(`oa:yes:${built.orderId}`, ADMIN);
+    await bot._handlers.get("callback_query")!(ctx);
+
+    const captionEdit = ctx._edits.find((e) => e.kind === "caption");
+    expect(captionEdit).toBeDefined();
+    expect(captionEdit!.text).toContain(built.orderNumber);
+    expect(captionEdit!.text).toContain("تأییدشده");
+    expect(captionEdit!.text).not.toContain("تأییدنشده");
+    // The inline keyboard is removed in the same edit.
+    expect(captionEdit!.opts?.reply_markup?.inline_keyboard).toEqual([]);
+  });
+
+  test("a failing caption edit still strips the keyboard and keeps the order paid", async () => {
+    const built = await placeCardOrder();
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, built.app);
+    const ctx = makeCallbackCtx(`oa:yes:${built.orderId}`, ADMIN);
+    ctx.editMessageCaption = async () => {
+      throw new Error("message can't be edited");
+    };
+    await bot._handlers.get("callback_query")!(ctx);
+
+    // The database is the source of truth: approval stands despite the edit failure.
+    expect(built.app.orders.loadOrder(built.orderId)!.paymentStatus).toBe("paid");
+    // Fallback: the keyboard is still removed.
+    expect(ctx._edits.some((e) => e.kind === "markup")).toBe(true);
+  });
+
+  test("a repeated تأیید press self-heals the caption without a duplicate notice", async () => {
+    const built = await placeCardOrder();
+    const bot = fakeBot();
+    registerCallbackHandlers(bot, built.app);
+    const first = makeCallbackCtx(`oa:yes:${built.orderId}`, ADMIN);
+    await bot._handlers.get("callback_query")!(first);
+    const second = makeCallbackCtx(`oa:yes:${built.orderId}`, ADMIN);
+    await bot._handlers.get("callback_query")!(second);
+
+    // Idempotent: still paid, and the second press re-applies the approved caption.
+    expect(built.app.orders.loadOrder(built.orderId)!.paymentStatus).toBe("paid");
+    const captionEdit = second._edits.find((e) => e.kind === "caption");
+    expect(captionEdit).toBeDefined();
+    expect(captionEdit!.text).toContain("تأییدشده");
+    // No duplicate customer notification on the repeat press.
+    const rows = built.app.db
+      .query("SELECT COUNT(*) AS c FROM notifications WHERE kind = 'customer_notice' AND ref_key = ?")
+      .get(`payment_approved_${built.orderNumber}`) as { c: number };
+    expect(rows.c).toBe(1);
   });
 
   test("admin لغو asks for a reason; the typed reason is saved and sent to the customer with the receipt image", async () => {

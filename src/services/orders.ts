@@ -1,6 +1,6 @@
 import type { Db } from "../db/database";
 import { nowIso, tx } from "../db/database";
-import { formatOrderNumber } from "../utils/ids";
+import { formatOrderNumber, MAX_CART_ITEMS, MAX_ITEM_QUANTITY } from "../utils/ids";
 import { formatMoney } from "../utils/money";
 import { BusinessHoursService } from "./business-hours";
 import { CartService, type CartLine, type FulfillmentMethod } from "./cart";
@@ -77,6 +77,22 @@ export type StartCheckoutResult =
 export type ChoosePaymentResult =
   | { ok: true; method: PaymentMethod; total: number; balance: number }
   | { ok: false; error: string };
+
+/** One item line in an admin order edit — product identity, not a snapshot name. */
+export interface AdminOrderItemInput {
+  productId: number;
+  variantId: number | null;
+  quantity: number;
+}
+
+/** Admin edit payload: every field optional; omitted fields stay unchanged. */
+export interface AdminOrderUpdate {
+  /** Full replacement of the order's items (each line revalidated + repriced). */
+  items?: AdminOrderItemInput[];
+  deliveryTime?: string | null;
+  fulfillmentMethod?: FulfillmentMethod;
+  deliveryNotes?: string | null;
+}
 
 export class OrdersService {
   private menu: MenuService;
@@ -453,6 +469,166 @@ export class OrdersService {
         .run(method, time, orderId);
       return { ok: true as const, order: this.loadOrder(orderId)! };
     });
+  }
+
+  /**
+   * Admin edit of a placed order: items, scheduled time, fulfillment method,
+   * delivery notes. Items are fully replaced and revalidated against the live
+   * menu (active + priced, after-hours rule applied) exactly like a customer
+   * checkout, so the persisted total always reflects current pricing.
+   * Delivered/cancelled orders are frozen. A wallet-funded order has its
+   * ledger reconciled to the new total inside the same transaction — shortfall
+   * charged, excess credited back — and a charge the balance cannot cover
+   * aborts the whole edit.
+   */
+  adminUpdateOrder(
+    orderId: number,
+    adminId: number,
+    update: AdminOrderUpdate,
+  ): { ok: true; order: Order } | { ok: false; error: string } {
+    try {
+      return tx(this.db, () => {
+        const order = this.loadOrder(orderId);
+        if (!order) return { ok: false as const, error: "سفارش یافت نشد" };
+        if (order.fulfillmentStatus === "delivered" || order.fulfillmentStatus === "cancelled") {
+          return { ok: false as const, error: "این سفارش دیگر قابل ویرایش نیست" };
+        }
+
+        let newLines: CartLine[] | null = null;
+        let total = order.totalAmount;
+        if (update.items !== undefined) {
+          if (!Array.isArray(update.items) || update.items.length === 0) {
+            return { ok: false as const, error: "سفارش باید حداقل یک قلم داشته باشد" };
+          }
+          if (update.items.length > MAX_CART_ITEMS) {
+            return { ok: false as const, error: "تعداد اقلام سفارش بیش از حد مجاز است" };
+          }
+          const afterHours = !this.businessHours.isOpenAt(new Date());
+          newLines = [];
+          const seen = new Set<string>();
+          for (const it of update.items) {
+            const productId = Number((it as any)?.productId);
+            const rawVariant = (it as any)?.variantId;
+            const variantId = rawVariant === undefined || rawVariant === null ? null : Number(rawVariant);
+            const quantity = Number((it as any)?.quantity);
+            if (!Number.isInteger(productId) || productId <= 0) {
+              return { ok: false as const, error: "قلم سفارش نامعتبر است" };
+            }
+            if (variantId !== null && (!Number.isInteger(variantId) || variantId <= 0)) {
+              return { ok: false as const, error: "قلم سفارش نامعتبر است" };
+            }
+            if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_ITEM_QUANTITY) {
+              return { ok: false as const, error: `تعداد باید بین ۱ و ${MAX_ITEM_QUANTITY} باشد` };
+            }
+            const key = `${productId}:${variantId ?? ""}`;
+            if (seen.has(key)) {
+              return { ok: false as const, error: "قلم تکراری در سفارش وجود دارد" };
+            }
+            seen.add(key);
+            const resolved = this.menu.resolvePrice(productId, variantId);
+            if (!resolved.ok) return { ok: false as const, error: resolved.error };
+            const unitPrice = resolved.variant
+              ? resolved.variant.priceAmount
+              : this.menu.priceFor(resolved.product, afterHours);
+            if (unitPrice === null) {
+              return { ok: false as const, error: `قیمت «${resolved.product.name}» تنظیم نشده است` };
+            }
+            newLines.push({
+              cartItemId: 0,
+              productId,
+              variantId,
+              productName: resolved.product.name,
+              variantName: resolved.variant?.name ?? null,
+              quantity,
+              unitPrice,
+              lineTotal: unitPrice * quantity,
+            });
+          }
+          total = newLines.reduce((sum, l) => sum + l.lineTotal, 0);
+        }
+
+        let method = order.fulfillmentMethod;
+        if (update.fulfillmentMethod !== undefined) {
+          if (update.fulfillmentMethod !== "delivery" && update.fulfillmentMethod !== "pickup") {
+            return { ok: false as const, error: "روش تحویل نامعتبر است" };
+          }
+          method = update.fulfillmentMethod;
+        }
+        if (method === "delivery") {
+          const profile = this.customers.getProfile(order.customerTelegramId);
+          if (!profile?.address) {
+            return {
+              ok: false as const,
+              error: "برای تحویل ارسالی، ابتدا آدرس مشتری باید در پروفایل ثبت شده باشد",
+            };
+          }
+        }
+        const time =
+          update.deliveryTime !== undefined
+            ? update.deliveryTime === null
+              ? null
+              : update.deliveryTime.trim().slice(0, 100) || null
+            : order.deliveryTime;
+        const notes =
+          update.deliveryNotes !== undefined
+            ? update.deliveryNotes === null
+              ? null
+              : update.deliveryNotes.trim().slice(0, 500) || null
+            : order.deliveryNotes;
+
+        // Wallet orders are already paid; reconcile the ledger to the new
+        // total. Manual adjustments (not the single-shot refund/order_payment
+        // entries) keep repeated edits correct and keep customerSummary's
+        // refund subtraction from double-counting a lowered total.
+        if (order.paymentMethod === "wallet" && order.paymentStatus === "paid" && total !== order.totalAmount) {
+          if (!this.customers.getProfile(order.customerTelegramId)) {
+            this.customers.saveProfile(order.customerTelegramId, {
+              fullName: order.customerName || "مشتری",
+            });
+          }
+          const delta = total - order.totalAmount;
+          const adj = this.customers.adjustBalance(
+            order.customerTelegramId,
+            -delta,
+            delta > 0
+              ? `تکمیل مبلغ سفارش ${order.orderNumber} پس از ویرایش`
+              : `کسر مبلغ سفارش ${order.orderNumber} پس از ویرایش`,
+            adminId,
+          );
+          if (!adj.ok) return { ok: false as const, error: adj.error };
+        }
+
+        this.db
+          .query(
+            "UPDATE orders SET total_amount = ?, fulfillment_method = ?, delivery_time = ?, delivery_notes = ? WHERE id = ?",
+          )
+          .run(total, method, time, notes, orderId);
+
+        if (newLines) {
+          this.db.query("DELETE FROM order_items WHERE order_id = ?").run(orderId);
+          const insertItem = this.db.query(
+            `INSERT INTO order_items (order_id, product_id, variant_id, product_name, variant_name,
+             quantity, unit_price_amount, line_total_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          );
+          for (const line of newLines) {
+            insertItem.run(
+              orderId,
+              line.productId,
+              line.variantId,
+              line.productName,
+              line.variantName,
+              line.quantity,
+              line.unitPrice,
+              line.lineTotal,
+            );
+          }
+        }
+
+        return { ok: true as const, order: this.loadOrder(orderId)! };
+      });
+    } catch (err) {
+      return { ok: false, error: `ویرایش سفارش انجام نشد: ${err}` };
+    }
   }
 
   /**

@@ -257,6 +257,9 @@ export function fulfillmentLine(method: "delivery" | "pickup", time: string | nu
 
 export const RECEIPT_PLACED_LEAD_TEXT = "🎉 ممنون! رسید شما دریافت شد و سفارش ثبت شد.";
 export const ORDER_PLACED_LEAD_TEXT = "🎉 سفارش شما ثبت شد!";
+/** Refusal when an immediate-time slot (الان / +۵ / +۱۰ دقیقه) is picked while closed. */
+export const CLOSED_IMMEDIATE_TIME_TEXT =
+  "کافه در حال حاضر بسته است؛ سفارش شما برای بازگشایی بعدی ثبت می‌شود. لطفاً «فردا» را انتخاب کنید.";;
 
 /**
  * The placed-order summary — sent once the order row exists and re-rendered
@@ -322,6 +325,18 @@ export function paymentRejectedCustomerText(orderNumber: string, reason: string)
     "لطفاً با کافه تماس بگیرید.",
   ].join("\n");
 }
+
+/**
+ * Captions for the admin receipt photo message (scheduler-sent). The pending
+ * caption is written once at send time; approved/rejected replace it after a
+ * review decision so the Telegram message, the database, and the panel agree.
+ */
+export const receiptPendingCaption = (orderNumber: string): string =>
+  `رسید سفارش ${orderNumber} (تأییدنشده)`;
+export const receiptApprovedCaption = (orderNumber: string): string =>
+  `رسید سفارش ${orderNumber} (تأییدشده ✓)`;
+export const receiptRejectedCaption = (orderNumber: string): string =>
+  `رسید سفارش ${orderNumber} (رد شده)`;
 
 export const STALE_TEXT = "این دکمه دیگر معتبر نیست. لطفاً دوباره از منو اقدام کنید.";
 export const AI_FALLBACK_TEXT =

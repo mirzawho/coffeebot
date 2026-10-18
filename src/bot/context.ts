@@ -9,6 +9,7 @@ import type { TokenService } from "./tokens";
 import type { CustomersService } from "../services/customers";
 import type { LoyaltyService } from "../services/loyalty";
 import type { NotificationService } from "../services/notifications";
+import type { ChannelMembershipService } from "../services/membership";
 
 export interface ChatTurn {
   role: "user" | "assistant";
@@ -54,6 +55,8 @@ export interface BotApp {
   loyalty: LoyaltyService;
   /** Durable customer notifications (payment review outcomes). */
   notifications: NotificationService;
+  /** Telegram channel membership enforcement (settings + verification cache). */
+  membership: ChannelMembershipService;
   /** Multi-step profile wizard (name → phone → address). */
   profileEdit: TextCaptureFlow;
   /** Next text message is captured as a wallet deposit amount. */

@@ -13,6 +13,7 @@ import { signInitData } from "../src/api/middleware/auth";
 import { loadConfig } from "../src/config";
 import { ReportService } from "../src/services/reports";
 import { NotificationService } from "../src/services/notifications";
+import { ChannelMembershipService } from "../src/services/membership";
 import { Scheduler } from "../src/scheduler";
 
 let db: Db;
@@ -453,6 +454,7 @@ describe("admin order lifecycle API", () => {
       uploadsDir: "/tmp/cafe-uploads-test",
       customers,
       loyalty,
+      membership: new ChannelMembershipService(db),
     };
   });
 
@@ -837,6 +839,7 @@ describe("admin payment review API", () => {
       uploadsDir: "/tmp/cafe-uploads-test",
       customers,
       loyalty,
+      membership: new ChannelMembershipService(db),
     };
   });
 
@@ -1079,6 +1082,7 @@ describe("payment method switches", () => {
       uploadsDir: "/tmp/cafe-uploads-test",
       customers,
       loyalty,
+      membership: new ChannelMembershipService(db),
     };
   });
 

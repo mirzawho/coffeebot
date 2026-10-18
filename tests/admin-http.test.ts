@@ -11,6 +11,7 @@ import { updatePaymentSettings } from "../src/services/settings";
 import { BusinessHoursService } from "../src/services/business-hours";
 import { ReportService } from "../src/services/reports";
 import { NotificationService } from "../src/services/notifications";
+import { ChannelMembershipService } from "../src/services/membership";
 import { handleAdminApi } from "../src/api/routes/admin";
 import { signInitData } from "../src/api/middleware/auth";
 import type { ApiApp } from "../src/api/context";
@@ -73,6 +74,7 @@ beforeEach(() => {
     uploadsDir: mkdtempSync(join(tmpdir(), "cafe-uploads-")),
     customers: new CustomersService(db),
     loyalty: new LoyaltyService(db),
+    membership: new ChannelMembershipService(db),
   };
 });
 
@@ -226,6 +228,174 @@ describe("customer orders appear in the admin workflow", () => {
     expect(
       (ordersOnBusinessDate.body as any[]).some((o) => o.orderNumber === conf.order.orderNumber),
     ).toBe(true);
+  });
+});
+
+describe("payment review from the panel (receipt sync regression)", () => {
+  /** Place a card-to-card order exactly like the customer flow does. */
+  function placeCardOrder() {
+    updatePaymentSettings(db, { cardNumber: "603799", cardholderName: "Ali", currency: "تومان" });
+    const cat = app.menu.createCategory({ name: "نوشیدنی" });
+    const product = app.menu.createProduct({ categoryId: cat.id, name: "اسپرسو", fixedPriceAmount: 80000 });
+    const cart = new CartService(db);
+    cart.addItem(555, product.id, null, 1);
+    app.orders.startCheckout(555);
+    app.orders.choosePaymentMethod(555, "card_to_card");
+    const placed = app.orders.placeOrderAfterReceipt(555, "receipt-file", 42);
+    if (!placed.ok) throw new Error("order not placed");
+    return placed.order;
+  }
+
+  /** Simulate a scheduler-delivered receipt notice with a known message id. */
+  function recordDeliveredNotice(orderNumber: string, messageId = 900) {
+    const now = new Date().toISOString();
+    app.db
+      .query(
+        `INSERT INTO notifications (kind, recipient_id, ref_key, status, attempts, payload, notification_id, created_at)
+         VALUES ('order_update', 777, ?, 'sent', 0, '{}', ?, ?)`,
+      )
+      .run(orderNumber, messageId, now);
+  }
+
+  test("approve marks the order paid and returns the updated DTO; repeats are idempotent", async () => {
+    const order = placeCardOrder();
+    const path = `/api/admin/orders/${encodeURIComponent(order.orderNumber)}/payment/approve`;
+
+    const r1 = await call("POST", path);
+    expect(r1.status).toBe(200);
+    expect(r1.body.ok).toBe(true);
+    expect(r1.body.already).toBe(false);
+    expect(r1.body.order.paymentStatus).toBe("paid");
+
+    const r2 = await call("POST", path);
+    expect(r2.status).toBe(200);
+    expect(r2.body.already).toBe(true);
+    expect(r2.body.order.paymentStatus).toBe("paid");
+  });
+
+  test("approve rewrites the delivered Telegram receipt caption and strips the keyboard", async () => {
+    const order = placeCardOrder();
+    recordDeliveredNotice(order.orderNumber);
+    const edits: { chatId: number; messageId: number; caption: string; other?: any }[] = [];
+    app.bot = {
+      api: {
+        getFile: async () => ({ file_path: "x" }),
+        editMessageCaption: async (
+          chatId: number,
+          messageId: number,
+          other: { caption: string; reply_markup?: any },
+        ) => {
+          edits.push({ chatId, messageId, caption: other.caption, other });
+          return true;
+        },
+      },
+    };
+
+    const r = await call(
+      "POST",
+      `/api/admin/orders/${encodeURIComponent(order.orderNumber)}/payment/approve`,
+    );
+    expect(r.status).toBe(200);
+    expect(r.body.order.paymentStatus).toBe("paid");
+    expect(edits.length).toBe(1);
+    expect(edits[0]!.chatId).toBe(777);
+    expect(edits[0]!.messageId).toBe(900);
+    expect(edits[0]!.caption).toContain(order.orderNumber);
+    expect(edits[0]!.caption).toContain("تأییدشده");
+    expect(edits[0]!.other?.reply_markup?.inline_keyboard).toEqual([]);
+  });
+
+  test("a failing Telegram edit never fails the approval (database is the truth)", async () => {
+    const order = placeCardOrder();
+    recordDeliveredNotice(order.orderNumber);
+    app.bot = {
+      api: {
+        getFile: async () => ({ file_path: "x" }),
+        editMessageCaption: async () => {
+          throw new Error("message can't be edited");
+        },
+      },
+    };
+
+    const r = await call(
+      "POST",
+      `/api/admin/orders/${encodeURIComponent(order.orderNumber)}/payment/approve`,
+    );
+    expect(r.status).toBe(200);
+    expect(r.body.ok).toBe(true);
+    expect(app.orders.loadOrder(order.id)!.paymentStatus).toBe("paid");
+  });
+
+  test("reject rewrites the caption to the rejected state", async () => {
+    const order = placeCardOrder();
+    recordDeliveredNotice(order.orderNumber);
+    const edits: { caption: string }[] = [];
+    app.bot = {
+      api: {
+        getFile: async () => ({ file_path: "x" }),
+        editMessageCaption: async (
+          _chatId: number,
+          _messageId: number,
+          other: { caption: string },
+        ) => {
+          edits.push({ caption: other.caption });
+          return true;
+        },
+      },
+    };
+
+    const r = await call(
+      "POST",
+      `/api/admin/orders/${encodeURIComponent(order.orderNumber)}/payment/reject`,
+      { body: { reason: "مبلغ واریزی کمتر از مبلغ سفارش است" } },
+    );
+    expect(r.status).toBe(200);
+    expect(r.body.order.paymentStatus).toBe("rejected");
+    expect(edits.length).toBe(1);
+    expect(edits[0]!.caption).toContain(order.orderNumber);
+    expect(edits[0]!.caption).toContain("رد شده");
+  });
+
+  test("the receipt image endpoint streams image bytes to an authorized admin", async () => {
+    const order = placeCardOrder();
+    app.bot = {
+      api: {
+        getFile: async () => ({ file_path: "photos/receipt.jpg" }),
+        editMessageCaption: async () => true,
+      },
+    };
+    globalThis.fetch = (async () =>
+      new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: { "content-type": "image/jpeg" },
+      })) as unknown as typeof fetch;
+    try {
+      const res = await handleAdminApi(
+        new Request(
+          `http://localhost/api/admin/orders/${encodeURIComponent(order.orderNumber)}/receipt/image`,
+          { method: "GET", headers: headersFor(ADMIN) },
+        ),
+        app,
+      );
+      expect(res!.status).toBe(200);
+      expect(res!.headers.get("content-type")).toContain("image/jpeg");
+      const bytes = new Uint8Array(await res!.arrayBuffer());
+      expect(bytes.length).toBe(3);
+    } finally {
+      delete (globalThis as any).fetch;
+    }
+  });
+
+  test("the receipt image endpoint is refused without authentication", async () => {
+    const order = placeCardOrder();
+    const res = await handleAdminApi(
+      new Request(
+        `http://localhost/api/admin/orders/${encodeURIComponent(order.orderNumber)}/receipt/image`,
+        { method: "GET" },
+      ),
+      app,
+    );
+    expect(res!.status).toBe(401);
   });
 });
 

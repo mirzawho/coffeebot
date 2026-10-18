@@ -221,11 +221,50 @@ const Api = (() => {
     return data;
   }
 
+  /**
+   * Fetch a protected resource as a Blob (receipt previews). An <img> tag
+   * cannot carry the initData header, so image bytes must go through fetch.
+   */
+  async function blob(path) {
+    await telegramReady();
+    const headers = {};
+    const token = initData();
+    if (token) headers[HEADER] = token;
+    else {
+      console.warn(
+        `⚠️ Warning: Sending API request with EMPTY ${HEADER}! ` +
+          `method=GET path=${path} insideTelegram=${!!webApp()} ` +
+          `hash=${window.location.hash ? "present" : "absent"}`,
+      );
+    }
+    let res;
+    try {
+      res = await fetch(baseUrl() + path, {
+        method: "GET",
+        headers,
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+    } catch (networkErr) {
+      const err = new Error("ارتباط با سرور برقرار نشد. اینترنت خود را بررسی کنید.");
+      err.status = 0;
+      err.cause = networkErr;
+      throw err;
+    }
+    if (!res.ok) {
+      const e = new Error(`HTTP ${res.status}`);
+      e.status = res.status;
+      throw e;
+    }
+    return res.blob();
+  }
+
   return {
     get: (p) => request("GET", p),
     post: (p, b) => request("POST", p, b),
     put: (p, b) => request("PUT", p, b),
     del: (p) => request("DELETE", p),
+    blob,
     initData,
     isTelegram,
     whenReady: telegramReady,

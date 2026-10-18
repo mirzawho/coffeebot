@@ -9,6 +9,7 @@ import { LoyaltyService } from "../src/services/loyalty";
 import { BusinessHoursService } from "../src/services/business-hours";
 import { ReportService } from "../src/services/reports";
 import { NotificationService } from "../src/services/notifications";
+import { ChannelMembershipService } from "../src/services/membership";
 import { createHttpServer } from "../src/api/server";
 import { signInitData } from "../src/api/middleware/auth";
 import { botState } from "../src/bot/state";
@@ -60,6 +61,7 @@ beforeAll(() => {
     uploadsDir: mkdtempSync(join(tmpdir(), "cafe-uploads-")),
     customers: new CustomersService(db),
     loyalty: new LoyaltyService(db),
+    membership: new ChannelMembershipService(db),
   };
   server = createHttpServer(app);
   base = `http://127.0.0.1:${server.port}`;
@@ -222,6 +224,7 @@ describe("DEBUG=true injects the eruda console", () => {
       uploadsDir: mkdtempSync(join(tmpdir(), "cafe-uploads-")),
       customers: new CustomersService(db),
       loyalty: new LoyaltyService(db),
+      membership: new ChannelMembershipService(db),
     };
     debugServer = createHttpServer(app);
     debugBase = `http://127.0.0.1:${debugServer.port}`;

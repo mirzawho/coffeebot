@@ -15,6 +15,7 @@ import {
 import {
   cartText,
   checkoutStartText,
+  CLOSED_IMMEDIATE_TIME_TEXT,
   HELP_TEXT,
   ORDER_PLACED_LEAD_TEXT,
   orderPlacedSummaryText,
@@ -25,6 +26,7 @@ import {
   quickFulfillmentTimeLabel,
   RECEIPT_PLACED_LEAD_TEXT,
   REJECT_REASON_PROMPT_TEXT,
+  receiptApprovedCaption,
   STALE_TEXT,
   walletPaymentSummaryText,
   WELCOME_TEXT,
@@ -178,6 +180,7 @@ export async function startCheckoutFlow(ctx: Context, app: BotApp): Promise<void
           {
             reply_markup: placedFulfillmentKeyboard(
               !!app.customers.getProfile(userId)?.address,
+              app.businessHours.isOpenAt(new Date()),
             ),
           },
         );
@@ -289,7 +292,7 @@ export async function finalizeOrder(
       await sendOrEditPlaced(
         ctx,
         priceChangedText(result.total, currency),
-        placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+        placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address, app.businessHours.isOpenAt(new Date())),
         opts.edit === true,
       );
       return;
@@ -316,7 +319,7 @@ export async function finalizeOrder(
   await sendOrEditPlaced(
     ctx,
     text,
-    placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+    placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address, app.businessHours.isOpenAt(new Date())),
     opts.edit === true,
   );
 }
@@ -327,7 +330,7 @@ async function editPlacedMessage(ctx: Context, app: BotApp, order: Order): Promi
   await sendOrEditPlaced(
     ctx,
     orderPlacedSummaryText(order, { lead: ORDER_PLACED_LEAD_TEXT }),
-    placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+    placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address, app.businessHours.isOpenAt(new Date())),
     true,
   );
 }
@@ -554,7 +557,7 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
       // Wallet is charged when the customer picks delivery/time below.
       const { payment } = app.orders.getPaymentInstructions(userId);
       await ctx.reply(walletPaymentSummaryText(res.total, payment.currency, res.balance), {
-        reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+        reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address, app.businessHours.isOpenAt(new Date())),
       });
       return;
     }
@@ -610,6 +613,16 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
       await ctx.answerCallbackQuery({ text: STALE_TEXT, show_alert: true });
       return;
     }
+    // Immediate-time slots are meaningless while the café is closed — the
+    // order would roll to the next business day anyway. Refuses stale «الان»
+    // buttons left over from an earlier open-hours render.
+    if (
+      (choice === "now" || choice === "5m" || choice === "10m") &&
+      !app.businessHours.isOpenAt(new Date())
+    ) {
+      await ctx.answerCallbackQuery({ text: CLOSED_IMMEDIATE_TIME_TEXT, show_alert: true });
+      return;
+    }
     const label = quickFulfillmentTimeLabel(choice, new Date(), app.config.timezone);
     if (placing) {
       app.cart.setFulfillmentTime(userId, label);
@@ -663,8 +676,21 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
         );
       }
       await ctx.answerCallbackQuery({ text: r.already ? "این رسید قبلاً بررسی شده است" : "پرداخت تأیید شد ✓" });
-      // Strip the buttons so the resolved message cannot be re-pressed.
-      await ctx.editMessageReplyMarkup().catch(() => {});
+      // Rewrite the receipt message: the caption still says «تأییدنشده», and
+      // the keyboard must go so the resolved message cannot be re-pressed.
+      // Runs even on `already` so a previously failed edit self-heals. Telegram
+      // errors (message too old / already identical) never undo the DB update.
+      const captionEdited = await ctx
+        .editMessageCaption({ caption: receiptApprovedCaption(order.orderNumber), reply_markup: { inline_keyboard: [] } })
+        .then(() => true)
+        .catch((err) => {
+          log.warn("receipt caption edit failed", { order: order.orderNumber, err: String(err) });
+          return false;
+        });
+      if (!captionEdited) {
+        // Caption could not be edited — still strip the buttons.
+        await ctx.editMessageReplyMarkup().catch(() => {});
+      }
       return;
     }
     // Reject: the reason is captured from the admin's next text message, then

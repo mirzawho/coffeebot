@@ -6,6 +6,7 @@ import type { ReportService } from "../services/reports";
 import type { OrdersService } from "../services/orders";
 import { buildOrderUpdateText } from "../services/reports";
 import { receiptReviewKeyboard } from "../bot/keyboards";
+import { receiptPendingCaption } from "../bot/format";
 import { log } from "../utils/logger";
 
 const TICK_MS = 30_000;
@@ -166,10 +167,13 @@ export class Scheduler {
         // so the admin still gets an actionable prompt.
         const reviewKb = receiptReviewKeyboard(order.id);
         try {
-          await this.deps.bot.api.sendPhoto(n.recipientId, receiptFileId, {
-            caption: `رسید سفارش ${order.orderNumber} (تأییدنشده)`,
+          const sent = await this.deps.bot.api.sendPhoto(n.recipientId, receiptFileId, {
+            caption: receiptPendingCaption(order.orderNumber),
             reply_markup: reviewKb,
           });
+          // Remember the message id so a later review decision (bot button or
+          // admin panel) can rewrite the caption in place.
+          this.deps.notifications.recordMessageId(n.id, sent.message_id);
         } catch (photoErr) {
           log.warn("receipt forward failed", { err: String(photoErr) });
           await this.deps.bot.api.sendMessage(n.recipientId, `🧾 رسید سفارش ${order.orderNumber}`, {

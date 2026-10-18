@@ -3,6 +3,7 @@ import type { BotApp } from "./context";
 import { registerCallbackHandlers } from "./handlers/callbacks";
 import { registerMessageHandlers } from "./handlers/messages";
 import { registerAdminEntry, configureAdminMenuButtons } from "./admin-entry";
+import { channelMembershipGuard } from "./guards/channel-membership";
 import { log } from "../utils/logger";
 import { botState } from "./state";
 
@@ -20,6 +21,12 @@ export function createBot(app: BotApp): Bot {
   bot.catch((err) => {
     log.error("bot error", { err: String(err.error) });
   });
+
+  // Centralized channel-membership guard — MUST run before every customer
+  // handler so commands, text/AI, receipts and callbacks cannot bypass it.
+  // It is a no-op unless the admin has enabled enforcement with a valid
+  // channel, and it never blocks administrators.
+  bot.use(channelMembershipGuard(app));
 
   registerCallbackHandlers(bot, app);
   registerMessageHandlers(bot, app);

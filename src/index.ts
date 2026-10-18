@@ -13,6 +13,7 @@ import { createAiService } from "./services/ollama";
 import { loadPersona } from "./services/persona";
 import { CustomersService } from "./services/customers";
 import { LoyaltyService } from "./services/loyalty";
+import { ChannelMembershipService } from "./services/membership";
 import { getReportSettings, getSetting, setSetting } from "./services/settings";
 import { TokenService } from "./bot/tokens";
 import { createBot, startBot } from "./bot/index";
@@ -39,6 +40,7 @@ async function main(): Promise<void> {
   const tokens = new TokenService(db);
   const customers = new CustomersService(db);
   const loyalty = new LoyaltyService(db);
+  const membership = new ChannelMembershipService(db);
 
   // AI is enabled whenever an Ollama endpoint is configured (base URL + model).
   // An empty API key does NOT disable it: local Ollama needs no key, and a
@@ -88,12 +90,16 @@ async function main(): Promise<void> {
     customers,
     loyalty,
     notifications,
+    membership,
     profileEdit: new TextCaptureFlow(),
     depositFlow: new TextCaptureFlow(),
     rejectReasonFlow: new TextCaptureFlow(),
   };
 
   const bot = createBot(botApp);
+  // Membership verification needs the live Telegram client; attach it once the
+  // bot exists (before any update can arrive — createBot does not poll yet).
+  membership.attach(bot.api);
 
   const uploadsDir = join(dirname(config.databasePath), "uploads");
   mkdirSync(uploadsDir, { recursive: true });
@@ -109,6 +115,7 @@ async function main(): Promise<void> {
     uploadsDir,
     customers,
     loyalty,
+    membership,
     // Used only to resolve receipt file_ids into image bytes for the panel.
     bot,
   };

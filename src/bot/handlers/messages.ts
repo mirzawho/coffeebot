@@ -14,6 +14,7 @@ import {
 import {
   AI_FALLBACK_TEXT,
   cartText,
+  CLOSED_IMMEDIATE_TIME_TEXT,
   HELP_TEXT,
   NO_ORDERS_TEXT,
   ORDER_PLACED_LEAD_TEXT,
@@ -187,7 +188,7 @@ async function handleText(ctx: Context, app: BotApp, text: string): Promise<void
       await ctx.reply(
         walletPaymentSummaryText(total, payment.currency, app.customers.getBalance(userId)),
         {
-          reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+          reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address, app.businessHours.isOpenAt(new Date())),
         },
       );
       return;
@@ -201,7 +202,7 @@ async function handleText(ctx: Context, app: BotApp, text: string): Promise<void
     // A price change parked the placement — re-offer the retry, no AI.
     const { total, payment } = app.orders.getPaymentInstructions(userId);
     await ctx.reply(priceChangedText(total, payment.currency), {
-      reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+      reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address, app.businessHours.isOpenAt(new Date())),
     });
     return;
   }
@@ -555,7 +556,7 @@ async function handleReceiptMedia(
       if (placed) {
         // A re-sent screenshot after the order exists — point at the summary.
         await ctx.reply(RECEIPT_WRONG_STATE_TEXT, {
-          reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+          reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address, app.businessHours.isOpenAt(new Date())),
         });
         return;
       }
@@ -566,7 +567,7 @@ async function handleReceiptMedia(
     }
     // Wallet awaiting fulfillment, or a placement retry: the receipt is settled.
     await ctx.reply(RECEIPT_WRONG_STATE_TEXT, {
-      reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+      reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address, app.businessHours.isOpenAt(new Date())),
     });
     return;
   }
@@ -593,7 +594,7 @@ async function handleReceiptMedia(
       // The receipt is kept; the retry keyboard re-places at the new total.
       const { total, payment } = app.orders.getPaymentInstructions(userId);
       await ctx.reply(priceChangedText(total, payment.currency), {
-        reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+        reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address, app.businessHours.isOpenAt(new Date())),
       });
       return;
     }
@@ -614,7 +615,7 @@ async function handleReceiptMedia(
       lead: RECEIPT_PLACED_LEAD_TEXT,
       awaitingFulfillment: true,
     }),
-    { reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address) },
+    { reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address, app.businessHours.isOpenAt(new Date())) },
   );
 }
 
@@ -674,21 +675,38 @@ async function tryApplyPlacedOrderText(ctx: Context, app: BotApp, text: string):
   const userId = ctx.from!.id;
   const order = app.orders.editableOrderFor(userId);
   if (!order) return false;
+  const now = new Date();
   const method = parseFulfillmentMethod(text);
-  const time = parseFulfillmentTime(text, new Date(), app.config.timezone);
+  const time = parseFulfillmentTime(text, now, app.config.timezone);
   if (!method && time === undefined) return false;
+  // Immediate-time phrases (الان / +۵ / +۱۰ دقیقه) are refused while the café
+  // is closed — the order belongs to the next business day, not «الان».
+  if (typeof time === "string" && !app.businessHours.isOpenAt(now)) {
+    const immediate = (["now", "5m", "10m"] as const).map((c) =>
+      quickFulfillmentTimeLabel(c, now, app.config.timezone),
+    );
+    if ((immediate as readonly string[]).includes(time)) {
+      await ctx.reply(CLOSED_IMMEDIATE_TIME_TEXT, {
+        reply_markup: placedFulfillmentKeyboard(
+          !!app.customers.getProfile(userId)?.address,
+          false,
+        ),
+      });
+      return true;
+    }
+  }
   const update: { method?: "delivery" | "pickup"; time?: string | null } = {};
   if (method) update.method = method;
   if (time !== undefined) update.time = time;
   const r = app.orders.updateFulfillment(order.id, userId, update);
   if (!r.ok) {
     await ctx.reply(r.error, {
-      reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+      reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address, app.businessHours.isOpenAt(now)),
     });
     return true;
   }
   await ctx.reply(orderPlacedSummaryText(r.order, { lead: ORDER_PLACED_LEAD_TEXT }), {
-    reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address),
+    reply_markup: placedFulfillmentKeyboard(!!app.customers.getProfile(userId)?.address, app.businessHours.isOpenAt(now)),
   });
   return true;
 }
