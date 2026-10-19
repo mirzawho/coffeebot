@@ -144,10 +144,15 @@ export class ReferralService {
     }
     for (let attempt = 0; attempt < MAX_CODE_ATTEMPTS; attempt++) {
       const code = randomCode();
-      const res = this.db
-        .query("UPDATE customer_profiles SET referral_code = ? WHERE telegram_id = ? AND referral_code IS NULL")
-        .run(code, telegramId);
-      if (res.changes > 0) return code;
+      try {
+        const res = this.db
+          .query("UPDATE customer_profiles SET referral_code = ? WHERE telegram_id = ? AND referral_code IS NULL")
+          .run(code, telegramId);
+        if (res.changes > 0) return code;
+      } catch {
+        // UNIQUE constraint: this random code belongs to another customer — retry.
+        continue;
+      }
       const again = this.db
         .query("SELECT referral_code FROM customer_profiles WHERE telegram_id = ?")
         .get(telegramId) as { referral_code: string | null } | null;
@@ -332,7 +337,8 @@ export class ReferralService {
            VALUES (?, ?, ?, ?, ?)`,
         )
         .run(customerTelegramId, referrerTelegramId, referrerCode, source, now);
-      this.recordEvent(customerTelegramId, null, referrerTelegramId, source === "admin" ? "change" : "set", actor);
+      // No prior relationship → this is always a first-time 'set', even for admins.
+      this.recordEvent(customerTelegramId, null, referrerTelegramId, "set", actor);
       const relation = this.getReferrer(customerTelegramId)!;
       return { ok: true as const, relation, already: false };
     });

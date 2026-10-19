@@ -797,6 +797,8 @@ route("GET", "/api/admin/customers", ({ app, url }) => {
   }
   const rows = app.customers.listCustomerRows(limit);
   const tz = app.config.timezone;
+  // Resolve a possible referral code once (normalized; null for non-codes).
+  const qReferralOwner = q ? app.referrals.lookup(q) : null;
   const filtered = q
     ? rows.filter((r) => {
         const name = r.fullName ?? "";
@@ -804,8 +806,7 @@ route("GET", "/api/admin/customers", ({ app, url }) => {
           name.includes(q) ||
           (r.phone ?? "").includes(q) ||
           (r.username ?? "").toLowerCase().includes(q.toLowerCase()) ||
-          // Referral-code search (normalized; null for non-codes).
-          app.referrals.lookup(q) === r.telegramId
+          qReferralOwner === r.telegramId
         );
       })
     : rows;
