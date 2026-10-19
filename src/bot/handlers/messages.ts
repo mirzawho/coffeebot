@@ -10,6 +10,7 @@ import {
   paymentMethodKeyboard,
   placedFulfillmentKeyboard,
   receiptKeyboard,
+  referralEntryKeyboard,
 } from "../keyboards";
 import {
   AI_FALLBACK_TEXT,
@@ -28,9 +29,17 @@ import {
   RECEIPT_PLACED_LEAD_TEXT,
   RECEIPT_PROMPT_TEXT,
   RECEIPT_WRONG_STATE_TEXT,
+  REFERRAL_ALREADY_TEXT,
+  REFERRAL_CANCELLED_TEXT,
+  REFERRAL_CODE_PROMPT_TEXT,
+  REFERRAL_INVALID_TEXT,
+  REFERRAL_NOT_FOUND_TEXT,
+  REFERRAL_SELF_TEXT,
+  referralAppliedOnStartText,
+  referralSuccessText,
   UNSUPPORTED_TEXT,
-  WELCOME_TEXT,
   walletPaymentSummaryText,
+  WELCOME_TEXT,
   type QuickTimeChoice,
 } from "../format";
 import { MAX_AI_OFFERS, MAX_ITEM_QUANTITY, MAX_USER_MESSAGE_LENGTH } from "../../utils/ids";
@@ -43,22 +52,59 @@ import { log } from "../../utils/logger";
 import { finalizeOrder, showHelp, showMainMenu, showCart, startCheckoutFlow } from "./callbacks";
 import { withTypingIndicator } from "../typing";
 import { walletKeyboard } from "../keyboards";
+import { membershipJoinUrl } from "../guards/channel-membership";
+import { parseStartParam } from "../../services/referrals";
 import { formatMoney } from "../../utils/money";
 import { toPersianDigits } from "../../utils/dates";
+
+/**
+ * Main menu for a user, built from their PERSISTED referral status: the
+ * «استفاده از کد معرف» entry disappears once the customer has a referrer.
+ */
+export function menuFor(
+  app: BotApp,
+  userId: number,
+  joinChannelUrl: string | null = null,
+) {
+  const showReferralEntry = app.referrals.getReferrer(userId) === null;
+  return mainMenu(app.cart.lineCount(userId), joinChannelUrl, showReferralEntry);
+}
 
 /** Register /start, /help, text (AI + delivery notes) and photo/document handlers. */
 export function registerMessageHandlers(bot: any, app: BotApp): void {
   bot.command("start", async (ctx: Context) => {
-    app.cart.getOrCreate(ctx.from!.id);
-    await ctx.reply(WELCOME_TEXT, { reply_markup: mainMenu(app.cart.lineCount(ctx.from!.id)) });
+    const userId = ctx.from!.id;
+    app.cart.getOrCreate(userId);
+
+    // Deep-link referral (`https://t.me/<bot>?start=ref_<code>`). Registered
+    // BEFORE the menu is rendered so the keyboard reflects the new state.
+    // Every failure mode falls through to the normal flow untouched.
+    const startParam = (ctx as any).startParam as string | undefined;
+    const refCode = parseStartParam(startParam);
+    if (refCode) {
+      // A brand-new customer may have no profile row yet; applyReferral
+      // creates the customer record and then the relationship, in that order.
+      const result = app.referrals.applyReferral(userId, refCode, "link");
+      if (result.ok) {
+        const referrerName = app.customers.getProfile(result.relation.referredBy)?.fullName || null;
+        await ctx.reply(referralAppliedOnStartText(referrerName));
+      } else if (result.code === "already_registered") {
+        // Graceful: a repeated /start never overwrites the original referrer.
+        await ctx.reply(REFERRAL_ALREADY_TEXT);
+      }
+      // invalid/not-found/self: silent skip — the normal flow continues.
+    }
+
+    const joinUrl = await membershipJoinUrl(app, userId);
+    await ctx.reply(WELCOME_TEXT, { reply_markup: menuFor(app, userId, joinUrl) });
     // First run: a customer without a saved profile is walked through it once.
-    if (!app.customers.isProfileComplete(ctx.from!.id)) {
+    if (!app.customers.isProfileComplete(userId)) {
       await startProfileWizard(ctx, app);
     }
   });
 
   bot.command("help", async (ctx: Context) => {
-    await ctx.reply(HELP_TEXT, { reply_markup: mainMenu(app.cart.lineCount(ctx.from!.id)) });
+    await ctx.reply(HELP_TEXT, { reply_markup: menuFor(app, ctx.from!.id) });
   });
 
   // Deterministic identity command — answered from the trusted sender object.
@@ -118,16 +164,18 @@ async function handleText(ctx: Context, app: BotApp, text: string): Promise<void
     const wasActive =
       app.profileEdit.isActive(userId) ||
       app.depositFlow.isActive(userId) ||
-      app.rejectReasonFlow.isActive(userId);
+      app.rejectReasonFlow.isActive(userId) ||
+      app.referralFlow.isActive(userId);
     app.profileEdit.clear(userId);
     app.depositFlow.clear(userId);
     app.rejectReasonFlow.clear(userId);
+    app.referralFlow.clear(userId);
     if (wasActive) {
-      await ctx.reply("عملیات لغو شد.", { reply_markup: mainMenu(app.cart.lineCount(userId)) });
+      await ctx.reply("عملیات لغو شد.", { reply_markup: menuFor(app, userId) });
       return;
     }
     app.cart.resetCheckout(userId);
-    await ctx.reply("عملیات لغو شد.", { reply_markup: mainMenu(app.cart.lineCount(userId)) });
+    await ctx.reply("عملیات لغو شد.", { reply_markup: menuFor(app, userId) });
     return;
   }
 
@@ -152,6 +200,12 @@ async function handleText(ctx: Context, app: BotApp, text: string): Promise<void
   if (app.depositFlow.isActive(userId)) {
     app.depositFlow.clear(userId);
     await applyDepositAmount(ctx, app, text);
+    return;
+  }
+  // Referral code entry — must never fall through to the AI ordering path.
+  if (app.referralFlow.isActive(userId)) {
+    app.referralFlow.clear(userId);
+    await applyReferralCode(ctx, app, text);
     return;
   }
 
@@ -232,7 +286,7 @@ async function handleNaturalLanguage(ctx: Context, app: BotApp, text: string): P
   // AI disabled by the admin: free-text falls back to a friendly hint; the
   // deterministic menu/cart buttons keep working regardless.
   if (!aiSettings.enabled) {
-    await ctx.reply(AI_FALLBACK_TEXT, { reply_markup: mainMenu(app.cart.lineCount(userId)) });
+    await ctx.reply(AI_FALLBACK_TEXT, { reply_markup: menuFor(app, userId) });
     return;
   }
   const profile = app.customers.getProfile(userId);
@@ -272,7 +326,7 @@ async function handleNaturalLanguage(ctx: Context, app: BotApp, text: string): P
     // understand() must not throw for network/model failures (they become an
     // "unavailable" result); reaching here means an unexpected application error.
     log.error("ai understand threw", { userId, err: String(err) });
-    await ctx.reply(AI_FALLBACK_TEXT, { reply_markup: mainMenu(app.cart.lineCount(userId)) });
+    await ctx.reply(AI_FALLBACK_TEXT, { reply_markup: menuFor(app, userId) });
     return;
   }
 
@@ -461,7 +515,7 @@ async function applyCartActions(ctx: Context, app: BotApp, result: AiResult): Pr
 
   await ctx.reply(replyParts.filter(Boolean).join("\n"), {
     reply_markup:
-      after.lines.length > 0 ? cartKeyboard(userId, after.lines, app.tokens) : mainMenu(app.cart.lineCount(userId)),
+      after.lines.length > 0 ? cartKeyboard(userId, after.lines, app.tokens) : menuFor(app, userId),
   });
 }
 
@@ -506,7 +560,7 @@ async function applyAiProfileUpdate(ctx: Context, app: BotApp, result: AiResult)
     r.profile.address ? `آدرس: ${r.profile.address}` : null,
   ].filter(Boolean);
   await ctx.reply(`${leadText}✅ پروفایل به‌روز شد.\n${lines.join("\n")}`, {
-    reply_markup: mainMenu(app.cart.lineCount(userId)),
+    reply_markup: menuFor(app, userId),
   });
 }
 
@@ -561,7 +615,7 @@ async function handleReceiptMedia(
         return;
       }
       await ctx.reply("برای ارسال رسید، ابتدا «پرداخت و ثبت سفارش» را از سبد خرید بزنید.", {
-        reply_markup: mainMenu(app.cart.lineCount(userId)),
+        reply_markup: menuFor(app, userId),
       });
       return;
     }
@@ -599,7 +653,7 @@ async function handleReceiptMedia(
       return;
     }
     await ctx.reply(res.reason === "empty" ? "سبد خرید شما خالی است." : res.error, {
-      reply_markup: mainMenu(app.cart.lineCount(userId)),
+      reply_markup: menuFor(app, userId),
     });
     return;
   }
@@ -749,6 +803,30 @@ async function applyDepositAmount(ctx: Context, app: BotApp, text: string): Prom
         .text("🏠 منوی اصلی", "m"),
     },
   );
+}
+
+/** Validate and register a manually entered referral code. */
+async function applyReferralCode(ctx: Context, app: BotApp, text: string): Promise<void> {
+  const userId = ctx.from!.id;
+  const r = app.referrals.applyReferral(userId, text, "manual");
+  if (r.ok) {
+    const referrerName = app.customers.getProfile(r.relation.referredBy)?.fullName || null;
+    await ctx.reply(referralSuccessText(referrerName), { reply_markup: menuFor(app, userId) });
+    return;
+  }
+  if (r.code === "already_registered") {
+    await ctx.reply(REFERRAL_ALREADY_TEXT, { reply_markup: menuFor(app, userId) });
+    return;
+  }
+  const message =
+    r.code === "self_referral"
+      ? REFERRAL_SELF_TEXT
+      : r.code === "not_found"
+        ? REFERRAL_NOT_FOUND_TEXT
+        : REFERRAL_INVALID_TEXT;
+  await ctx.reply(message, { reply_markup: referralEntryKeyboard() });
+  // Re-arm so the customer can retry without pressing the button again.
+  app.referralFlow.expect(userId);
 }
 
 /**

@@ -14,6 +14,7 @@ import { loadPersona } from "./services/persona";
 import { CustomersService } from "./services/customers";
 import { LoyaltyService } from "./services/loyalty";
 import { ChannelMembershipService } from "./services/membership";
+import { ReferralService } from "./services/referrals";
 import { getReportSettings, getSetting, setSetting } from "./services/settings";
 import { TokenService } from "./bot/tokens";
 import { createBot, startBot } from "./bot/index";
@@ -41,6 +42,7 @@ async function main(): Promise<void> {
   const customers = new CustomersService(db);
   const loyalty = new LoyaltyService(db);
   const membership = new ChannelMembershipService(db);
+  const referrals = new ReferralService(db);
 
   // AI is enabled whenever an Ollama endpoint is configured (base URL + model).
   // An empty API key does NOT disable it: local Ollama needs no key, and a
@@ -91,9 +93,11 @@ async function main(): Promise<void> {
     loyalty,
     notifications,
     membership,
+    referrals,
     profileEdit: new TextCaptureFlow(),
     depositFlow: new TextCaptureFlow(),
     rejectReasonFlow: new TextCaptureFlow(),
+    referralFlow: new TextCaptureFlow(),
   };
 
   const bot = createBot(botApp);
@@ -116,6 +120,7 @@ async function main(): Promise<void> {
     customers,
     loyalty,
     membership,
+    referrals,
     // Used only to resolve receipt file_ids into image bytes for the panel.
     bot,
   };

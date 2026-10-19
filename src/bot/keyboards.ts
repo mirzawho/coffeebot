@@ -25,14 +25,24 @@ import { toPersianDigits } from "../utils/dates";
  *  oa:yes:<orderId> / oa:no:<orderId>   admin: approve / reject a card receipt
  *  cx           cancel checkout
  *  hlp          help
+ *  ref          referral section (code + share link + referred count)
+ *  refcode      start the «enter referral code» capture flow
+ *  refcancel    abort the referral-code capture flow
  */
 
 /**
  * Main menu. The cart button is only rendered while the cart has items —
  * an empty cart offers nothing to open. Checkout is NOT offered here: the
  * customer opens the cart and pays from its own view.
+ *
+ * `showReferralEntry` must come from the customer's PERSISTED referral status:
+ * once a customer has a referrer the «استفاده از کد معرف» button disappears.
  */
-export function mainMenu(cartLineCount = 0): InlineKeyboard {
+export function mainMenu(
+  cartLineCount = 0,
+  joinChannelUrl: string | null = null,
+  showReferralEntry = true,
+): InlineKeyboard {
   const kb = new InlineKeyboard();
   kb.text("☕ منوی محصولات", "cats");
   if (cartLineCount > 0) kb.text("🛒 سبد خرید", "cart");
@@ -42,7 +52,42 @@ export function mainMenu(cartLineCount = 0): InlineKeyboard {
     .row()
     .text("📦 سفارش‌های من", "oh")
     .row()
-    .text("ℹ️ راهنما", "hlp");
+    .text("👥 دعوت از دوستان", "ref");
+  if (showReferralEntry) kb.text("🎟 استفاده از کد معرف", "refcode");
+  kb.row().text("ℹ️ راهنما", "hlp");
+  // Optional nudge (never a block): shown only to known non-members.
+  if (joinChannelUrl) {
+    kb.row().url("➕ عضویت در کانال", joinChannelUrl).text("✅ عضو شدم", "ch:check");
+  }
+  return kb;
+}
+
+/**
+ * Referral section: share link (via Telegram's share sheet when the bot
+ * username is known), optional manual-entry button, and a way back home.
+ */
+export function referralSectionKeyboard(
+  botUsername: string | null,
+  code: string,
+  showReferralEntry: boolean,
+): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  const link = botUsername ? `https://t.me/${botUsername}?start=ref_${code}` : null;
+  if (link) {
+    const share = `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(
+      `در کافئنوب ثبت‌نام کن و با کد معرف من ${code} شروع کن!`,
+    )}`;
+    kb.url("🔗 اشتراک‌گذاری لینک دعوت", share);
+  }
+  if (showReferralEntry) kb.text("🎟 استفاده از کد معرف", "refcode");
+  kb.row().text("🏠 منوی اصلی", "m");
+  return kb;
+}
+
+/** Prompt keyboard while waiting for a referral code text. */
+export function referralEntryKeyboard(): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  kb.text("❌ انصراف", "refcancel").text("🏠 منوی اصلی", "m");
   return kb;
 }
 

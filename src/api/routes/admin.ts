@@ -803,7 +803,9 @@ route("GET", "/api/admin/customers", ({ app, url }) => {
         return (
           name.includes(q) ||
           (r.phone ?? "").includes(q) ||
-          (r.username ?? "").toLowerCase().includes(q.toLowerCase())
+          (r.username ?? "").toLowerCase().includes(q.toLowerCase()) ||
+          // Referral-code search (normalized; null for non-codes).
+          app.referrals.lookup(q) === r.telegramId
         );
       })
     : rows;
@@ -886,6 +888,172 @@ route("GET", "/api/admin/customers/:id", ({ app, params }) => {
     })),
     ratings,
   });
+});
+
+/**
+ * Referral tab data for the customer profile: the customer's own code/link,
+ * their current referrer (if any), direct referred customers (paginated),
+ * and a short audit history. The code always comes from the database.
+ */
+route("GET", "/api/admin/customers/:id/referral", ({ app, params, url }) => {
+  const telegramId = num(params.id);
+  const code = app.referrals.ensureCode(telegramId);
+  const offset = Math.max(0, Number(url.searchParams.get("offset") ?? "0") || 0);
+  const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") ?? "20") || 20));
+
+  const relation = app.referrals.getReferrer(telegramId);
+  const referrer = relation
+    ? (() => {
+        const p = app.customers.getProfile(relation.referredBy);
+        return {
+          id: relation.referredBy,
+          name: p?.fullName?.trim() || "بدون نام",
+          username: p?.username ?? null,
+          phone: p?.phone ?? null,
+          referralCode: app.referrals.getCode(relation.referredBy),
+          source: relation.source,
+          createdAt: relation.createdAt,
+        };
+      })()
+    : null;
+
+  const referred = app.referrals.listReferred(telegramId, limit, offset).map((r) => ({
+    id: r.telegramId,
+    name: r.fullName || "بدون نام",
+    username: r.username,
+    referralCode: r.referralCode,
+    createdAt: r.createdAt,
+  }));
+
+  const botUsername = getSetting(app.db, "bot_username").trim() || null;
+  return json({
+    code,
+    link: botUsername ? `https://t.me/${botUsername}?start=ref_${code}` : null,
+    referredCount: app.referrals.countReferred(telegramId),
+    referrer,
+    referred,
+    offset,
+    limit,
+    history: app.referrals.history(telegramId, 10).map((e) => ({
+      action: e.action,
+      actor: e.actor,
+      previousReferredBy: e.previousReferredBy,
+      newReferredBy: e.newReferredBy,
+      createdAt: e.createdAt,
+    })),
+  });
+});
+
+/** Admin: assign or change this customer's referrer (validated server-side). */
+route("POST", "/api/admin/customers/:id/referrer", async ({ app, user, params, req }) => {
+  const telegramId = num(params.id);
+  const body = (await req.json().catch(() => null)) as { referrerId?: unknown } | null;
+  const referrerId = Number(body?.referrerId);
+  if (!Number.isInteger(referrerId) || referrerId <= 0) {
+    return badRequest("شناسه معرف نامعتبر است");
+  }
+  const r = app.referrals.setReferrerByAdmin(telegramId, referrerId, user.id);
+  if (!r.ok) return badRequest(r.error);
+  return json({
+    ok: true,
+    referrer: {
+      id: r.relation.referredBy,
+      name: app.customers.getProfile(r.relation.referredBy)?.fullName?.trim() || "بدون نام",
+      referralCode: r.relation.referralCodeUsed,
+      createdAt: r.relation.createdAt,
+    },
+  });
+});
+
+/** Admin: remove this customer's referrer (customer data is never deleted). */
+route("DELETE", "/api/admin/customers/:id/referrer", ({ app, user, params }) => {
+  const telegramId = num(params.id);
+  const r = app.referrals.removeReferrer(telegramId, user.id);
+  if (!r.ok) return badRequest(r.error);
+  return json({ ok: true });
+});
+
+/**
+ * Unified transaction history for the customer profile: wallet ledger entries
+ * merged with card-to-card order payments, newest first.
+ * Filters: `type` = all | wallet_in | wallet_out | card; `from`/`to` = YYYY-MM-DD.
+ */
+route("GET", "/api/admin/customers/:id/transactions", ({ app, params, url }) => {
+  const telegramId = num(params.id);
+  const type = (url.searchParams.get("type") ?? "all").trim();
+  if (!["all", "wallet_in", "wallet_out", "card"].includes(type)) {
+    return badRequest("نوع تراکنش نامعتبر است");
+  }
+  const from = (url.searchParams.get("from") ?? "").trim();
+  const to = (url.searchParams.get("to") ?? "").trim();
+  if ((from && !isValidDate(from)) || (to && !isValidDate(to))) {
+    return badRequest("بازه زمانی نامعتبر است");
+  }
+
+  const tz = app.config.timezone;
+  const items: any[] = [];
+
+  if (type !== "card") {
+    let sql = "SELECT * FROM wallet_transactions WHERE telegram_id = ?";
+    const args: any[] = [telegramId];
+    if (type === "wallet_in") sql += " AND amount > 0";
+    if (type === "wallet_out") sql += " AND amount < 0";
+    if (from) { sql += " AND substr(created_at, 1, 10) >= ?"; args.push(from); }
+    if (to) { sql += " AND substr(created_at, 1, 10) <= ?"; args.push(to); }
+    sql += " ORDER BY id DESC LIMIT 200";
+    const rows = app.db.query(sql).all(...args) as any[];
+    // Resolve order numbers for order-linked ledger entries (one query).
+    const orderIds = rows.filter((r) => r.ref_type === "order").map((r) => r.ref_id);
+    const orderNums = new Map<number, string>();
+    if (orderIds.length) {
+      const orows = app.db
+        .query(`SELECT id, order_number FROM orders WHERE id IN (${orderIds.map(() => "?").join(",")})`)
+        .all(...orderIds) as { id: number; order_number: string }[];
+      for (const o of orows) orderNums.set(o.id, o.order_number);
+    }
+    for (const r of rows) {
+      items.push({
+        id: `w${r.id}`,
+        source: "wallet",
+        kind: r.kind,
+        kindLabel: WALLET_TX_LABELS[r.kind] ?? "—",
+        amount: r.amount,
+        time: isoToLocalDateTime(r.created_at, tz),
+        note: r.note ?? null,
+        balanceAfter: r.balance_after,
+        orderNumber: r.ref_type === "order" ? orderNums.get(r.ref_id) ?? null : null,
+        paymentStatusLabel: null,
+        fulfillmentLabel: null,
+      });
+    }
+  }
+
+  if (type !== "wallet_in" && type !== "wallet_out") {
+    let sql = "SELECT * FROM orders WHERE customer_telegram_id = ? AND payment_method = 'card_to_card'";
+    const args: any[] = [telegramId];
+    if (from) { sql += " AND substr(created_at, 1, 10) >= ?"; args.push(from); }
+    if (to) { sql += " AND substr(created_at, 1, 10) <= ?"; args.push(to); }
+    sql += " ORDER BY id DESC LIMIT 200";
+    const rows = app.db.query(sql).all(...args) as any[];
+    for (const r of rows) {
+      items.push({
+        id: `o${r.id}`,
+        source: "card",
+        kind: "card_payment",
+        kindLabel: "پرداخت کارت به کارت",
+        amount: -r.total_amount,
+        time: isoToLocalDateTime(r.created_at, tz),
+        note: r.delivery_notes ?? null,
+        balanceAfter: null,
+        orderNumber: r.order_number,
+        paymentStatusLabel: PAYMENT_STATUS_LABELS[r.payment_status] ?? "—",
+        fulfillmentLabel: FULFILLMENT_LABELS[r.fulfillment_status] ?? "—",
+      });
+    }
+  }
+
+  items.sort((a, b) => (a.time < b.time ? 1 : a.time > b.time ? -1 : 0));
+  return json(items.slice(0, 300));
 });
 
 /**

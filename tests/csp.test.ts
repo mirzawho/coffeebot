@@ -21,16 +21,17 @@ describe("CSP (BUG-001 regression)", () => {
     expect(csp).toContain("connect-src 'self'");
   });
 
-  test("keeps img-src restricted to self, data, and specific Telegram photo hosts", () => {
+  test("keeps img-src restricted to self, data, blob, and specific Telegram photo hosts", () => {
     const imgPart = csp.split(";").map((s) => s.trim()).find((s) => s.startsWith("img-src"))!;
     const origins = imgPart.replace("img-src", "").trim().split(/\s+/);
     expect(origins.sort()).toEqual([
       "'self'",
+      "blob:",
       "data:",
       "https://cdn4.telesco.pe",
       "https://t.me",
     ]);
-    // No wildcard image origins — only the two known Telegram profile-photo hosts.
+    // No wildcard image origins — only blob previews and the known Telegram hosts.
     expect(origins.some((o) => o.includes("*"))).toBe(false);
   });
 

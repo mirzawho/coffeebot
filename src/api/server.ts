@@ -14,7 +14,7 @@ const ADMIN_DIR = join(import.meta.dir, "..", "admin");
 const authLimiter = new RateLimiter(5000, 60_000);
 
 const BASE_CSP =
-  "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https://t.me https://cdn4.telesco.pe; connect-src 'self'; frame-ancestors 'self' https://web.telegram.org https://webk.telegram.org https://webz.telegram.org";
+  "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob: https://t.me https://cdn4.telesco.pe; connect-src 'self'; frame-ancestors 'self' https://web.telegram.org https://webk.telegram.org https://webz.telegram.org";
 
 // DEBUG=true only: eruda is loaded from jsdelivr and bootstrapped with an inline
 // script, so both need to be allowed. Never used in production.

@@ -10,6 +10,10 @@ const CustomersPage = (() => {
   let query = "";
   let membershipFilter = ""; // "" | "member" | "not_member" | "unknown" | "none"
   let listBox = null;
+  // Transactions tab filters (shared across profile opens, like query).
+  let txType = "all"; // all | wallet_in | wallet_out | card
+  let txFrom = ""; // YYYY-MM-DD
+  let txTo = ""; // YYYY-MM-DD
 
   function setData(cur) {
     currency = cur || "تومان";
@@ -101,7 +105,7 @@ const CustomersPage = (() => {
       });
     });
     container.appendChild(el("div", { class: "card filter-bar" }, searchWrap,
-      el("div", { style: "margin-top:8px" }, filterSeg.root)));
+      el("div", { style: "margin-top:8px;width:100%" }, filterSeg.root)));
 
     listBox = el("div", { style: "margin-top:12px" });
     container.appendChild(listBox);
@@ -196,23 +200,88 @@ const CustomersPage = (() => {
     );
   }
 
-  function txRow(t) {
+  const TX_TYPE_FILTERS = [
+    { value: "all", label: "همه" },
+    { value: "wallet_out", label: "کاهش کیف پول" },
+    { value: "wallet_in", label: "افزایش کیف پول" },
+    { value: "card", label: "کارت به کارت" },
+  ];
+
+  function txRow(t, onOpen) {
+    const isCard = t.source === "card";
     const positive = t.amount > 0;
+    const sign = isCard ? "−" : positive ? "+" : "−";
+    const color = isCard ? "color:var(--muted)" : positive ? "color:var(--ok)" : "color:var(--danger)";
+    const sub = [formatDateTime(t.time), t.note, t.orderNumber].filter(Boolean).join(" · ");
     return el(
-      "div",
-      { class: "row" },
+      "button",
+      { class: "row tappable", type: "button", onClick: () => onOpen(t) },
       el(
         "div",
         { class: "row-main" },
-        el("div", { class: "row-title", text: t.kindLabel }),
-        el("div", { class: "row-sub", text: `${formatDateTime(t.time)}${t.note ? ` · ${t.note}` : ""} · مانده ${moneyWithCurrency(t.balanceAfter, currency)}` }),
+        el("div", { class: "row-title" },
+          t.kindLabel,
+          isCard && t.paymentStatusLabel
+            ? el("span", { class: "badge", text: t.paymentStatusLabel, style: "margin-inline-start:6px" })
+            : null),
+        el("div", { class: "row-sub", text: sub }),
       ),
       el(
         "span",
-        { class: "row-end order-total", style: positive ? "color:var(--ok)" : "color:var(--danger)" },
-        `${positive ? "+" : "−"}${moneyWithCurrency(Math.abs(t.amount), currency)}`,
+        { class: "row-end order-total", style: color },
+        `${sign}${moneyWithCurrency(Math.abs(t.amount), currency)}`,
       ),
     );
+  }
+
+  /** Detail dialog for one transaction (wallet ledger entry or card payment). */
+  function openTxDetail(t, customerId) {
+    const infoRow = (label, value, isolateLtr) =>
+      el(
+        "div",
+        { class: "row", style: "padding:10px 0" },
+        el("div", { class: "row-main" }, el("div", { class: "row-sub", text: label })),
+        el("span", {
+          class: "row-end",
+          style: "font-weight:600;color:var(--text)",
+        }, isolateLtr && value != null ? el("span", { class: "ltr", text: String(value) }) : value ?? "—"),
+      );
+
+    const isCard = t.source === "card";
+    const amountText = `${t.amount > 0 ? "+" : "−"}${moneyWithCurrency(Math.abs(t.amount), currency)}`;
+
+    const box = el(
+      "div",
+      {},
+      el(
+        "div",
+        { class: "card", style: "padding:4px 14px;margin-bottom:14px" },
+        infoRow("نوع تراکنش", t.kindLabel),
+        infoRow("مبلغ", el("span", { style: t.amount > 0 ? "color:var(--ok)" : "color:var(--danger)", text: amountText })),
+        infoRow("زمان", formatDateTime(t.time)),
+        t.balanceAfter != null ? infoRow("مانده بعد از تراکنش", moneyWithCurrency(t.balanceAfter, currency)) : null,
+        t.note ? infoRow("توضیح", t.note) : null,
+        t.orderNumber ? infoRow("شماره سفارش", t.orderNumber, true) : null,
+        t.paymentStatusLabel ? infoRow("وضعیت پرداخت", t.paymentStatusLabel) : null,
+        t.fulfillmentLabel ? infoRow("وضعیت تحویل", t.fulfillmentLabel) : null,
+      ),
+    );
+
+    if (t.orderNumber) {
+      box.appendChild(
+        el("div", { class: "form-actions" },
+          el("button", {
+            class: "btn secondary",
+            type: "button",
+            text: "مشاهده سفارش",
+            onClick: () =>
+              OrderDetail.open(t.orderNumber, {
+                onClose: () => openDetail(customerId, "tx"),
+              }),
+          })),
+      );
+    }
+    openSheet("جزئیات تراکنش", box);
   }
 
   function depositRow(d) {
@@ -245,21 +314,37 @@ const CustomersPage = (() => {
     );
   }
 
-  /** Opens the customer's Telegram chat by @username in a new tab. */
-  function chatButton(username) {
-    if (!username) return null;
-    return el(
-      "a",
-      {
-        class: "btn small secondary",
-        href: `https://t.me/${encodeURIComponent(username)}`,
-        target: "_blank",
-        rel: "noopener noreferrer",
-        style: "text-decoration:none;width:auto",
-      },
-      el("span", { html: icons.send, style: "width:16px;height:16px;display:flex" }),
-      "گفتگو در تلگرام",
-    );
+  /** 2-column action grid under the phone: Telegram chat + call. */
+  function profileActions(profile) {
+    const btns = [];
+    if (profile?.username) {
+      btns.push(el(
+        "a",
+        {
+          class: "btn small secondary",
+          href: `https://t.me/${encodeURIComponent(profile.username)}`,
+          target: "_blank",
+          rel: "noopener noreferrer",
+          style: "text-decoration:none;justify-content:center",
+        },
+        el("span", { html: icons.send, style: "width:16px;height:16px;display:flex" }),
+        "گفتگو تلگرام",
+      ));
+    }
+    if (profile?.phone) {
+      btns.push(el(
+        "a",
+        {
+          class: "btn small secondary",
+          href: `tel:${profile.phone}`,
+          style: "text-decoration:none;justify-content:center",
+        },
+        el("span", { html: icons.phone, style: "width:16px;height:16px;display:flex" }),
+        "تماس",
+      ));
+    }
+    if (!btns.length) return null;
+    return el("div", { style: "display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px" }, ...btns);
   }
 
   // ---------- wallet adjustment dialog ----------
@@ -375,7 +460,7 @@ const CustomersPage = (() => {
       wrap.appendChild(
         el(
           "div",
-          { class: "card profile-card" },
+          { class: "card profile-card", style: "margin-bottom:14px;align-items:flex-start" },
           avatar,
           el(
             "div",
@@ -387,8 +472,8 @@ const CustomersPage = (() => {
             d.profile?.phone
               ? el("div", { class: "profile-sub" }, el("span", { class: "ltr", text: faDigits(d.profile.phone) }))
               : null,
+            profileActions(d.profile),
           ),
-          chatButton(d.profile?.username),
         ),
       );
       // Telegram identity info (id + username) as a small labeled list.
@@ -426,8 +511,62 @@ const CustomersPage = (() => {
     const ordersPanel = () =>
       section("", d.orders.map((o) => orderRow(o, id)), "هنوز سفارشی ثبت نکرده است.");
 
-    const txPanel = () =>
-      section("", d.transactions.map(txRow), "تراکنشی ثبت نشده است.");
+    const txPanel = () => {
+      const wrap = el("div", {});
+      const seg = Ui.segmented(
+        TX_TYPE_FILTERS.map((f) => ({ value: f.value, label: f.label })),
+        txType,
+      );
+      seg.root.querySelectorAll("button").forEach((b, i) => {
+        b.addEventListener("click", () => {
+          txType = TX_TYPE_FILTERS[i].value;
+          void loadTx();
+        });
+      });
+      const fromInput = el("input", { type: "date", value: txFrom, "aria-label": "از تاریخ" });
+      const toInput = el("input", { type: "date", value: txTo, "aria-label": "تا تاریخ" });
+      fromInput.addEventListener("change", () => { txFrom = fromInput.value; void loadTx(); });
+      toInput.addEventListener("change", () => { txTo = toInput.value; void loadTx(); });
+      wrap.appendChild(el("div", { class: "card filter-bar" },
+        el("div", { style: "width:100%" }, seg.root),
+        el("div", { style: "display:flex;gap:8px;width:100%;margin-top:8px" },
+          el("div", { style: "flex:1" }, fromInput),
+          el("div", { style: "flex:1" }, toInput),
+        ),
+      ));
+      const box = el("div", { style: "margin-top:12px" });
+      wrap.appendChild(box);
+
+      let token = 0;
+      async function loadTx() {
+        const my = ++token;
+        box.innerHTML = "";
+        box.appendChild(loadingState());
+        try {
+          const qs = new URLSearchParams();
+          if (txType && txType !== "all") qs.set("type", txType);
+          if (txFrom) qs.set("from", txFrom);
+          if (txTo) qs.set("to", txTo);
+          const q = qs.toString() ? `?${qs.toString()}` : "";
+          const items = await Api.get(`/api/admin/customers/${id}/transactions${q}`);
+          if (my !== token) return;
+          box.innerHTML = "";
+          if (!items.length) {
+            box.appendChild(emptyState("تراکنشی یافت نشد", "فیلترها را تغییر دهید."));
+            return;
+          }
+          const card = el("div", { class: "card list-card" });
+          for (const t of items) card.appendChild(txRow(t, (tt) => openTxDetail(tt, id)));
+          box.appendChild(card);
+        } catch (err) {
+          if (my !== token) return;
+          box.innerHTML = "";
+          box.appendChild(errorState(err.message, () => void loadTx()));
+        }
+      }
+      void loadTx();
+      return wrap;
+    };
 
     const walletPanel = () => {
       const wrap = el("div", {});
@@ -450,6 +589,190 @@ const CustomersPage = (() => {
       return wrap;
     };
 
+    // --- referral panel (معرفی و زیرمجموعه‌ها) ---
+    const referralPanel = () => {
+      const wrap = el("div", {});
+      const box = el("div", {}, loadingState());
+      wrap.appendChild(box);
+
+      let state = null; // last loaded payload
+      let referredOffset = 0;
+
+      function copyText(text) {
+        const done = () => toast("کپی شد");
+        if (navigator.clipboard?.writeText) {
+          navigator.clipboard.writeText(text).then(done).catch(() => toast("کپی انجام نشد", true));
+        } else {
+          const ta = el("textarea", { style: "position:fixed;opacity:0" });
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          try { document.execCommand("copy"); done(); } catch { toast("کپی انجام نشد", true); }
+          ta.remove();
+        }
+      }
+
+      function customerSub(c) {
+        return [
+          c.username ? `@${c.username}` : null,
+          c.referralCode ? `کد: ${c.referralCode}` : null,
+          c.createdAt ? `تاریخ: ${Ui.jalaliLabel(c.createdAt.slice(0, 10))}` : null,
+        ].filter(Boolean).join(" · ");
+      }
+
+      function referrerCard() {
+        if (!state.referrer) {
+          return el("div", { class: "card", style: "padding:14px;margin-bottom:14px" },
+            el("div", { class: "switch-sub", text: "معرف این مشتری" }),
+            el("div", { style: "margin-top:6px;color:var(--text-dim)", text: "این مشتری با کد معرف ثبت‌نام نکرده است." }));
+        }
+        const r = state.referrer;
+        const link = r.id ? `?customer=${r.id}` : null;
+        return el("div", { class: "card", style: "padding:14px;margin-bottom:14px" },
+          el("div", { class: "switch-sub", text: "معرف این مشتری" }),
+          el("div", { style: "font-weight:700;margin-top:6px" },
+            r.name || "بدون نام",
+            r.username ? el("span", { class: "ltr", style: "margin-inline-start:6px", text: `@${r.username}` }) : null),
+          el("div", { class: "row-sub", style: "margin-top:4px" },
+            r.referralCode ? `کد معرف: ${r.referralCode}` : null,
+            r.phone ? ` · ${faDigits(r.phone)}` : null),
+          el("div", { class: "row-sub", style: "margin-top:2px" },
+            `تاریخ ثبت: ${r.createdAt ? Ui.jalaliLabel(r.createdAt.slice(0, 10)) : "—"}`),
+          el("div", { style: "display:flex;gap:8px;margin-top:10px;flex-wrap:wrap" },
+            el("button", { class: "btn small", type: "button", text: "پروفایل معرف", onClick: () => openDetail(r.id) }),
+            el("button", { class: "btn small ghost danger", type: "button", text: "لغو ارتباط با معرف", onClick: () => void removeReferrer() })),
+        );
+      }
+
+      function referredList() {
+        const items = state.referred || [];
+        const card = section("زیرمجموعه‌ها (مشتریان دعوت‌شده)", items.map((c) =>
+          el("button", { class: "row tappable", type: "button", onClick: () => openDetail(c.id) },
+            el("div", { class: "profile-avatar", style: "width:40px;height:40px;font-size:15px",
+              text: (c.name || "ب").trim().charAt(0) }),
+            el("div", { class: "row-main" },
+              el("div", { class: "row-title", text: c.name || "بدون نام" }),
+              el("div", { class: "row-sub", text: customerSub(c) }))),
+          items.length === 0 ? "هنوز مشتری با کد معرف این شخص ثبت‌نام نکرده است." : null);
+        if (state.referredCount > items.length) {
+          card.appendChild(el("button", {
+            class: "btn small ghost", type: "button", style: "margin:10px auto;display:block",
+            text: "نمایش موارد بیشتر",
+            onClick: () => { referredOffset += state.limit; void load(); },
+          }));
+        }
+        return card;
+      }
+
+      async function setReferrer() {
+        const chosen = await pickCustomer("انتخاب معرف", id);
+        if (!chosen) return;
+        if (!confirm(`«${chosen.name || chosen.id}» به عنوان معرف این مشتری ثبت شود؟`)) return;
+        try {
+          await Api.post(`/api/admin/customers/${id}/referrer`, { referrerId: chosen.id });
+          toast("معرف با موفقیت ثبت شد");
+          await load();
+        } catch (err) {
+          toast(err.message || "ثبت معرف انجام نشد", true);
+        }
+      }
+
+      async function removeReferrer() {
+        if (!confirm("ارتباط این مشتری با معرف حذف شود؟ کد معرف خود مشتری و سایر اطلاعات دست‌نخورده می‌ماند.")) return;
+        try {
+          await Api.del(`/api/admin/customers/${id}/referrer`);
+          toast("ارتباط با معرف حذف شد");
+          await load();
+        } catch (err) {
+          toast(err.message || "حذف ارتباط انجام نشد", true);
+        }
+      }
+
+      async function load() {
+        box.innerHTML = "";
+        box.appendChild(loadingState());
+        try {
+          state = await Api.get(`/api/admin/customers/${id}/referral?offset=${referredOffset}&limit=20`);
+        } catch (err) {
+          box.innerHTML = "";
+          box.appendChild(errorState(err.message, () => void load()));
+          return;
+        }
+        box.innerHTML = "";
+        // A. Own referral code
+        const codeCard = el("div", { class: "card", style: "padding:14px;margin-bottom:14px" },
+          el("div", { class: "switch-sub", text: "کد معرف این مشتری" }),
+          el("div", { style: "display:flex;align-items:center;gap:10px;margin-top:6px;flex-wrap:wrap" },
+            el("span", { class: "ltr", style: "font-size:20px;font-weight:800;letter-spacing:2px", text: state.code }),
+            el("button", { class: "btn small", type: "button", text: "کپی کد", onClick: () => copyText(state.code) })),
+          state.link
+            ? el("div", { style: "margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap" },
+                el("span", { class: "ltr row-sub", style: "word-break:break-all;flex:1;min-width:180px", text: state.link }),
+                el("button", { class: "btn small ghost", type: "button", text: "کپی لینک", onClick: () => copyText(state.link) }))
+            : el("div", { class: "row-sub", style: "margin-top:8px", text: "لینک دعوت پس از روشن شدن ربات در دسترس می‌شود." }),
+          el("div", { style: "margin-top:8px" }, statTile("تعداد زیرمجموعه‌ها", faDigits(state.referredCount))),
+        );
+        box.appendChild(codeCard);
+        // B. Current referrer + admin actions
+        box.appendChild(referrerCard());
+        box.appendChild(el("div", { style: "display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap" },
+          el("button", { class: "btn small", type: "button", text: "تغییر معرف", onClick: () => void setReferrer() })));
+        // C. Referred customers
+        box.appendChild(referredList());
+      }
+
+      void load();
+      return wrap;
+    };
+
+    /** Searchable customer picker. Resolves to a customer row or null. */
+    function pickCustomer(title, excludeId) {
+      return new Promise((resolve) => {
+        const results = el("div", { style: "margin-top:10px;max-height:260px;overflow:auto" });
+        const input = el("input", { type: "text", placeholder: "جستجو بر اساس نام، یوزرنیم، تلفن یا کد…", style: "width:100%" });
+        let timer = null;
+        input.addEventListener("input", () => {
+          clearTimeout(timer);
+          const q = input.value.trim();
+          if (q.length < 1) { results.innerHTML = ""; return; }
+          timer = setTimeout(async () => {
+            try {
+              const list = await Api.get(`/api/admin/customers?q=${encodeURIComponent(q)}`);
+              results.innerHTML = "";
+              const matches = list.filter((c) => c.id !== excludeId).slice(0, 20);
+              if (!matches.length) {
+                results.appendChild(el("div", { class: "row-sub", style: "padding:10px 0", text: "مشتری‌ای یافت نشد." }));
+                return;
+              }
+              for (const c of matches) {
+                results.appendChild(el("button", {
+                  class: "row tappable", type: "button",
+                  onClick: () => { closeSheet(); resolve(c); },
+                },
+                  el("div", { class: "profile-avatar", style: "width:36px;height:36px;font-size:14px", text: (c.name || "ب").trim().charAt(0) }),
+                  el("div", { class: "row-main" },
+                    el("div", { class: "row-title", text: c.name || "بدون نام" }),
+                    el("div", { class: "row-sub", text: [
+                      c.username ? `@${c.username}` : null,
+                      c.phone ? faDigits(c.phone) : null,
+                      `شناسه: ${c.id}`,
+                    ].filter(Boolean).join(" · ") }))));
+              }
+            } catch {
+              results.innerHTML = "";
+              results.appendChild(el("div", { class: "row-sub", style: "padding:10px 0", text: "جستجو انجام نشد." }));
+            }
+          }, 250);
+        });
+        openSheet(title, el("div", {},
+          el("div", { class: "form-field" }, input),
+          results,
+          el("div", { class: "form-actions" },
+            el("button", { class: "btn ghost", type: "button", text: "انصراف", onClick: () => { closeSheet(); resolve(null); } }))));
+        setTimeout(() => input.focus(), 50);
+      });
+    }
+
     box.appendChild(
       Ui.tabs(
         [
@@ -457,6 +780,7 @@ const CustomersPage = (() => {
           { key: "orders", label: "سفارش‌ها", icon: icons.order, build: ordersPanel },
           { key: "tx", label: "تراکنش‌ها", icon: icons.chart, build: txPanel },
           { key: "wallet", label: "کیف پول", icon: icons.wallet, build: walletPanel },
+          { key: "referral", label: "معرفی و زیرمجموعه‌ها", icon: icons.send, build: referralPanel },
         ],
         initialTab || "profile",
       ),
@@ -507,8 +831,8 @@ const CustomersPage = (() => {
         : null,
       infoRow("آخرین بررسی", m.checkedAt || "—", false),
       m.enforcementEnabled
-        ? el("div", { class: "field-hint", style: "margin:4px 0 0", text: "الزام عضویت فعال است؛ مشتریان غیرعضو نمی‌توانند از ربات استفاده کنند." })
-        : el("div", { class: "field-hint", style: "margin:4px 0 0", text: "الزام عضویت غیرفعال است (فقط نمایش وضعیت)." }),
+        ? el("div", { class: "field-hint", style: "margin:4px 0 0", text: "دکمه عضویت کانال برای مشتریان غیرعضو در منوی اصلی ربات نمایش داده می‌شود (اجباری نیست)." })
+        : el("div", { class: "field-hint", style: "margin:4px 0 0", text: "نمایش دکمه عضویت کانال در ربات غیرفعال است (فقط نمایش وضعیت)." }),
       !m.configuredChannel
         ? el("div", { class: "field-hint", style: "margin:4px 0 0", text: "برای بررسی، ابتدا کانال را در تنظیمات عضویت کانال پیکربندی کنید." })
         : null,

@@ -14,6 +14,7 @@ import { loadConfig } from "../src/config";
 import { ReportService } from "../src/services/reports";
 import { NotificationService } from "../src/services/notifications";
 import { ChannelMembershipService } from "../src/services/membership";
+import { ReferralService } from "../src/services/referrals";
 import { Scheduler } from "../src/scheduler";
 
 let db: Db;
@@ -455,6 +456,7 @@ describe("admin order lifecycle API", () => {
       customers,
       loyalty,
       membership: new ChannelMembershipService(db),
+    referrals: new ReferralService(db),
     };
   });
 
@@ -840,6 +842,7 @@ describe("admin payment review API", () => {
       customers,
       loyalty,
       membership: new ChannelMembershipService(db),
+    referrals: new ReferralService(db),
     };
   });
 
@@ -1083,6 +1086,7 @@ describe("payment method switches", () => {
       customers,
       loyalty,
       membership: new ChannelMembershipService(db),
+    referrals: new ReferralService(db),
     };
   });
 

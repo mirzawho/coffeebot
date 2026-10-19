@@ -38,6 +38,7 @@ import { MAX_ITEM_QUANTITY } from "../../utils/ids";
 import { log } from "../../utils/logger";
 import { cardToCardAvailable } from "../../services/settings";
 import { walletKeyboard, ratingKeyboard } from "../keyboards";
+import { membershipJoinUrl } from "../guards/channel-membership";
 import { NO_ORDERS_TEXT, customerOrderDetailText, FULFILLMENT_LABELS } from "../format";
 import type { Order } from "../../services/orders";
 import {
@@ -46,12 +47,20 @@ import {
   profileWizardSkip,
   startProfileWizard,
 } from "../profile-wizard";
+import { menuFor } from "./messages";
+import {
+  REFERRAL_CANCELLED_TEXT,
+  REFERRAL_CODE_PROMPT_TEXT,
+  referralSectionText,
+} from "../format";
+import { referralSectionKeyboard, referralEntryKeyboard } from "../keyboards";
+import { getSetting } from "../../services/settings";
 
 /** Show the main menu (edits when possible, otherwise sends). */
 export async function showMainMenu(ctx: Context, app: BotApp, edit = false): Promise<void> {
   const userId = ctx.from!.id;
   const text = `${WELCOME_TEXT}\n\nساعات کاری: ${app.businessHours.isOpenAt(new Date()) ? "🟢 باز" : "🔴 بسته"} | بازگشایی: ${app.businessHours.nextOpeningLabel(new Date())}`;
-  const kb = mainMenu(app.cart.lineCount(userId));
+  const kb = menuFor(app, userId, await membershipJoinUrl(app, userId));
   if (edit) {
     try {
       await ctx.editMessageText(text, { reply_markup: kb });
@@ -64,7 +73,7 @@ export async function showMainMenu(ctx: Context, app: BotApp, edit = false): Pro
 }
 
 export async function showHelp(ctx: Context, app: BotApp, edit = false): Promise<void> {
-  const kb = mainMenu(app.cart.lineCount(ctx.from!.id));
+  const kb = menuFor(app, ctx.from!.id);
   if (edit) {
     try {
       await ctx.editMessageText(HELP_TEXT, { reply_markup: kb });
@@ -76,6 +85,45 @@ export async function showHelp(ctx: Context, app: BotApp, edit = false): Promise
   await ctx.reply(HELP_TEXT, { reply_markup: kb });
 }
 
+/** Referral section: own code, referred count, share link, manual entry. */
+async function showReferralSection(ctx: Context, app: BotApp): Promise<void> {
+  const userId = ctx.from!.id;
+  const code = app.referrals.ensureCode(userId);
+  const count = app.referrals.countReferred(userId);
+  const showEntry = app.referrals.getReferrer(userId) === null;
+  const botUsername =
+    (ctx as any).me?.username?.trim() || getSetting(app.db, "bot_username").trim() || null;
+  const kb = referralSectionKeyboard(botUsername, code, showEntry);
+  const text = referralSectionText(code, count, botUsername);
+  try {
+    await ctx.editMessageText(text, { reply_markup: kb });
+    return;
+  } catch {
+    /* message unchanged or too old — send fresh */
+  }
+  await ctx.reply(text, { reply_markup: kb });
+}
+
+/** Arm the referral-code capture flow and ask for the code. */
+async function startReferralCodeEntry(ctx: Context, app: BotApp): Promise<void> {
+  const userId = ctx.from!.id;
+  if (app.referrals.getReferrer(userId)) {
+    // Defensive: the button is hidden, but persisted state wins.
+    await ctx.reply("شما قبلاً با کد معرف ثبت‌نام کرده‌اید و امکان تغییر آن نیست.", {
+      reply_markup: menuFor(app, userId),
+    });
+    return;
+  }
+  app.referralFlow.expect(userId);
+  await ctx.reply(REFERRAL_CODE_PROMPT_TEXT, { reply_markup: referralEntryKeyboard() });
+}
+
+async function cancelReferralCodeEntry(ctx: Context, app: BotApp): Promise<void> {
+  const userId = ctx.from!.id;
+  app.referralFlow.clear(userId);
+  await ctx.reply(REFERRAL_CANCELLED_TEXT, { reply_markup: menuFor(app, userId) });
+}
+
 async function showCategories(ctx: Context, app: BotApp, edit = false): Promise<void> {
   const categories = app.menu.listCategories(false);
   const text =
@@ -84,7 +132,7 @@ async function showCategories(ctx: Context, app: BotApp, edit = false): Promise<
       : "دسته‌بندی مورد نظر را انتخاب کنید:";
   const kb = categories.length > 0
     ? categoriesKeyboard(categories)
-    : mainMenu(app.cart.lineCount(ctx.from!.id));
+    : menuFor(app, ctx.from!.id);
   if (edit) {
     try {
       await ctx.editMessageText(text, { reply_markup: kb });
@@ -198,7 +246,7 @@ export async function startCheckoutFlow(ctx: Context, app: BotApp): Promise<void
   }
   const result = app.orders.startCheckout(userId);
   if (!result.ok) {
-    await ctx.reply(result.error, { reply_markup: mainMenu(app.cart.lineCount(userId)) });
+    await ctx.reply(result.error, { reply_markup: menuFor(app, userId) });
     return;
   }
   // One message: order summary + payment-method choice (previously two).
@@ -298,7 +346,7 @@ export async function finalizeOrder(
       return;
     }
     await ctx.reply(result.reason === "empty" ? "سبد خرید شما خالی است." : result.error, {
-      reply_markup: mainMenu(app.cart.lineCount(userId)),
+      reply_markup: menuFor(app, userId),
     });
     return;
   }
@@ -371,6 +419,9 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
 
   if (data === "m") return showMainMenu(ctx, app, true);
   if (data === "hlp") return showHelp(ctx, app, true);
+  if (data === "ref") return showReferralSection(ctx, app);
+  if (data === "refcode") return startReferralCodeEntry(ctx, app);
+  if (data === "refcancel") return cancelReferralCodeEntry(ctx, app);
   if (data === "cats") return showCategories(ctx, app, true);
   if (data === "cart") return showCart(ctx, app, true);
 
@@ -711,7 +762,7 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
 
   if (data === "cx") {
     app.cart.resetCheckout(userId);
-    await ctx.reply("عملیات خرید لغو شد.", { reply_markup: mainMenu(app.cart.lineCount(userId)) });
+    await ctx.reply("عملیات خرید لغو شد.", { reply_markup: menuFor(app, userId) });
     return;
   }
 
@@ -853,7 +904,7 @@ async function showOrderHistory(ctx: Context, app: BotApp, offset: number): Prom
   const PAGE = 5;
   const orders = app.orders.listForCustomer(userId, PAGE + 1, offset);
   if (orders.length === 0 && offset === 0) {
-    await ctx.reply(NO_ORDERS_TEXT, { reply_markup: mainMenu(app.cart.lineCount(userId)) });
+    await ctx.reply(NO_ORDERS_TEXT, { reply_markup: menuFor(app, userId) });
     return;
   }
   const page = orders.slice(0, PAGE);

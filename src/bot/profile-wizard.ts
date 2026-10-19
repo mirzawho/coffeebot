@@ -1,6 +1,7 @@
 import type { Context } from "grammy";
 import type { BotApp } from "./context";
-import { mainMenu, profileWizardKeyboard } from "./keyboards";
+import { profileWizardKeyboard } from "./keyboards";
+import { menuFor } from "./handlers/messages";
 import { MAX_ADDRESS_LENGTH, normalizePhone } from "../services/customers";
 import { toPersianDigits } from "../utils/dates";
 
@@ -175,7 +176,7 @@ export async function profileWizardCancel(ctx: Context, app: BotApp): Promise<vo
   const userId = ctx.from!.id;
   app.profileEdit.clear(userId);
   wizardState.delete(userId);
-  await ctx.reply("ویرایش پروفایل لغو شد.", { reply_markup: mainMenu(app.cart.lineCount(userId)) });
+  await ctx.reply("ویرایش پروفایل لغو شد.", { reply_markup: menuFor(app, userId) });
 }
 
 /** Validate the collected fields and persist the profile. */
@@ -223,6 +224,6 @@ async function finishWizard(ctx: Context, app: BotApp): Promise<void> {
       `موبایل: ${r.profile.phone ? toPersianDigits(r.profile.phone) : "—"}`,
       r.profile.address ? `آدرس: ${r.profile.address}` : "آدرس: ثبت نشده",
     ].join("\n"),
-    { reply_markup: mainMenu(app.cart.lineCount(userId)) },
+    { reply_markup: menuFor(app, userId) },
   );
 }

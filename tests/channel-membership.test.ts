@@ -18,13 +18,14 @@ import {
   mapChatMemberStatus,
   DEFAULT_JOIN_MESSAGE,
 } from "../src/services/membership";
+import { ReferralService } from "../src/services/referrals";
 import {
   channelMembershipGuard,
+  membershipJoinUrl,
   MEMBERSHIP_RECHECK_CB,
-  MEMBERSHIP_VERIFY_FAILED_TEXT,
   MEMBERSHIP_GRANTED_TEXT,
 } from "../src/bot/guards/channel-membership";
-import { joinChannelKeyboard } from "../src/bot/keyboards";
+import { mainMenu, joinChannelKeyboard } from "../src/bot/keyboards";
 import { registerMessageHandlers } from "../src/bot/handlers/messages";
 import { registerCallbackHandlers } from "../src/bot/handlers/callbacks";
 import { createMockAiService, type AiResult } from "../src/services/ollama";
@@ -98,9 +99,11 @@ function buildBotApp(membership: ChannelMembershipService): BotApp {
     loyalty: new LoyaltyService(db),
     notifications: new NotificationService(db),
     membership,
+    referrals: new ReferralService(db),
     profileEdit: new TextCaptureFlow(),
     depositFlow: new TextCaptureFlow(),
     rejectReasonFlow: new TextCaptureFlow(),
+    referralFlow: new TextCaptureFlow(),
   };
 }
 
@@ -357,113 +360,63 @@ describe("join-channel keyboard", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Central guard behavior
+// Guard behavior: membership is OPTIONAL — never blocks, only handles recheck
 // ---------------------------------------------------------------------------
 
 describe("channelMembershipGuard", () => {
-  test("1. disabled: customer text passes straight through", async () => {
+  test("customer text always passes through, member or not", async () => {
+    enableEnforcement();
+    const membership = new ChannelMembershipService(db);
+    attachFakeApi(membership);
+    const app = buildBotApp(membership);
+    chatMembers.set(CUSTOMER, { status: "left" });
+    expect((await runGuard(app, msgCtx("سلام"))).passed).toBe(true);
+    chatMembers.set(CUSTOMER, { status: "member" });
+    expect((await runGuard(app, msgCtx("سلام", CUSTOMER))).passed).toBe(true);
+  });
+
+  test("disabled feature: no API calls, text passes", async () => {
     const membership = new ChannelMembershipService(db);
     attachFakeApi(membership);
     const app = buildBotApp(membership);
     const r = await runGuard(app, msgCtx("سلام"));
     expect(r.passed).toBe(true);
-    expect(r.replies.length).toBe(0);
     expect(apiCalls.length).toBe(0);
   });
 
-  test("1b. enabled but no valid channel: still no blocking", async () => {
-    // Enable flag without a channel is refused by updateMembershipSettings;
-    // simulate drift by writing the setting directly.
-    db.query("UPDATE settings SET value = '1' WHERE key = 'channel_membership_enabled'").run();
-    const membership = new ChannelMembershipService(db);
-    attachFakeApi(membership);
-    const app = buildBotApp(membership);
-    const r = await runGuard(app, msgCtx("سلام"));
-    expect(r.passed).toBe(true);
-  });
-
-  test("2. a member is allowed through", async () => {
+  test("callbacks pass through for non-members (nothing is blocked)", async () => {
     enableEnforcement();
     const membership = new ChannelMembershipService(db);
     attachFakeApi(membership);
-    chatMembers.set(CUSTOMER, { status: "member" });
+    chatMembers.set(CUSTOMER, { status: "left" });
     const app = buildBotApp(membership);
-    const r = await runGuard(app, msgCtx("سلام"));
-    expect(r.passed).toBe(true);
-    expect(r.replies.length).toBe(0);
-  });
-
-  test("3. administrator and creator are treated as members", async () => {
-    enableEnforcement();
-    for (const status of ["administrator", "creator"]) {
-      db.exec("DELETE FROM channel_membership");
-      const membership = new ChannelMembershipService(db);
-      attachFakeApi(membership);
-      chatMembers.set(CUSTOMER, { status });
-      const app = buildBotApp(membership);
-      const r = await runGuard(app, msgCtx("سلام"));
-      expect(r.passed, status).toBe(true);
+    for (const data of ["co", "cart", "m", "cats", "pm:c", "wdep"]) {
+      const r = await runGuard(app, cbCtx(data));
+      expect(r.passed, data).toBe(true);
     }
   });
 
-  test("4. left/kicked users are restricted with the join prompt + keyboard", async () => {
+  test("recheck is a fresh verification: join then «عضو شدم» confirms", async () => {
     enableEnforcement();
     const membership = new ChannelMembershipService(db);
     attachFakeApi(membership);
     chatMembers.set(CUSTOMER, { status: "left" });
     const app = buildBotApp(membership);
-    const r = await runGuard(app, msgCtx("سلام"));
-    expect(r.passed).toBe(false);
-    expect(r.replies.length).toBe(1);
-    expect(r.replies[0]!.text).toBe(DEFAULT_JOIN_MESSAGE);
-    const kb = JSON.stringify(r.replies[0]!.opts?.reply_markup);
-    expect(kb).toContain("https://t.me/my_cafe_channel");
-    expect(kb).toContain(MEMBERSHIP_RECHECK_CB);
-  });
-
-  test("5. restricted with is_member=true is allowed; is_member=false is blocked", async () => {
-    enableEnforcement();
-    const membership = new ChannelMembershipService(db);
-    attachFakeApi(membership);
-    chatMembers.set(CUSTOMER, { status: "restricted", is_member: true });
-    expect((await runGuard(buildBotApp(membership), msgCtx("x"))).passed).toBe(true);
-    // is_member=false is a different user so the cache does not interfere.
-    chatMembers.set(666, { status: "restricted", is_member: false });
-    expect((await runGuard(buildBotApp(membership), msgCtx("x", 666))).passed).toBe(false);
-  });
-
-  test("6. custom join message replaces the default", async () => {
-    enableEnforcement("@my_cafe_channel", "پیام سفارشی مدیر");
-    const membership = new ChannelMembershipService(db);
-    attachFakeApi(membership);
-    chatMembers.set(CUSTOMER, { status: "left" });
-    const r = await runGuard(buildBotApp(membership), msgCtx("سلام"));
-    expect(r.replies[0]!.text).toBe("پیام سفارشی مدیر");
-  });
-
-  test("7+8. recheck is a fresh verification; joining after a block grants access", async () => {
-    enableEnforcement();
-    const membership = new ChannelMembershipService(db);
-    attachFakeApi(membership);
-    chatMembers.set(CUSTOMER, { status: "left" });
-    const app = buildBotApp(membership);
-    // Blocked initially.
-    expect((await runGuard(app, msgCtx("سلام"))).passed).toBe(false);
-    // The customer joins...
+    await runGuard(app, msgCtx("سلام")); // warm the cache with not_member
     chatMembers.set(CUSTOMER, { status: "member" });
-    // ...and presses «عضو شدم، بررسی کن». The recheck must hit the API fresh.
     const callsBefore = apiCalls.length;
     const rc = await runGuard(app, cbCtx(MEMBERSHIP_RECHECK_CB));
     expect(rc.passed).toBe(false); // recheck itself never falls through
-    expect(apiCalls.length).toBe(callsBefore + 1);
-    const shown = [...rc.replies, ...rc.edits].map((x) => x.text).join("\n");
+    expect(apiCalls.length).toBe(callsBefore + 1); // fresh, cache bypassed
+    const shown = [...rc.replies, ...rc.answers, ...rc.edits]
+      .map((x) => x?.text ?? "")
+      .join("\n");
     expect(shown).toContain("تأیید شد");
-    // The next interaction now passes without any extra recheck press.
-    const after = await runGuard(app, msgCtx("سلام دوباره"));
-    expect(after.passed).toBe(true);
+    // The menu edit (when possible) shows the granted text.
+    expect(rc.edits.some((e) => e.text === MEMBERSHIP_GRANTED_TEXT)).toBe(true);
   });
 
-  test("recheck while still not a member keeps the restriction", async () => {
+  test("recheck while still not a member answers with an alert", async () => {
     enableEnforcement();
     const membership = new ChannelMembershipService(db);
     attachFakeApi(membership);
@@ -472,77 +425,84 @@ describe("channelMembershipGuard", () => {
     const rc = await runGuard(app, cbCtx(MEMBERSHIP_RECHECK_CB));
     expect(rc.passed).toBe(false);
     expect(rc.answers.some((a) => a?.show_alert)).toBe(true);
-    const after = await runGuard(app, msgCtx("سلام"));
-    expect(after.passed).toBe(false);
   });
 
-  test("9. API failure -> unknown state, retry-friendly message, NOT a non-member claim", async () => {
+  test("recheck on API failure answers retry-friendly, never claims non-membership", async () => {
     enableEnforcement();
     const membership = new ChannelMembershipService(db);
     attachFakeApi(membership);
     apiShouldThrow = true;
     const app = buildBotApp(membership);
-    const r = await runGuard(app, msgCtx("سلام"));
-    expect(r.passed).toBe(false); // fail-closed: access withheld until verified
-    expect(r.replies.length).toBe(1);
-    expect(r.replies[0]!.text).toContain("ممکن نیست");
-    expect(r.replies[0]!.text).not.toBe(DEFAULT_JOIN_MESSAGE);
-    // Persisted as unknown, not not_member.
+    const rc = await runGuard(app, cbCtx(MEMBERSHIP_RECHECK_CB));
+    expect(rc.passed).toBe(false);
+    const shown = rc.answers.map((a) => a?.text ?? "").join("\n");
+    expect(shown).toContain("بررسی ناموفق");
     expect(membership.recordFor(CUSTOMER)?.status).toBe("unknown");
   });
 
-  test("10. callback actions cannot bypass the guard", async () => {
-    enableEnforcement();
-    const membership = new ChannelMembershipService(db);
-    attachFakeApi(membership);
-    chatMembers.set(CUSTOMER, { status: "left" });
-    const app = buildBotApp(membership);
-    for (const data of ["co", "cart", "m", "cats", "pm:c", "wdep"]) {
-      const r = await runGuard(app, cbCtx(data));
-      expect(r.passed, data).toBe(false);
-      expect(r.answers.some((a) => a?.show_alert), data).toBe(true);
-    }
-    // Cart untouched.
-    expect(app.cart.getTotals(CUSTOMER).lines.length).toBe(0);
-  });
-
-  test("11. administrators are exempt even when not channel members", async () => {
-    enableEnforcement();
-    const membership = new ChannelMembershipService(db);
-    attachFakeApi(membership);
-    // Admin never appears in chatMembers — if the guard queried, it would throw.
-    const app = buildBotApp(membership);
-    const r = await runGuard(app, msgCtx("سلام", ADMIN));
-    expect(r.passed).toBe(true);
-    expect(apiCalls.length).toBe(0); // not even queried
-    // Admin callbacks also pass.
-    const cb = await runGuard(app, cbCtx("oa:yes:1", ADMIN));
-    expect(cb.passed).toBe(true);
-  });
-
-  test("updates without a user pass through", async () => {
-    enableEnforcement();
+  test("recheck when the feature was turned off answers and lets the user be", async () => {
     const membership = new ChannelMembershipService(db);
     attachFakeApi(membership);
     const app = buildBotApp(membership);
-    const r = await runGuard(app, { message: { text: "channel post" } });
-    expect(r.passed).toBe(true);
+    const rc = await runGuard(app, cbCtx(MEMBERSHIP_RECHECK_CB));
+    expect(rc.passed).toBe(false);
+    expect(rc.answers.length).toBe(1);
+    expect(apiCalls.length).toBe(0);
   });
 
-  test("the guard only ever checks ctx.from.id — never callback-supplied ids", async () => {
+  test("the recheck only ever checks ctx.from.id", async () => {
     enableEnforcement();
     const membership = new ChannelMembershipService(db);
     attachFakeApi(membership);
     chatMembers.set(CUSTOMER, { status: "member" });
     chatMembers.set(99999, { status: "left" });
     const app = buildBotApp(membership);
-    // A member presses a callback; even if callback data tried to name
-    // another user (it can't — data is opaque), only 555 is verified.
     const r = await runGuard(app, { ...cbCtx("ch:check:99999"), from: { id: CUSTOMER } });
-    // "ch:check:99999" is not the exact recheck action, so it is treated as a
-    // regular callback: 555 (member) passes, 99999 is never queried.
+    // Not the exact recheck action — treated as a regular callback.
     expect(r.passed).toBe(true);
     expect(apiCalls.every((c) => c.userId === CUSTOMER)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// membershipJoinUrl + main menu nudge
+// ---------------------------------------------------------------------------
+
+describe("membershipJoinUrl (main-menu nudge)", () => {
+  test("null when the feature is disabled", async () => {
+    const membership = new ChannelMembershipService(db);
+    attachFakeApi(membership);
+    const app = buildBotApp(membership);
+    expect(await membershipJoinUrl(app, CUSTOMER)).toBeNull();
+    expect(apiCalls.length).toBe(0);
+  });
+
+  test("null for members; URL for confirmed non-members", async () => {
+    enableEnforcement();
+    const membership = new ChannelMembershipService(db);
+    attachFakeApi(membership);
+    const app = buildBotApp(membership);
+    chatMembers.set(CUSTOMER, { status: "member" });
+    expect(await membershipJoinUrl(app, CUSTOMER)).toBeNull();
+    chatMembers.set(666, { status: "left" });
+    expect(await membershipJoinUrl(app, 666)).toBe("https://t.me/my_cafe_channel");
+  });
+
+  test("null on API failure (unknown is never treated as non-member)", async () => {
+    enableEnforcement();
+    const membership = new ChannelMembershipService(db);
+    attachFakeApi(membership);
+    apiShouldThrow = true;
+    const app = buildBotApp(membership);
+    expect(await membershipJoinUrl(app, CUSTOMER)).toBeNull();
+  });
+
+  test("mainMenu appends the join row only when a URL is given", () => {
+    const plain = JSON.stringify(mainMenu(0));
+    expect(plain).not.toContain("ch:check");
+    const withNudge = JSON.stringify(mainMenu(0, "https://t.me/my_cafe_channel"));
+    expect(withNudge).toContain("https://t.me/my_cafe_channel");
+    expect(withNudge).toContain(MEMBERSHIP_RECHECK_CB);
   });
 });
 
@@ -604,7 +564,7 @@ describe("guard + real handlers integration", () => {
     expect(ctx._replies.length).toBe(1); // AI mock replied
   });
 
-  test("a blocked member's text never reaches the AI handler", async () => {
+  test("a non-member's text still reaches the AI handler (membership never blocks)", async () => {
     enableEnforcement();
     const membership = new ChannelMembershipService(db);
     attachFakeApi(membership);
@@ -612,12 +572,10 @@ describe("guard + real handlers integration", () => {
     const app = buildBotApp(membership);
     const bot = fakeBot();
     registerMessageHandlers(bot, app);
-    const { passed, ctx } = await guardedText(app, bot, "دو تا آب اضافه کن");
-    expect(passed).toBe(false);
-    // Only the join prompt — no AI reply, no cart mutation.
+    const { passed, ctx } = await guardedText(app, bot, "سلام");
+    expect(passed).toBe(true);
     expect(ctx._replies.length).toBe(1);
-    expect(ctx._replies[0]!.text).toBe(DEFAULT_JOIN_MESSAGE);
-    expect(app.cart.getTotals(CUSTOMER).lines.length).toBe(0);
+    expect(ctx._replies[0]!.text).toBe("ok");
   });
 
   test("a member's text reaches the handlers normally", async () => {
@@ -634,7 +592,7 @@ describe("guard + real handlers integration", () => {
     expect(ctx._replies[0]!.text).toBe("ok");
   });
 
-  test("a blocked non-member cannot press checkout via callbacks", async () => {
+  test("a non-member can press checkout via callbacks (nothing is blocked)", async () => {
     enableEnforcement();
     const membership = new ChannelMembershipService(db);
     attachFakeApi(membership);
@@ -645,16 +603,12 @@ describe("guard + real handlers integration", () => {
     const menu = new MenuService(db);
     const cat = menu.listCategories(false)[0]!;
     const prod = menu.listProducts(cat.id, false)[0]!;
-    app.cart.addItem(CUSTOMER, prod.id, null, 1); // seeded outside the guard
+    app.cart.addItem(CUSTOMER, prod.id, null, 1);
 
-    const answers: any[] = [];
     const ctx = {
       from: { id: CUSTOMER },
       callbackQuery: { data: "co" },
-      answerCallbackQuery: async (o?: any) => {
-        answers.push(o);
-        return {} as any;
-      },
+      answerCallbackQuery: async () => ({}) as any,
       reply: async () => ({}) as any,
       editMessageText: async () => ({}) as any,
     };
@@ -664,10 +618,9 @@ describe("guard + real handlers integration", () => {
       passed = true;
       await bot._handlers.get("callback_query")!(ctx);
     });
-    expect(passed).toBe(false);
-    // Checkout never started.
-    expect(app.cart.get(CUSTOMER)?.state).toBe("browsing");
-    expect(answers.some((a) => a?.show_alert)).toBe(true);
+    expect(passed).toBe(true);
+    // Checkout started normally.
+    expect(app.cart.get(CUSTOMER)?.state).toBe("checkout_payment");
   });
 });
 
@@ -720,6 +673,7 @@ describe("admin API: channel membership", () => {
       customers: new CustomersService(db),
       loyalty: new LoyaltyService(db),
       membership,
+      referrals: new ReferralService(db),
     };
   });
 

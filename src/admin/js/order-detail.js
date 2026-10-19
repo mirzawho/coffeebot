@@ -6,7 +6,7 @@
 
 const OrderDetail = (() => {
   const { el, icons, toast, openSheet, field, textInput, loadingState, errorState,
-    moneyWithCurrency, faDigits, segmented } = Ui;
+    moneyWithCurrency, money, faDigits, segmented } = Ui;
 
   // Mirrors of the server limits (src/utils/ids.ts) for client-side steering;
   // the server re-validates everything on save.
@@ -148,7 +148,7 @@ const OrderDetail = (() => {
               "div",
               { class: "row-main" },
               el("div", { class: "row-title", text: it.variantName ? `${it.productName} — ${it.variantName}` : it.productName }),
-              el("div", { class: "row-sub", text: `${faDigits(it.quantity)} × ${faDigits(it.unitPrice)}` }),
+              el("div", { class: "row-sub", text: `${faDigits(it.quantity)} × ${money(it.unitPrice)}` }),
             ),
             el("span", { class: "row-end order-total", text: moneyWithCurrency(it.lineTotal, o.currency) }),
           ),
@@ -178,7 +178,7 @@ const OrderDetail = (() => {
     const actions = el("div", { class: "form-actions" });
 
     if (o.fulfillmentStatus !== "delivered" && o.fulfillmentStatus !== "cancelled") {
-      const editBtn = el("button", { class: "btn secondary", type: "button", text: "✏️ ویرایش سفارش" });
+      const editBtn = el("button", { class: "btn secondary", type: "button", text: "ویرایش سفارش" });
       editBtn.addEventListener("click", () => openEdit(o, opts));
       actions.appendChild(editBtn);
     }
@@ -200,7 +200,7 @@ const OrderDetail = (() => {
       return b;
     };
     if (o.fulfillmentStatus === "pending") {
-      actions.appendChild(mkAction("✅ تأیید سفارش", `/api/admin/orders/${encodeURIComponent(o.orderNumber)}/confirm`));
+      actions.appendChild(mkAction("تأیید سفارش", `/api/admin/orders/${encodeURIComponent(o.orderNumber)}/confirm`));
     } else if (o.fulfillmentStatus === "confirmed") {
       actions.appendChild(mkAction("📦 تحویل داده شد", `/api/admin/orders/${encodeURIComponent(o.orderNumber)}/deliver`));
     }
@@ -216,11 +216,16 @@ const OrderDetail = (() => {
       { class: "card", style: "padding:12px 14px;margin-bottom:14px" },
       el(
         "div",
-        { style: "display:flex;justify-content:space-between;font-weight:700" },
+        { style: "display:flex;justify-content:space-between;font-weight:700;align-items:center" },
         el("span", { text: "پرداخت" }),
-        el("span", { text: o.paymentMethodLabel }),
+        el("div", { style: "display:flex;gap:6px;align-items:center" },
+          el("span", { class: "badge info", text: o.paymentMethodLabel }),
+          el("span", {
+            class: o.paymentStatus === "paid" ? "badge" : o.paymentStatus === "rejected" ? "badge off" : "badge warn",
+            text: o.paymentLabel,
+          }),
+        ),
       ),
-      el("div", { style: "font-size:13px;color:var(--muted);margin-top:6px", text: `وضعیت: ${o.paymentLabel}` }),
     );
 
     if (o.hasReceipt) {
@@ -344,7 +349,7 @@ const OrderDetail = (() => {
                 class: "row-sub",
                 text: l.productId == null
                   ? "شناسه محصول ثبت نشده — این قلم قابل ویرایش نیست"
-                  : `${faDigits(l.quantity)} × ${faDigits(l.unitPrice)}`,
+                  : `${faDigits(l.quantity)} × ${money(l.unitPrice)}`,
               }),
             ),
             el(

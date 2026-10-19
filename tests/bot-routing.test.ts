@@ -21,6 +21,7 @@ import { CustomersService } from "../src/services/customers";
 import { LoyaltyService } from "../src/services/loyalty";
 import { NotificationService } from "../src/services/notifications";
 import { ChannelMembershipService } from "../src/services/membership";
+import { ReferralService } from "../src/services/referrals";
 import { registerMessageHandlers } from "../src/bot/handlers/messages";
 import { registerCallbackHandlers } from "../src/bot/handlers/callbacks";
 import { registerAdminEntry, adminWebAppUrl, adminEntryKeyboard } from "../src/bot/admin-entry";
@@ -105,9 +106,11 @@ function buildApp(aiResult: AiResult | ((input: AiInput) => AiResult)): BotApp {
     loyalty: new LoyaltyService(db),
     notifications: new NotificationService(db),
     membership: new ChannelMembershipService(db),
+    referrals: new ReferralService(db),
     profileEdit: new TextCaptureFlow(),
     depositFlow: new TextCaptureFlow(),
     rejectReasonFlow: new TextCaptureFlow(),
+    referralFlow: new TextCaptureFlow(),
   };
 }
 

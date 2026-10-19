@@ -16,6 +16,7 @@ import { BusinessHoursService } from "../src/services/business-hours";
 import { ReportService } from "../src/services/reports";
 import { NotificationService } from "../src/services/notifications";
 import { ChannelMembershipService } from "../src/services/membership";
+import { ReferralService } from "../src/services/referrals";
 import { handleAdminApi } from "../src/api/routes/admin";
 import { signInitData } from "../src/api/middleware/auth";
 import type { ApiApp } from "../src/api/context";
@@ -75,6 +76,7 @@ beforeEach(() => {
     customers: new CustomersService(db),
     loyalty: new LoyaltyService(db),
     membership: new ChannelMembershipService(db),
+    referrals: new ReferralService(db),
   };
 });
 

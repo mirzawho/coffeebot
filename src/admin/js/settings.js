@@ -405,9 +405,9 @@ const SettingsPage = (() => {
 
   function openMembershipSheet() {
     const enabledSw = switchField(
-      "الزام عضویت در کانال",
+      "دکمه عضویت کانال در ربات",
       membershipSettings.enabled,
-      "مشتریان برای استفاده از ربات باید عضو کانال باشند",
+      "برای مشتریان غیرعضو، دکمه عضویت در منوی اصلی ربات نمایش داده می‌شود (اجباری نیست)",
     );
     const channelF = field("شناسه کانال", textInput(membershipSettings.channel || "", { maxlength: 64, placeholder: "@my_cafe_channel یا https://t.me/my_cafe_channel" }), {
       hint: "یوزرنیم عمومی کانال (لینک دعوت پشتیبانی نمی‌شود). ربات باید ادمین کانال باشد.",

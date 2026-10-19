@@ -10,6 +10,7 @@ import { CustomersService } from "../src/services/customers";
 import { LoyaltyService } from "../src/services/loyalty";
 import { NotificationService } from "../src/services/notifications";
 import { ChannelMembershipService } from "../src/services/membership";
+import { ReferralService } from "../src/services/referrals";
 import { ReportService } from "../src/services/reports";
 import { updatePaymentSettings, updateReportSettings } from "../src/services/settings";
 import { handleAdminApi } from "../src/api/routes/admin";
@@ -94,6 +95,7 @@ beforeEach(() => {
     customers: new CustomersService(db),
     loyalty: new LoyaltyService(db),
     membership: new ChannelMembershipService(db),
+    referrals: new ReferralService(db),
   };
   updatePaymentSettings(db, { cardNumber: "603799", cardholderName: "Ali", currency: "تومان" });
   // Recipients drive the immediate receipt-review notifications; the daily
@@ -213,10 +215,12 @@ function buildBotApp(): BotApp {
     customers: app.customers,
     loyalty: app.loyalty,
     membership: new ChannelMembershipService(db),
+    referrals: new ReferralService(db),
     notifications: app.notifications,
     profileEdit: new TextCaptureFlow(),
     depositFlow: new TextCaptureFlow(),
     rejectReasonFlow: new TextCaptureFlow(),
+    referralFlow: new TextCaptureFlow(),
   };
 }
 

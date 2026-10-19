@@ -1,9 +1,11 @@
 import { Bot } from "grammy";
 import type { BotApp } from "./context";
+import type { Db } from "../db/database";
 import { registerCallbackHandlers } from "./handlers/callbacks";
 import { registerMessageHandlers } from "./handlers/messages";
 import { registerAdminEntry, configureAdminMenuButtons } from "./admin-entry";
 import { channelMembershipGuard } from "./guards/channel-membership";
+import { setSetting } from "../services/settings";
 import { log } from "../utils/logger";
 import { botState } from "./state";
 
@@ -22,10 +24,9 @@ export function createBot(app: BotApp): Bot {
     log.error("bot error", { err: String(err.error) });
   });
 
-  // Centralized channel-membership guard — MUST run before every customer
-  // handler so commands, text/AI, receipts and callbacks cannot bypass it.
-  // It is a no-op unless the admin has enabled enforcement with a valid
-  // channel, and it never blocks administrators.
+  // Channel-membership «عضو شدم» recheck handler. Membership is OPTIONAL —
+  // it never blocks customers; the main menu only shows a join nudge to
+  // known non-members (see membershipJoinUrl).
   bot.use(channelMembershipGuard(app));
 
   registerCallbackHandlers(bot, app);
@@ -51,8 +52,12 @@ export function backoffDelay(attempt: number): number {
  * exhausted) the promise resolves with `failed` and botState records it —
  * callers decide how to surface that (health endpoint, exit).
  */
-export async function startBot(bot: Bot, opts?: { maxAttempts?: number }): Promise<"running" | "failed"> {
+export async function startBot(
+  bot: Bot,
+  opts?: { maxAttempts?: number; db?: Db },
+): Promise<"running" | "failed"> {
   const maxAttempts = opts?.maxAttempts ?? MAX_START_ATTEMPTS;
+  const db = opts?.db;
   botState.running = false;
   botState.failed = false;
   botState.lastError = null;
@@ -76,6 +81,13 @@ export async function startBot(bot: Bot, opts?: { maxAttempts?: number }): Promi
             botState.running = true;
             botState.failed = false;
             botState.lastError = null;
+            // Persist the live username so the admin panel can build referral
+            // deep links without calling getMe.
+            try {
+              if (db) setSetting(db, "bot_username", info.username);
+            } catch {
+              /* non-fatal */
+            }
             log.info("bot started", { username: info.username });
           },
           timeout: 30,

@@ -341,3 +341,56 @@ export const receiptRejectedCaption = (orderNumber: string): string =>
 export const STALE_TEXT = "این دکمه دیگر معتبر نیست. لطفاً دوباره از منو اقدام کنید.";
 export const AI_FALLBACK_TEXT =
   "متوجه نشدم. می‌توانید از دکمه‌های منو استفاده کنید یا سفارش را ساده‌تر بنویسید.";
+
+// ---------------------------------------------------------------------------
+// Referrals
+// ---------------------------------------------------------------------------
+
+export const REFERRAL_CODE_PROMPT_TEXT = `لطفاً کد معرف را به صورت متن ارسال کنید.
+
+نمونه: ABCD2345
+
+برای انصراف، دکمه «انصراف» را بزنید یا /cancel را بفرستید.`;
+
+export const REFERRAL_CANCELLED_TEXT = "ثبت کد معرف لغو شد.";
+export const REFERRAL_INVALID_TEXT =
+  "کد معرف معتبر نیست. کد باید ۸ کاراکتر باشد (مثلاً ABCD2345). دوباره تلاش کنید یا انصراف دهید.";
+export const REFERRAL_NOT_FOUND_TEXT =
+  "این کد معرف یافت نشد. لطفاً کد را بررسی و دوباره وارد کنید یا انصراف دهید.";
+export const REFERRAL_SELF_TEXT =
+  "امکان ثبت کد معرف خودتان وجود ندارد. کد دیگری وارد کنید یا انصراف دهید.";
+export const REFERRAL_ALREADY_TEXT =
+  "شما قبلاً با کد معرف ثبت‌نام کرده‌اید و امکان تغییر آن نیست.";
+
+export function referralSuccessText(referrerName: string | null): string {
+  const who = referrerName ? ` (${referrerName})` : "";
+  return `✅ کد معرف با موفقیت ثبت شد${who}.\nاز این پس شما زیرمجموعه این معرف هستید.`;
+}
+
+export function referralSectionText(
+  code: string,
+  referredCount: number,
+  botUsername: string | null,
+): string {
+  const link = botUsername ? `https://t.me/${botUsername}?start=ref_${code}` : null;
+  return [
+    "👥 دعوت از دوستان",
+    "",
+    `کد معرف شما: ${code}`,
+    "",
+    link ? `لینک دعوت:\n${link}` : null,
+    "",
+    `تعداد مشتریانی که با کد شما ثبت‌نام کرده‌اند: ${referredCount}`,
+    "",
+    "دوستان می‌توانند لینک دعوت شما را باز کنند و ثبت‌نام کنند،",
+    "یا پس از شروع گفتگو با ربات، کد معرف شما را در بخش",
+    "«استفاده از کد معرف» وارد کنند.",
+  ]
+    .filter((l) => l !== null)
+    .join("\n");
+}
+
+export function referralAppliedOnStartText(referrerName: string | null): string {
+  const who = referrerName ? ` (${referrerName})` : "";
+  return `✅ کد معرف شما${who} ثبت شد.`;
+}

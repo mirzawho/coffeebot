@@ -10,6 +10,7 @@ import type { CustomersService } from "../services/customers";
 import type { LoyaltyService } from "../services/loyalty";
 import type { NotificationService } from "../services/notifications";
 import type { ChannelMembershipService } from "../services/membership";
+import type { ReferralService } from "../services/referrals";
 
 export interface ChatTurn {
   role: "user" | "assistant";
@@ -57,12 +58,16 @@ export interface BotApp {
   notifications: NotificationService;
   /** Telegram channel membership enforcement (settings + verification cache). */
   membership: ChannelMembershipService;
+  /** Referral codes and attribution (shared by /start, manual entry, menu). */
+  referrals: ReferralService;
   /** Multi-step profile wizard (name → phone → address). */
   profileEdit: TextCaptureFlow;
   /** Next text message is captured as a wallet deposit amount. */
   depositFlow: TextCaptureFlow;
   /** Next admin text is the rejection reason for the order id in `step`. */
   rejectReasonFlow: TextCaptureFlow;
+  /** Next text message is captured as a referral code. */
+  referralFlow: TextCaptureFlow;
 }
 
 const HISTORY_CAP = 300;

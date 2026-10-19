@@ -73,6 +73,8 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   channel_membership_enabled: "0",
   channel_membership_channel: "",
   channel_membership_message: "",
+  // Filled in by the bot on start; used to build referral deep links.
+  bot_username: "",
 };
 
 function seedDefaults(db: Db): void {

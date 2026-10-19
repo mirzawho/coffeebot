@@ -8,6 +8,7 @@ import type { NotificationService } from "../services/notifications";
 import type { CustomersService } from "../services/customers";
 import type { LoyaltyService } from "../services/loyalty";
 import type { ChannelMembershipService } from "../services/membership";
+import type { ReferralService } from "../services/referrals";
 import type { InlineKeyboardMarkup } from "@grammyjs/types";
 
 export interface ApiApp {
@@ -24,6 +25,8 @@ export interface ApiApp {
   loyalty: LoyaltyService;
   /** Channel membership verification (admin list status + manual recheck). */
   membership: ChannelMembershipService;
+  /** Referral codes and attribution (admin customer profile tab). */
+  referrals: ReferralService;
   /**
    * Telegram bot, used only to resolve receipt file_ids into image bytes for
    * the admin panel, and to rewrite receipt notice captions after a review

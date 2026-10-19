@@ -14,6 +14,7 @@ import { CustomersService } from "../src/services/customers";
 import { LoyaltyService } from "../src/services/loyalty";
 import { NotificationService } from "../src/services/notifications";
 import { ChannelMembershipService } from "../src/services/membership";
+import { ReferralService } from "../src/services/referrals";
 import { registerMessageHandlers } from "../src/bot/handlers/messages";
 import type { BotApp } from "../src/bot/context";
 import { TextCaptureFlow } from "../src/bot/context";
@@ -162,10 +163,12 @@ function buildApp(aiResult: AiResult | ((input: AiInput) => AiResult), persona =
     customers: new CustomersService(db),
     loyalty: new LoyaltyService(db),
     membership: new ChannelMembershipService(db),
+    referrals: new ReferralService(db),
     notifications: new NotificationService(db),
     profileEdit: new TextCaptureFlow(),
     depositFlow: new TextCaptureFlow(),
     rejectReasonFlow: new TextCaptureFlow(),
+    referralFlow: new TextCaptureFlow(),
   };
 }
 
