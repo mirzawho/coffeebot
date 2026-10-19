@@ -364,6 +364,7 @@ describe("payment review from the panel (receipt sync regression)", () => {
         editMessageCaption: async () => true,
       },
     };
+    const originalFetch = globalThis.fetch;
     globalThis.fetch = (async () =>
       new Response(new Uint8Array([1, 2, 3]), {
         status: 200,
@@ -382,7 +383,7 @@ describe("payment review from the panel (receipt sync regression)", () => {
       const bytes = new Uint8Array(await res!.arrayBuffer());
       expect(bytes.length).toBe(3);
     } finally {
-      delete (globalThis as any).fetch;
+      globalThis.fetch = originalFetch;
     }
   });
 
