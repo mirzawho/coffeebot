@@ -212,6 +212,11 @@ async function serveAdminHtml(absPath: string, app: ApiApp): Promise<Response | 
 export function createHttpServer(app: ApiApp) {
   return Bun.serve({
     port: app.config.httpPort,
+    // Bind to all interfaces explicitly. Bun's default (hostname "localhost")
+    // resolves to ::1 on Linux, which breaks IPv4 connections from the test
+    // suite (http://127.0.0.1:...) and, in the Docker image, makes the app
+    // unreachable from outside the container.
+    hostname: "0.0.0.0",
     // Image uploads go base64 in JSON: a 2MB image is ~2.7MB base64 — allow headroom.
     maxRequestBodySize: 4 * 1024 * 1024,
     async fetch(req, server) {
