@@ -1,5 +1,6 @@
 import type { Db } from "../db/database";
 import { nowIso, tx } from "../db/database";
+import { cardLast4, maskCardNumber, validateCardNumber } from "../utils/cards";
 import { log } from "../utils/logger";
 
 /**
@@ -419,6 +420,65 @@ export class CustomersService {
       .run(adminId, nowIso(), nowIso(), depositId);
     if (res.changes === 0) return { ok: false, error: "این درخواست قبلاً بررسی شده است" };
     return { ok: true, deposit: this.getDeposit(depositId)! };
+  }
+
+  // ---------- bank card ----------
+
+  /** The customer's registered card. Never expose `cardNumber` outside the bot's own edit flow. */
+  getCard(telegramId: number): { cardNumber: string; masked: string; last4: string; updatedAt: string } | null {
+    const r = this.db
+      .query("SELECT card_number, updated_at FROM customer_cards WHERE telegram_id = ?")
+      .get(telegramId) as { card_number: string; updated_at: string } | null;
+    if (!r) return null;
+    return {
+      cardNumber: r.card_number,
+      masked: maskCardNumber(r.card_number),
+      last4: cardLast4(r.card_number),
+      updatedAt: r.updated_at,
+    };
+  }
+
+  /** Register or replace the customer's card. Validates format + Luhn; stores the normalized number. */
+  saveCard(telegramId: number, raw: unknown):
+    | { ok: true; card: { masked: string; last4: string } }
+    | { ok: false; error: string } {
+    const normalized = validateCardNumber(raw);
+    if (!normalized) {
+      return { ok: false, error: "شماره کارت معتبر نیست (۱۶ رقم بدون خط تیره)" };
+    }
+    // FK target must exist; a customer editing a card has a profile, but be safe.
+    if (!this.getProfile(telegramId)) {
+      this.saveProfile(telegramId, { fullName: "مشتری" });
+    }
+    const now = nowIso();
+    this.db
+      .query(
+        `INSERT INTO customer_cards (telegram_id, card_number, created_at, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(telegram_id) DO UPDATE SET card_number = excluded.card_number,
+           updated_at = excluded.updated_at`,
+      )
+      .run(telegramId, normalized, now, now);
+    return { ok: true, card: { masked: maskCardNumber(normalized), last4: cardLast4(normalized) } };
+  }
+
+  /**
+   * Credit a completed wallet refund, referencing the refund row
+   * (kind='refund', ref_type='order', ref_id=refundId) so the ledger's
+   * UNIQUE index makes each refund creditable at most once. Must be called
+   * inside the caller's transaction that also inserts the refund row.
+   */
+  creditOrderRefund(
+    telegramId: number,
+    refundId: number,
+    amount: number,
+    adminId: number | null,
+    note: string,
+  ): { applied: boolean; tx: WalletTransaction } {
+    return this.applyLedger(telegramId, amount, "refund", "order", refundId, {
+      createdBy: adminId,
+      note,
+    });
   }
 
   // ---------- order payment integration ----------

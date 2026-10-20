@@ -394,3 +394,34 @@ export function referralAppliedOnStartText(referrerName: string | null): string 
   const who = referrerName ? ` (${referrerName})` : "";
   return `✅ کد معرف شما${who} ثبت شد.`;
 }
+
+// ---------------------------------------------------------------------------
+// Bank card (customer-registered card for refunds)
+// ---------------------------------------------------------------------------
+
+export const CARD_MENU_NO_CARD_TEXT = "شماره کارتی ثبت نکرده‌اید.";
+
+/** Card section view — masked number only; the full number is never echoed. */
+export function cardMenuText(masked: string | null): string {
+  return ["💳 کارت بانکی من", "", masked ? `شماره کارت: ${masked}` : CARD_MENU_NO_CARD_TEXT].join(
+    "\n",
+  );
+}
+
+/** Edit-confirmation shown when a card already exists. */
+export function cardEditConfirmText(masked: string): string {
+  return `ویرایش شماره کارت فعلی (${masked})؟`;
+}
+
+export const CARD_NUMBER_PROMPT_TEXT = `لطفاً شماره کارت ۱۶ رقمی خود را به صورت متن بفرستید (مثلاً ۶۰۳۷۹۹۱۲۳۴۵۶۷۸۹۰).
+
+برای انصراف، دکمه «لغو» را بزنید یا /cancel را بفرستید.`;
+
+export const CARD_RETRY_PROMPT_TEXT = "شماره کارت را دوباره بفرستید یا لغو کنید:";
+
+export const CARD_CANCELLED_TEXT = "لغو شد.";
+
+/** Success: only the masked form of the saved card is shown. */
+export function cardSavedText(masked: string): string {
+  return `✅ کارت بانکی شما ثبت شد: ${masked}`;
+}

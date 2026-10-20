@@ -46,6 +46,7 @@ import { MAX_AI_OFFERS, MAX_ITEM_QUANTITY, MAX_USER_MESSAGE_LENGTH } from "../..
 import { FALLBACK_REPLY, type AiResult } from "../../services/ollama";
 import { cardToCardAvailable, getAiSettings } from "../../services/settings";
 import { handleProfileWizardText, startProfileWizard } from "../profile-wizard";
+import { handleCardWizardText } from "../card-wizard";
 import { validateReceipt } from "../receipt";
 import { isIdentityQuestion, buildIdentityReply } from "../identity";
 import { log } from "../../utils/logger";
@@ -165,11 +166,13 @@ async function handleText(ctx: Context, app: BotApp, text: string): Promise<void
       app.profileEdit.isActive(userId) ||
       app.depositFlow.isActive(userId) ||
       app.rejectReasonFlow.isActive(userId) ||
-      app.referralFlow.isActive(userId);
+      app.referralFlow.isActive(userId) ||
+      app.cardEdit.isActive(userId);
     app.profileEdit.clear(userId);
     app.depositFlow.clear(userId);
     app.rejectReasonFlow.clear(userId);
     app.referralFlow.clear(userId);
+    app.cardEdit.clear(userId);
     if (wasActive) {
       await ctx.reply("عملیات لغو شد.", { reply_markup: menuFor(app, userId) });
       return;
@@ -206,6 +209,13 @@ async function handleText(ctx: Context, app: BotApp, text: string): Promise<void
   if (app.referralFlow.isActive(userId)) {
     app.referralFlow.clear(userId);
     await applyReferralCode(ctx, app, text);
+    return;
+  }
+  // Bank-card number entry — validated by saveCard; never reaches the AI.
+  if (app.cardEdit.isActive(userId)) {
+    const step = app.cardEdit.step(userId);
+    app.cardEdit.clear(userId);
+    await handleCardWizardText(ctx, app, text, step);
     return;
   }
 

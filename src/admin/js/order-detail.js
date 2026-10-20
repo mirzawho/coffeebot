@@ -5,13 +5,51 @@
 "use strict";
 
 const OrderDetail = (() => {
-  const { el, icons, toast, openSheet, field, textInput, loadingState, errorState,
-    moneyWithCurrency, money, faDigits, segmented } = Ui;
+  const { el, icons, toast, openSheet, field, textInput, loadingState, errorState, emptyState,
+    moneyWithCurrency, money, faDigits, segmented, jalaliLabel } = Ui;
 
   // Mirrors of the server limits (src/utils/ids.ts) for client-side steering;
   // the server re-validates everything on save.
   const MAX_QTY = 20;
   const MAX_LINES = 40;
+
+  // Display currency for cross-order views (pending-refunds sheet); per-order
+  // views always use the currency carried by the order payload itself.
+  let currency = "تومان";
+  function setData(cur) {
+    currency = cur || "تومان";
+  }
+
+  // Mirrors of src/services/refunds.ts REFUND_REASON_LABELS — the server
+  // re-validates the code; these labels keep the UI in step with it.
+  const REASON_LABELS = {
+    item_issue: "مشکل در آیتم سفارش",
+    wrong_item: "آیتم اشتباه",
+    quality: "کیفیت نامناسب",
+    stock: "کمبود موجودی",
+    customer_request: "درخواست مشتری",
+    other: "سایر موارد",
+  };
+
+  const REFUND_STATUS_CLS = {
+    pending: "badge warn",
+    completed: "badge",
+    cancelled: "badge off",
+  };
+
+  /** Client-generated idempotency key; replays of the same submit are free. */
+  function idemKey() {
+    try {
+      if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+    } catch { /* older webview — fall through */ }
+    return `r-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  /** "YYYY-MM-DD HH:MM" → "۲۵ مهر ۱۴۰۵ · ۱۶:۴۸" (server already localizes). */
+  function formatTime(s) {
+    if (!s) return "";
+    return `${jalaliLabel(s.slice(0, 10))} · ${faDigits(s.slice(11))}`;
+  }
 
   const FULFILLMENT_BADGE = {
     pending: "badge warn",
@@ -171,6 +209,7 @@ const OrderDetail = (() => {
         reload(o.orderNumber, opts);
         done();
       }),
+      refundsSection(o, opts),
     );
 
     // Lifecycle + edit actions. The server validates every transition; only
@@ -275,6 +314,443 @@ const OrderDetail = (() => {
       card.appendChild(actions);
     }
     return card;
+  }
+
+  // ---------- refunds ----------
+
+  /**
+   * ریفاند / بازپرداخت — item-level, multi-item and full-order refunds.
+   * Every amount is computed and validated on the server; this section only
+   * collects the selection and renders what the server returns.
+   */
+  function refundsSection(o, opts) {
+    const wrap = el("div", { class: "card", style: "padding:12px 14px;margin-bottom:14px" });
+    wrap.appendChild(
+      el("div", { style: "font-weight:700;margin-bottom:8px", text: "ریفاند / بازپرداخت" }),
+    );
+
+    const s = o.refundSummary;
+    if (!s) {
+      wrap.appendChild(el("div", { style: "font-size:13px;color:var(--faint)", text: "اطلاعات ریفاند در دسترس نیست." }));
+      return wrap;
+    }
+
+    // Summary row: original total / already refunded / remaining.
+    wrap.appendChild(
+      el(
+        "div",
+        { style: "display:flex;justify-content:space-between;font-size:13px;color:var(--muted);margin-bottom:10px;flex-wrap:wrap;gap:4px" },
+        el("span", { text: `کل سفارش: ${moneyWithCurrency(s.totalAmount, o.currency)}` }),
+        el("span", { text: `بازگشت‌شده: ${moneyWithCurrency(s.refundedAmount, o.currency)}` }),
+        el("span", { style: "font-weight:700;color:var(--text)", text: `قابل بازگشت: ${moneyWithCurrency(s.remainingRefundableAmount, o.currency)}` }),
+      ),
+    );
+
+    if (o.paymentStatus !== "paid") {
+      wrap.appendChild(
+        el("div", { style: "font-size:13px;color:var(--warn)", text: "فقط برای سفارش پرداخت‌شده امکان‌پذیر است." }),
+      );
+    } else if (s.remainingRefundableAmount <= 0) {
+      wrap.appendChild(
+        el("div", { style: "font-size:13px;color:var(--faint)", text: "مبلغ قابل بازگشتی باقی نمانده است." }),
+      );
+    } else {
+      wrap.appendChild(buildRefundForm(o, s, opts));
+    }
+
+    // Refund history.
+    const refunds = o.refunds || [];
+    wrap.appendChild(el("div", { class: "field-label", style: "margin-top:12px", text: "تاریخچه ریفاند" }));
+    if (!refunds.length) {
+      wrap.appendChild(el("div", { style: "font-size:13px;color:var(--faint)", text: "هنوز ریفاندی ثبت نشده است." }));
+    } else {
+      const list = el("div", { class: "list-card" });
+      for (const r of refunds) {
+        list.appendChild(refundRow(r, o, opts));
+      }
+      wrap.appendChild(list);
+    }
+    return wrap;
+  }
+
+  function refundRow(r, o, opts) {
+    const sub = [
+      r.itemLabel,
+      `${faDigits(r.quantity)} ×`,
+      r.settlementLabel,
+      r.reasonLabel,
+    ].filter(Boolean).join(" · ");
+    const times = [
+      r.createdAt ? `ایجاد: ${formatTime(r.createdAt)}` : null,
+      r.completedAt ? `تکمیل: ${formatTime(r.completedAt)}` : null,
+      r.cancelledAt ? `لغو: ${formatTime(r.cancelledAt)}` : null,
+      r.cancelReason ? `دلیل لغو: ${r.cancelReason}` : null,
+    ].filter(Boolean).join("\n");
+
+    const row = el(
+      "div",
+      { class: "row", style: "align-items:flex-start" },
+      el(
+        "div",
+        { class: "row-main" },
+        el("div", { style: "display:flex;gap:6px;align-items:center;flex-wrap:wrap" },
+          el("span", { class: "row-title", text: moneyWithCurrency(r.amount, o.currency) }),
+          el("span", { class: REFUND_STATUS_CLS[r.status] || "badge", text: r.statusLabel }),
+        ),
+        el("div", { class: "row-sub", text: sub }),
+        r.cardMasked ? el("div", { class: "row-sub ltr", text: `کارت: ${r.cardMasked}` }) : null,
+        times ? el("div", { class: "row-sub", style: "white-space:pre-line", text: times }) : null,
+      ),
+    );
+
+    // Pending card payouts: complete after the manual transfer, or cancel.
+    if (r.settlementMethod === "card" && r.status === "pending") {
+      const actions = el("div", { style: "display:flex;flex-direction:column;gap:6px;min-width:120px" });
+      const completeBtn = el("button", { class: "btn small", type: "button", text: "تکمیل انتقال" });
+      completeBtn.addEventListener("click", async () => {
+        if (!confirm(`انتقال ${moneyWithCurrency(r.amount, o.currency)} به کارت ${r.cardMasked ?? "ثبت‌شده"} را انجام داده‌اید؟`)) return;
+        completeBtn.disabled = true;
+        try {
+          await Api.post(`/api/admin/refunds/${r.id}/complete`, {});
+          toast("ریفاند تکمیل شد");
+          reload(o.orderNumber, opts);
+          if (opts.onChanged) opts.onChanged();
+        } catch (err) {
+          toast(err.message || "انجام نشد", true);
+          completeBtn.disabled = false;
+        }
+      });
+      const cancelBtn = el("button", { class: "btn small ghost danger", type: "button", text: "لغو" });
+      cancelBtn.addEventListener("click", async () => {
+        const reason = prompt("دلیل لغو (اختیاری):");
+        if (reason === null) return;
+        cancelBtn.disabled = true;
+        try {
+          await Api.post(`/api/admin/refunds/${r.id}/cancel`, reason.trim() ? { reason: reason.trim() } : {});
+          toast("ریفاند لغو شد");
+          reload(o.orderNumber, opts);
+          if (opts.onChanged) opts.onChanged();
+        } catch (err) {
+          toast(err.message || "انجام نشد", true);
+          cancelBtn.disabled = false;
+        }
+      });
+      actions.appendChild(completeBtn);
+      actions.appendChild(cancelBtn);
+      row.appendChild(actions);
+    }
+    return row;
+  }
+
+  /** Item selection + qty + reason + settlement + submit; plus full-order button. */
+  function buildRefundForm(o, s, opts) {
+    const box = el("div", {});
+    const refundableItems = s.items.filter((i) => i.refundableQuantity > 0);
+    if (!refundableItems.length) return box;
+
+    // --- item rows: checkbox + qty input, live amount ---
+    const selection = new Map(); // orderItemId -> { checked, qty, item }
+    const amountPreview = el("span", { style: "font-weight:700" });
+
+    function currentAmount() {
+      let sum = 0;
+      for (const { checked, qty, item } of selection.values()) {
+        if (checked) sum += Math.min(qty, item.refundableQuantity) * item.unitPrice;
+      }
+      return sum;
+    }
+    function refreshPreview() {
+      amountPreview.textContent = moneyWithCurrency(currentAmount(), o.currency);
+    }
+
+    const itemsBox = el("div", { class: "list-card", style: "margin-bottom:10px" });
+    for (const it of refundableItems) {
+      const entry = { checked: false, qty: 1, item: it };
+      selection.set(it.id, entry);
+
+      const cb = el("input", { type: "checkbox", style: "width:18px;height:18px" });
+      cb.addEventListener("change", () => { entry.checked = cb.checked; refreshPreview(); });
+      const qty = el("input", {
+        type: "number", min: "1", max: String(it.refundableQuantity), value: "1",
+        inputmode: "numeric",
+        style: "width:64px;text-align:center",
+      });
+      qty.addEventListener("input", () => {
+        let v = parseInt(qty.value, 10);
+        if (Number.isNaN(v) || v < 1) v = 1;
+        if (v > it.refundableQuantity) v = it.refundableQuantity;
+        entry.qty = v;
+        refreshPreview();
+      });
+
+      itemsBox.appendChild(
+        el(
+          "div",
+          { class: "row" },
+          el("div", { class: "row-main" },
+            el("div", { class: "row-title", text: it.variantName ? `${it.productName} — ${it.variantName}` : it.productName }),
+            el("div", {
+              class: "row-sub",
+              text: `${moneyWithCurrency(it.unitPrice, o.currency)} × ${faDigits(it.refundableQuantity)} قابل بازگشت (از ${faDigits(it.quantity)})`,
+            }),
+          ),
+          el("span", { class: "row-end", style: "display:flex;gap:8px;align-items:center" }, cb, qty),
+        ),
+      );
+    }
+
+    // --- reason ---
+    const reasonSelect = el("select", {},
+      el("option", { value: "", text: "بدون دلیل" }),
+      ...Object.entries(REASON_LABELS).map(([code, label]) =>
+        el("option", { value: code, text: label })),
+    );
+    const otherF = field("توضیح (سایر موارد)", textInput("", { maxlength: 200, placeholder: "دلیل را بنویسید…" }));
+    otherF.root.hidden = true;
+    reasonSelect.addEventListener("change", () => {
+      otherF.root.hidden = reasonSelect.value !== "other";
+    });
+    const reasonF = field("دلیل ریفاند (اختیاری)", reasonSelect);
+
+    // --- settlement ---
+    let method = "wallet";
+    const methodSeg = segmented([
+      { value: "wallet", label: "بازگشت به کیف پول" },
+      { value: "card", label: "بازپرداخت به کارت مشتری" },
+    ], method);
+    methodSeg.root.querySelectorAll("button").forEach((b) => {
+      b.addEventListener("click", () => { method = methodSeg.value(); updateCardNote(); });
+    });
+    const cardNote = el("div", { style: "font-size:12.5px;color:var(--muted);margin-top:6px" });
+    const hasCard = !!(o.customerCard && o.customerCard.hasCard);
+    function updateCardNote() {
+      if (method === "card") {
+        cardNote.textContent = hasCard
+          ? `کارت مقصد: ${o.customerCard.masked} — انتقال باید خارج از ربات انجام و سپس «تکمیل انتقال» زده شود.`
+          : "مشتری شماره کارت ثبت‌نکرده است؛ ابتدا کارت او را ثبت کنید یا بازگشت به کیف پول را انتخاب کنید.";
+        cardNote.style.color = hasCard ? "var(--muted)" : "var(--danger)";
+      } else {
+        cardNote.textContent = "مبلغ بلافاصله به کیف پول مشتری اضافه می‌شود.";
+        cardNote.style.color = "var(--muted)";
+      }
+    }
+    updateCardNote();
+    const methodF = field("روش بازگشت وجه", methodSeg.root);
+    methodF.root.appendChild(cardNote);
+
+    // --- submit ---
+    const formError = el("div", { class: "form-error" });
+    formError.hidden = true;
+    const submitBtn = el("button", { class: "btn", type: "submit", text: "ثبت ریفاند انتخاب‌شده" });
+
+    const form = el("form", { novalidate: "" },
+      el("div", { class: "field-label", text: "انتخاب آیتم‌ها" }),
+      itemsBox,
+      el("div", { style: "display:flex;justify-content:space-between;font-size:13px;margin-bottom:10px" },
+        el("span", { text: "مبلغ انتخابی:" }), amountPreview),
+      reasonF.root,
+      otherF.root,
+      methodF.root,
+      formError,
+      el("div", { class: "form-actions" },
+        submitBtn,
+        el("button", { class: "btn secondary", type: "button", text: "بازگشت کامل سفارش", onClick: () => openFullRefund(o, s, opts) })),
+    );
+    refreshPreview();
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      formError.hidden = true;
+      const items = [];
+      for (const { checked, qty, item } of selection.values()) {
+        if (checked && qty > 0) items.push({ orderItemId: item.orderItemId, quantity: qty });
+      }
+      if (!items.length) {
+        formError.textContent = "حداقل یک آیتم را انتخاب کنید";
+        formError.hidden = false;
+        return;
+      }
+      if (method === "card" && !hasCard) {
+        formError.textContent = "مشتری شماره کارت ثبت‌نکرده است";
+        formError.hidden = false;
+        return;
+      }
+      const amount = currentAmount();
+      const methodLabel = method === "wallet" ? "بازگشت به کیف پول" : `بازپرداخت به کارت ${o.customerCard ? o.customerCard.masked : ""}`;
+      if (!confirm(`ریفاند ${moneyWithCurrency(amount, o.currency)} (${methodLabel}) ثبت شود؟`)) return;
+      submitBtn.disabled = true;
+      try {
+        const r = await Api.post(`/api/admin/orders/${encodeURIComponent(o.orderNumber)}/refunds`, {
+          items,
+          settlementMethod: method,
+          reasonCode: reasonSelect.value || null,
+          reasonText: reasonSelect.value === "other" ? otherF.input.value : null,
+          idempotencyKey: idemKey(),
+        });
+        toast(r.balanceAfter !== undefined
+          ? `ثبت شد. موجودی جدید کیف پول: ${moneyWithCurrency(r.balanceAfter, o.currency)}`
+          : "ثبت شد");
+        reload(o.orderNumber, opts);
+        if (opts.onChanged) opts.onChanged();
+      } catch (err) {
+        formError.textContent = err.message || "ثبت ریفاند انجام نشد";
+        formError.hidden = false;
+        submitBtn.disabled = false;
+      }
+    });
+
+    box.appendChild(form);
+    return box;
+  }
+
+  /** Full-order refund: breakdown + settlement choice + explicit confirmation. */
+  function openFullRefund(o, s, opts) {
+    const box = el("div", {});
+    let method = "wallet";
+    const hasCard = !!(o.customerCard && o.customerCard.hasCard);
+
+    const lines = s.items.filter((i) => i.refundableQuantity > 0).map((i) =>
+      el("div", { style: "font-size:13px;color:var(--muted)" },
+        `${i.variantName ? `${i.productName} — ${i.variantName}` : i.productName}: ${faDigits(i.refundableQuantity)} × ${moneyWithCurrency(i.unitPrice, o.currency)} = ${moneyWithCurrency(i.refundableAmount, o.currency)}`),
+    );
+
+    const methodSeg = segmented([
+      { value: "wallet", label: "بازگشت به کیف پول" },
+      { value: "card", label: "بازپرداخت به کارت مشتری" },
+    ], method);
+    methodSeg.root.querySelectorAll("button").forEach((b) => {
+      b.addEventListener("click", () => { method = methodSeg.value(); updateNote(); });
+    });
+    const note = el("div", { style: "font-size:12.5px;margin-top:6px" });
+    function updateNote() {
+      if (method === "card") {
+        note.textContent = hasCard
+          ? `کارت مقصد: ${o.customerCard.masked} — انتقال دستی است.`
+          : "مشتری شماره کارت ثبت‌نکرده است.";
+        note.style.color = hasCard ? "var(--muted)" : "var(--danger)";
+      } else {
+        note.textContent = "مبلغ باقی‌مانده به کیف پول اضافه می‌شود.";
+        note.style.color = "var(--muted)";
+      }
+    }
+    updateNote();
+
+    const formError = el("div", { class: "form-error" });
+    formError.hidden = true;
+    const submitBtn = el("button", { class: "btn danger", type: "submit", text: "تأیید بازگشت کامل" });
+    const form = el("form", { novalidate: "" },
+      el("div", { style: "font-size:13px;margin-bottom:6px" }, el("b", { text: `کل سفارش: ${moneyWithCurrency(s.totalAmount, o.currency)}` })),
+      el("div", { style: "font-size:13px;margin-bottom:6px" }, el("b", { text: `قبلاً بازگشت‌شده: ${moneyWithCurrency(s.refundedAmount, o.currency)}` })),
+      el("div", { style: "font-size:13px;margin-bottom:10px" }, el("b", { text: `باقی‌مانده قابل بازگشت: ${moneyWithCurrency(s.remainingRefundableAmount, o.currency)}` })),
+      el("div", { class: "field-label", text: "آیتم‌هایی که بازگشت داده می‌شوند" }),
+      ...lines,
+      el("div", { style: "height:10px" }),
+      field("روش بازگشت وجه", methodSeg.root).root,
+      note,
+      formError,
+      el("div", { class: "form-actions" },
+        submitBtn,
+        el("button", { class: "btn ghost", type: "button", text: "انصراف", onClick: () => reload(o.orderNumber, opts) })),
+    );
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      formError.hidden = true;
+      if (method === "card" && !hasCard) {
+        formError.textContent = "مشتری شماره کارت ثبت‌نکرده است";
+        formError.hidden = false;
+        return;
+      }
+      if (!confirm(`بازگشت کامل ${moneyWithCurrency(s.remainingRefundableAmount, o.currency)} ثبت شود؟`)) return;
+      submitBtn.disabled = true;
+      try {
+        const r = await Api.post(`/api/admin/orders/${encodeURIComponent(o.orderNumber)}/refunds`, {
+          fullOrder: true,
+          settlementMethod: method,
+          idempotencyKey: idemKey(),
+        });
+        toast(r.balanceAfter !== undefined
+          ? `ثبت شد. موجودی جدید کیف پول: ${moneyWithCurrency(r.balanceAfter, o.currency)}`
+          : "ثبت شد");
+        reload(o.orderNumber, opts);
+        if (opts.onChanged) opts.onChanged();
+      } catch (err) {
+        formError.textContent = err.message || "ثبت ریفاند انجام نشد";
+        formError.hidden = false;
+        submitBtn.disabled = false;
+      }
+    });
+
+    openSheet("بازگشت کامل سفارش", form, { onClose: () => reload(o.orderNumber, opts) });
+  }
+
+  /** Cross-order sheet: pending manual card payouts with complete/cancel. */
+  async function openPendingRefunds() {
+    const box = el("div", {}, loadingState());
+    openSheet("ریفاندهای معلق (کارت)", box);
+    let data;
+    try {
+      data = await Api.get("/api/admin/refunds/pending");
+    } catch (err) {
+      box.innerHTML = "";
+      box.appendChild(errorState(err.message, () => void openPendingRefunds()));
+      return;
+    }
+    box.innerHTML = "";
+    const refunds = data.refunds || [];
+    if (!refunds.length) {
+      box.appendChild(emptyState("ریفاند معلقی وجود ندارد."));
+      return;
+    }
+    const list = el("div", { class: "list-card" });
+    for (const r of refunds) {
+      const row = el(
+        "div",
+        { class: "row", style: "align-items:flex-start" },
+        el("div", { class: "row-main" },
+          el("div", { style: "display:flex;gap:6px;align-items:center;flex-wrap:wrap" },
+            el("span", { class: "row-title", text: moneyWithCurrency(r.amount, currency) }),
+            el("span", { class: "badge warn", text: r.statusLabel || "در انتظار انتقال" }),
+          ),
+          el("div", { class: "row-sub", text: `${r.orderNumber || "—"} · ${r.customerName || "بدون نام"}` }),
+          r.cardMasked ? el("div", { class: "row-sub ltr", text: `کارت: ${r.cardMasked}` }) : null,
+          el("div", { class: "row-sub", text: `${r.itemLabel || ""} · ${formatTime(r.createdAt)}` }),
+        ),
+      );
+      const actions = el("div", { style: "display:flex;flex-direction:column;gap:6px;min-width:120px" });
+      const completeBtn = el("button", { class: "btn small", type: "button", text: "تکمیل انتقال" });
+      completeBtn.addEventListener("click", async () => {
+        if (!confirm(`انتقال ${moneyWithCurrency(r.amount, currency)} به کارت ${r.cardMasked ?? "ثبت‌شده"} را انجام داده‌اید؟`)) return;
+        completeBtn.disabled = true;
+        try {
+          await Api.post(`/api/admin/refunds/${r.id}/complete`, {});
+          toast("ریفاند تکمیل شد");
+          void openPendingRefunds();
+        } catch (err) {
+          toast(err.message || "انجام نشد", true);
+          completeBtn.disabled = false;
+        }
+      });
+      const cancelBtn = el("button", { class: "btn small ghost danger", type: "button", text: "لغو" });
+      cancelBtn.addEventListener("click", async () => {
+        const reason = prompt("دلیل لغو (اختیاری):");
+        if (reason === null) return;
+        cancelBtn.disabled = true;
+        try {
+          await Api.post(`/api/admin/refunds/${r.id}/cancel`, reason.trim() ? { reason: reason.trim() } : {});
+          toast("ریفاند لغو شد");
+          void openPendingRefunds();
+        } catch (err) {
+          toast(err.message || "انجام نشد", true);
+          cancelBtn.disabled = false;
+        }
+      });
+      actions.appendChild(completeBtn);
+      actions.appendChild(cancelBtn);
+      row.appendChild(actions);
+      list.appendChild(row);
+    }
+    box.appendChild(list);
   }
 
   // ---------- edit ----------
@@ -551,5 +1027,5 @@ const OrderDetail = (() => {
     void loadPicker();
   }
 
-  return { open };
+  return { open, openPendingRefunds };
 })();

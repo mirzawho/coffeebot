@@ -38,6 +38,12 @@ import { MAX_ITEM_QUANTITY } from "../../utils/ids";
 import { log } from "../../utils/logger";
 import { cardToCardAvailable } from "../../services/settings";
 import { walletKeyboard, ratingKeyboard } from "../keyboards";
+import {
+  cardWizardCancel,
+  cardWizardConfirmEdit,
+  showCardMenu,
+  startCardEdit,
+} from "../card-wizard";
 import { membershipJoinUrl } from "../guards/channel-membership";
 import { NO_ORDERS_TEXT, customerOrderDetailText, FULFILLMENT_LABELS } from "../format";
 import type { Order } from "../../services/orders";
@@ -773,6 +779,11 @@ async function handleCallback(ctx: Context, app: BotApp, data: string): Promise<
   if (data === "pf:skip") return profileWizardSkip(ctx, app);
   if (data === "pf:ok") return profileWizardConfirm(ctx, app);
   if (data === "pf:cancel") return profileWizardCancel(ctx, app);
+  if (data === "card") return showCardMenu(ctx, app);
+  if (data === "cardedit") return startCardEdit(ctx, app);
+  // cd:go arms the capture flow itself, so there is no active flow to guard.
+  if (data === "cd:go") return cardWizardConfirmEdit(ctx, app);
+  if (data === "cd:cancel") return cardWizardCancel(ctx, app);
   if (data === "wal") return showWallet(ctx, app);
   if (data === "wdep") return startDeposit(ctx, app);
   if (data === "whist") return showWalletHistory(ctx, app);
@@ -840,7 +851,12 @@ async function showProfile(ctx: Context, app: BotApp): Promise<void> {
       ].join("\n")
     : "👤 هنوز پروفایلی نساخته‌اید.";
   await ctx.reply(text, {
-    reply_markup: new InlineKeyboard().text("✏️ ویرایش پروفایل", "profedit").row().text("🏠 منوی اصلی", "m"),
+    reply_markup: new InlineKeyboard()
+      .text("✏️ ویرایش پروفایل", "profedit")
+      .row()
+      .text("💳 کارت بانکی من", "card")
+      .row()
+      .text("🏠 منوی اصلی", "m"),
   });
 }
 

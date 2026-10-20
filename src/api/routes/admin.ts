@@ -33,6 +33,11 @@ import { formatJalaliFa, isValidDate } from "../../utils/dates";
 import { paymentRejectedCustomerText, receiptApprovedCaption, receiptRejectedCaption } from "../../bot/format";
 import { log } from "../../utils/logger";
 import type { AdminOrderUpdate, Order } from "../../services/orders";
+import {
+  REFUND_REASON_LABELS,
+  type Refund,
+  type RefundSummary,
+} from "../../services/refunds";
 
 interface RouteCtx {
   app: ApiApp;
@@ -234,6 +239,109 @@ function isoToLocalDateTime(iso: string, timezone: string): string {
     if (part.type !== "literal") p[part.type] = part.value;
   }
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
+}
+
+// ---- refunds (admin) ----
+
+/** Persian labels for refund settlement methods — the UI never shows raw codes. */
+const REFUND_SETTLEMENT_LABELS: Record<string, string> = {
+  wallet: "بازگشت به کیف پول",
+  card: "بازپرداخت به کارت مشتری",
+};
+
+const REFUND_STATUS_LABELS: Record<string, string> = {
+  pending: "در انتظار انتقال",
+  completed: "تکمیل‌شده",
+  cancelled: "لغو‌شده",
+};
+
+function refundItemLabel(productName: string, variantName: string | null): string {
+  return variantName ? `${productName} (${variantName})` : productName;
+}
+
+/** Product/variant labels for order items already loaded on an order. */
+function refundLabelsFromOrder(order: Order): Map<number, string> {
+  return new Map(order.items.map((i) => [i.id, refundItemLabel(i.productName, i.variantName)]));
+}
+
+/** Batch-resolve item labels for refunds whose orders are not fully loaded. */
+function refundLabelsForItemIds(app: ApiApp, ids: number[]): Map<number, string> {
+  const labels = new Map<number, string>();
+  const unique = [...new Set(ids)];
+  if (unique.length === 0) return labels;
+  const rows = app.db
+    .query(
+      `SELECT id, product_name, variant_name FROM order_items
+       WHERE id IN (${unique.map(() => "?").join(",")})`,
+    )
+    .all(...unique) as { id: number; product_name: string; variant_name: string | null }[];
+  for (const row of rows) labels.set(row.id, refundItemLabel(row.product_name, row.variant_name));
+  return labels;
+}
+
+/**
+ * Admin-facing refund shape. Card data is only ever the masked snapshot taken
+ * at creation — the full number is not stored on the refund and never leaves
+ * this server.
+ */
+function refundDto(r: Refund, timezone: string, itemLabels: Map<number, string> = new Map()) {
+  return {
+    id: r.id,
+    orderItemId: r.orderItemId,
+    itemLabel: itemLabels.get(r.orderItemId) ?? "—",
+    quantity: r.quantity,
+    amount: r.amount,
+    settlementMethod: r.settlementMethod,
+    settlementLabel: REFUND_SETTLEMENT_LABELS[r.settlementMethod] ?? "—",
+    status: r.status,
+    statusLabel: REFUND_STATUS_LABELS[r.status] ?? "—",
+    reasonCode: r.reasonCode,
+    reasonLabel: r.reasonCode ? (REFUND_REASON_LABELS[r.reasonCode] ?? "—") : null,
+    reasonText: r.reasonText,
+    cardMasked: r.cardMasked,
+    createdBy: r.createdBy,
+    createdAt: isoToLocalDateTime(r.createdAt, timezone),
+    completedBy: r.completedBy,
+    completedAt: r.completedAt ? isoToLocalDateTime(r.completedAt, timezone) : null,
+    cancelledAt: r.cancelledAt ? isoToLocalDateTime(r.cancelledAt, timezone) : null,
+    cancelReason: r.cancelReason,
+  };
+}
+
+function refundSummaryDto(s: RefundSummary) {
+  return {
+    totalAmount: s.totalAmount,
+    refundedAmount: s.refundedAmount,
+    remainingRefundableAmount: s.remainingRefundableAmount,
+    items: s.items.map((i) => ({
+      orderItemId: i.id,
+      productName: i.productName,
+      variantName: i.variantName,
+      quantity: i.quantity,
+      unitPrice: i.unitPrice,
+      refundedQuantity: i.refundedQuantity,
+      refundableQuantity: i.refundableQuantity,
+      refundableAmount: i.refundableAmount,
+    })),
+  };
+}
+
+/** Whether the customer has a registered card — masked only, never the number. */
+function customerCardDto(app: ApiApp, telegramId: number) {
+  const card = app.customers.getCard(telegramId);
+  return { hasCard: !!card, masked: card?.masked ?? null };
+}
+
+/** Full admin order payload: classic orderDto fields + refund state + card status. */
+function orderDetailPayload(app: ApiApp, order: Order) {
+  const refunds = app.refunds.listForOrder(order.id);
+  const labels = refundLabelsFromOrder(order);
+  return {
+    ...orderDto(order, app.config.timezone),
+    refunds: refunds.map((r) => refundDto(r, app.config.timezone, labels)),
+    refundSummary: refundSummaryDto(app.refunds.summarize(order)),
+    customerCard: customerCardDto(app, order.customerTelegramId),
+  };
 }
 
 function localDate(app: ApiApp, now = new Date()): string {
@@ -620,7 +728,9 @@ route("GET", "/api/admin/orders", ({ app, url }) => {
 route("GET", "/api/admin/orders/:ref", ({ app, params }) => {
   const order = app.orders.findByNumber(decodeURIComponent(params.ref));
   if (!order) return json({ error: "سفارش یافت نشد" }, 404);
-  return json(orderDto(order, app.config.timezone));
+  // Same top-level fields as before (backward compatible), plus refund state
+  // and the customer's registered-card status so the panel can render both.
+  return json(orderDetailPayload(app, order));
 });
 
 /**
@@ -850,6 +960,17 @@ route("GET", "/api/admin/customers/:id", ({ app, params }) => {
   const ratings = app.loyalty.ratingsForCustomer(telegramId, 10);
   const membershipSettings = getMembershipSettings(app.db);
   const membershipRecord = app.membership.recordFor(telegramId);
+  // Masked card + recent refunds — for the profile's «کارت بانکی» row and
+  // refund history. The full card number is never included.
+  const card = app.customers.getCard(telegramId);
+  const refundRows = app.db
+    .query(
+      `SELECT r.*, o.order_number FROM refunds r
+       JOIN orders o ON o.id = r.order_id
+       WHERE r.customer_telegram_id = ?
+       ORDER BY r.id DESC LIMIT 20`,
+    )
+    .all(telegramId) as any[];
   return json({
     ...summary,
     profile: summary.profile
@@ -861,6 +982,19 @@ route("GET", "/api/admin/customers/:id", ({ app, params }) => {
           username: summary.profile.username,
         }
       : null,
+    card: card ? { hasCard: true, masked: card.masked, last4: card.last4 } : { hasCard: false, masked: null },
+    refunds: refundRows.map((r) => ({
+      id: r.id,
+      orderNumber: r.order_number,
+      amount: r.amount,
+      quantity: r.quantity,
+      settlementLabel: REFUND_SETTLEMENT_LABELS[r.settlement_method] ?? "—",
+      status: r.status,
+      statusLabel: REFUND_STATUS_LABELS[r.status] ?? "—",
+      cardMasked: r.card_masked ?? null,
+      createdAt: isoToLocalDateTime(r.created_at, app.config.timezone),
+      completedAt: r.completed_at ? isoToLocalDateTime(r.completed_at, app.config.timezone) : null,
+    })),
     membership: {
       configuredChannel: membershipSettings.channel,
       enforcementEnabled: membershipSettings.enabled,
@@ -1344,6 +1478,175 @@ route("POST", "/api/admin/orders/:ref/payment/reject", async ({ app, user, param
   }
   await syncReceiptNotices(app, r.order.orderNumber, receiptRejectedCaption(r.order.orderNumber));
   return json({ ok: true, already: r.already, order: orderDto(r.order, app.config.timezone) });
+});
+
+// ---- refunds ----
+
+/** Refund history + refundability summary for one order. */
+route("GET", "/api/admin/orders/:ref/refunds", ({ app, params }) => {
+  const order = app.orders.findByNumber(decodeURIComponent(params.ref));
+  if (!order) return badRequest("سفارش یافت نشد");
+  const labels = refundLabelsFromOrder(order);
+  return json({
+    refunds: app.refunds
+      .listForOrder(order.id)
+      .map((r) => refundDto(r, app.config.timezone, labels)),
+    summary: refundSummaryDto(app.refunds.summarize(order)),
+  });
+});
+
+/**
+ * Create refunds for an order: selected item quantities or the full remaining
+ * balance, settled to the wallet (immediate ledger credit) or recorded as a
+ * pending manual card payout. All financial rules live in RefundsService —
+ * this handler only shapes the request, snapshots the registered card when
+ * needed, notifies the customer, and returns the refreshed order payload.
+ * The admin actor always comes from the authenticated initData, never the body.
+ */
+route("POST", "/api/admin/orders/:ref/refunds", async ({ app, user, params, req }) => {
+  const order = app.orders.findByNumber(decodeURIComponent(params.ref));
+  if (!order) return badRequest("سفارش یافت نشد");
+  const body = (await readJson(req)) as Record<string, unknown> | null;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return badRequest("JSON نامعتبر است");
+  }
+  const settlementMethod = String(body.settlementMethod ?? "") as "wallet" | "card" | "";
+  if (settlementMethod !== "wallet" && settlementMethod !== "card") {
+    return badRequest("روش بازگشت وجه نامعتبر است");
+  }
+  // Card settlement needs the registered card snapshot; there is no bank
+  // integration, so a pending record is created and an admin confirms the
+  // manual transfer later. A missing card is a hard error, never a fallback.
+  let card: { number: string; cardholderName: string | null } | null = null;
+  if (settlementMethod === "card") {
+    const saved = app.customers.getCard(order.customerTelegramId);
+    if (!saved) {
+      return badRequest(
+        "مشتری شماره کارت ثبت‌نکرده است؛ ابتدا کارت او را ثبت کنید یا بازگشت به کیف پول را انتخاب کنید",
+      );
+    }
+    card = {
+      number: saved.cardNumber,
+      cardholderName: app.customers.getProfile(order.customerTelegramId)?.fullName?.trim() || null,
+    };
+  }
+  const fullOrder = body.fullOrder === true;
+  const rawItems = Array.isArray(body.items) ? body.items : [];
+  const items = rawItems.map((it: any) => ({
+    orderItemId: Number(it?.orderItemId),
+    quantity: Number(it?.quantity),
+  }));
+  if (!fullOrder && items.length === 0) {
+    return badRequest("حداقل یک آیتم برای بازگشت انتخاب کنید");
+  }
+  // Replays with the same key return the original result; a missing key gets a
+  // fresh UUID so each submission is its own operation.
+  const idempotencyKey = String(body.idempotencyKey ?? "").trim() || crypto.randomUUID();
+  const input = {
+    settlementMethod,
+    idempotencyKey,
+    createdBy: user.id,
+    reasonCode: body.reasonCode != null ? String(body.reasonCode) : null,
+    reasonText: body.reasonText != null ? String(body.reasonText) : null,
+    card,
+  };
+  const r = fullOrder
+    ? app.refunds.createFullOrderRefund(order, input)
+    : app.refunds.createItemRefunds(order, items, input);
+  if (!r.ok) return badRequest(r.error);
+
+  if (!r.already && r.refunds.length > 0) {
+    const first = r.refunds[0];
+    const text =
+      settlementMethod === "wallet"
+        ? `✅ مبلغ ${formatMoney(r.totalAmount, order.currency)} بابت بازگشت سفارش ${order.orderNumber} به کیف پول شما اضافه شد.`
+        : `⏳ درخواست بازپرداخت ${formatMoney(r.totalAmount, order.currency)} بابت سفارش ${order.orderNumber} ثبت شد و پس از انتقال وجه به کارت ${first.cardMasked ?? "ثبت‌شده"} تکمیل می‌شود.`;
+    notifyCustomer(app, order.customerTelegramId, `order_refund_${first.id}`, text);
+  }
+  const refreshed = app.orders.loadOrder(order.id) ?? order;
+  const labels = refundLabelsForItemIds(app, r.refunds.map((x) => x.orderItemId));
+  return json({
+    ok: true,
+    already: r.already,
+    totalAmount: r.totalAmount,
+    ...(r.balanceAfter !== undefined ? { balanceAfter: r.balanceAfter } : {}),
+    refunds: r.refunds.map((ref) => refundDto(ref, app.config.timezone, labels)),
+    order: orderDetailPayload(app, refreshed),
+  });
+});
+
+/** Pending manual card payouts, joined with order number + customer name. */
+route("GET", "/api/admin/refunds/pending", ({ app }) => {
+  const tz = app.config.timezone;
+  const pending = app.refunds.listPendingCard(100);
+  const orderIds = [...new Set(pending.map((r) => r.orderId))];
+  const orders = new Map<number, { orderNumber: string; customerName: string | null }>();
+  if (orderIds.length) {
+    const rows = app.db
+      .query(
+        `SELECT id, order_number, customer_name FROM orders
+         WHERE id IN (${orderIds.map(() => "?").join(",")})`,
+      )
+      .all(...orderIds) as { id: number; order_number: string; customer_name: string | null }[];
+    for (const o of rows) {
+      orders.set(o.id, { orderNumber: o.order_number, customerName: o.customer_name });
+    }
+  }
+  const labels = refundLabelsForItemIds(app, pending.map((r) => r.orderItemId));
+  return json({
+    refunds: pending.map((r) => {
+      const o = orders.get(r.orderId);
+      const customerName =
+        o?.customerName?.trim() ||
+        app.customers.getProfile(r.customerTelegramId)?.fullName?.trim() ||
+        "بدون نام";
+      return {
+        ...refundDto(r, tz, labels),
+        orderNumber: o?.orderNumber ?? null,
+        customerName,
+      };
+    }),
+  });
+});
+
+/**
+ * Admin confirms a pending card refund was transferred manually. Idempotent —
+ * a repeated call returns `already: true` and never notifies twice.
+ */
+route("POST", "/api/admin/refunds/:id/complete", ({ app, user, params }) => {
+  const r = app.refunds.completeCardRefund(num(params.id), user.id);
+  if (!r.ok) return badRequest(r.error);
+  if (!r.already) {
+    const order = app.orders.loadOrder(r.refund.orderId);
+    const currency = order?.currency ?? getCurrency(app.db);
+    const orderNumber = order?.orderNumber ?? `#${r.refund.orderId}`;
+    // Distinct ref_key from the create notice — (kind, ref_key, recipient) is
+    // unique, so reusing it would silently drop this completion notice.
+    notifyCustomer(
+      app,
+      r.refund.customerTelegramId,
+      `order_refund_completed_${r.refund.id}`,
+      `✅ بازپرداخت ${formatMoney(r.refund.amount, currency)} بابت سفارش ${orderNumber} به کارت ${r.refund.cardMasked ?? "ثبت‌شده"} انجام شد.`,
+    );
+  }
+  return json({ ok: true, already: r.already, refund: refundDto(r.refund, app.config.timezone) });
+});
+
+/** Cancel a still-pending refund (optionally with a reason). */
+route("POST", "/api/admin/refunds/:id/cancel", async ({ app, user, params, req }) => {
+  let reason: string | null = null;
+  try {
+    const body = (await readJson(req)) as { reason?: unknown } | null;
+    if (typeof body?.reason === "string" && body.reason.trim()) {
+      reason = body.reason.trim().slice(0, 200);
+    }
+  } catch (err) {
+    if (err instanceof HttpError && err.status === 413) throw err;
+    // Unreadable body: fall through with no reason (backward compatible).
+  }
+  const r = app.refunds.cancelRefund(num(params.id), user.id, reason);
+  if (!r.ok) return badRequest(r.error);
+  return json({ ok: true, refund: refundDto(r.refund, app.config.timezone) });
 });
 
 /**

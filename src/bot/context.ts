@@ -68,6 +68,8 @@ export interface BotApp {
   rejectReasonFlow: TextCaptureFlow;
   /** Next text message is captured as a referral code. */
   referralFlow: TextCaptureFlow;
+  /** Next text message is captured as the customer's bank card number. */
+  cardEdit: TextCaptureFlow;
 }
 
 const HISTORY_CAP = 300;

@@ -11,6 +11,7 @@ import { LoyaltyService } from "../src/services/loyalty";
 import { NotificationService } from "../src/services/notifications";
 import { ChannelMembershipService } from "../src/services/membership";
 import { ReferralService } from "../src/services/referrals";
+import { RefundsService } from "../src/services/refunds";
 import { ReportService } from "../src/services/reports";
 import { updatePaymentSettings, updateReportSettings } from "../src/services/settings";
 import { handleAdminApi } from "../src/api/routes/admin";
@@ -96,6 +97,7 @@ beforeEach(() => {
     loyalty: new LoyaltyService(db),
     membership: new ChannelMembershipService(db),
     referrals: new ReferralService(db),
+    refunds: new RefundsService(db),
   };
   updatePaymentSettings(db, { cardNumber: "603799", cardholderName: "Ali", currency: "تومان" });
   // Recipients drive the immediate receipt-review notifications; the daily
@@ -221,6 +223,7 @@ function buildBotApp(): BotApp {
     depositFlow: new TextCaptureFlow(),
     rejectReasonFlow: new TextCaptureFlow(),
     referralFlow: new TextCaptureFlow(),
+    cardEdit: new TextCaptureFlow(),
   };
 }
 

@@ -111,6 +111,7 @@ function buildApp(aiResult: AiResult | ((input: AiInput) => AiResult)): BotApp {
     depositFlow: new TextCaptureFlow(),
     rejectReasonFlow: new TextCaptureFlow(),
     referralFlow: new TextCaptureFlow(),
+    cardEdit: new TextCaptureFlow(),
   };
 }
 

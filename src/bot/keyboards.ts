@@ -28,6 +28,10 @@ import { toPersianDigits } from "../utils/dates";
  *  ref          referral section (code + share link + referred count)
  *  refcode      start the «enter referral code» capture flow
  *  refcancel    abort the referral-code capture flow
+ *  card         bank-card section view (masked number + actions)
+ *  cardedit     start the bank-card edit flow (confirm first if one exists)
+ *  cd:go        confirm replacing the saved card; arms the capture flow
+ *  cd:cancel    abort the card edit flow without touching the saved card
  */
 
 /**
@@ -318,4 +322,20 @@ export function ratingKeyboard(telegramId: number, orderId: number, tokens: Toke
   }
   kb.row().text("⏭ بعداً", "noop");
   return kb;
+}
+
+/**
+ * Bank-card section view. The label differs when no card is registered yet
+ * («ثبت» vs «ویرایش»); the full number is never placed in callback data.
+ */
+export function cardViewKeyboard(hasCard: boolean, _last4: string | null): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  kb.text(hasCard ? "✏️ ویرایش شماره کارت" : "➕ ثبت شماره کارت", "cardedit");
+  kb.row().text("🏠 منوی اصلی", "m");
+  return kb;
+}
+
+/** Confirmation before replacing an existing card: explicit «ادامه» / «لغو». */
+export function cardEditConfirmKeyboard(): InlineKeyboard {
+  return new InlineKeyboard().text("✅ ادامه", "cd:go").text("❌ لغو", "cd:cancel");
 }

@@ -19,6 +19,7 @@ import {
   DEFAULT_JOIN_MESSAGE,
 } from "../src/services/membership";
 import { ReferralService } from "../src/services/referrals";
+import { RefundsService } from "../src/services/refunds";
 import {
   channelMembershipGuard,
   membershipJoinUrl,
@@ -104,6 +105,7 @@ function buildBotApp(membership: ChannelMembershipService): BotApp {
     depositFlow: new TextCaptureFlow(),
     rejectReasonFlow: new TextCaptureFlow(),
     referralFlow: new TextCaptureFlow(),
+    cardEdit: new TextCaptureFlow(),
   };
 }
 
@@ -674,6 +676,7 @@ describe("admin API: channel membership", () => {
       loyalty: new LoyaltyService(db),
       membership,
       referrals: new ReferralService(db),
+      refunds: new RefundsService(db),
     };
   });
 

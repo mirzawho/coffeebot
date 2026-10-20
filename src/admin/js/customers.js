@@ -485,8 +485,27 @@ const CustomersPage = (() => {
           infoRow("یوزرنیم", d.profile?.username ? `@${d.profile.username}` : "ثبت نشده", true),
           infoRow("شماره تماس", d.profile?.phone ? faDigits(d.profile.phone) : "ثبت نشده", true),
           infoRow("آدرس", d.profile?.address || "ثبت نشده", false),
+          infoRow("کارت بانکی", d.card?.hasCard ? d.card.masked : "ثبت نشده", true),
         ),
       );
+      // Refund history (recent first) — masked destination card only.
+      if (d.refunds && d.refunds.length) {
+        const refundRows = d.refunds.map((r) =>
+          el("div", { class: "row" },
+            el("div", { class: "row-main" },
+              el("div", { class: "row-title" },
+                moneyWithCurrency(r.amount, currency),
+                " ",
+                el("span", { class: r.status === "pending" ? "badge warn" : r.status === "cancelled" ? "badge off" : "badge", text: r.statusLabel })),
+              el("div", { class: "row-sub", text: `${r.orderNumber || "—"} · ${r.settlementLabel}${r.cardMasked ? ` · ${r.cardMasked}` : ""}` }),
+              el("div", { class: "row-sub", text: r.createdAt }))),
+        );
+        wrap.appendChild(
+          el("div", { class: "card list-card", style: "margin-bottom:14px" },
+            el("div", { class: "section-label", text: "تاریخچه ریفاند" }),
+            ...refundRows),
+        );
+      }
       // Channel membership (cached last verification + manual recheck).
       wrap.appendChild(membershipCard(d, id));
       wrap.appendChild(
@@ -646,14 +665,18 @@ const CustomersPage = (() => {
 
       function referredList() {
         const items = state.referred || [];
-        const card = section("زیرمجموعه‌ها (مشتریان دعوت‌شده)", items.map((c) =>
+        const rows = items.map((c) =>
           el("button", { class: "row tappable", type: "button", onClick: () => openDetail(c.id) },
             el("div", { class: "profile-avatar", style: "width:40px;height:40px;font-size:15px",
               text: (c.name || "ب").trim().charAt(0) }),
             el("div", { class: "row-main" },
               el("div", { class: "row-title", text: c.name || "بدون نام" }),
-              el("div", { class: "row-sub", text: customerSub(c) }))),
-          items.length === 0 ? "هنوز مشتری با کد معرف این شخص ثبت‌نام نکرده است." : null);
+              el("div", { class: "row-sub", text: customerSub(c) }))));
+        const card = section(
+          "زیرمجموعه‌ها (مشتریان دعوت‌شده)",
+          rows,
+          items.length === 0 ? "هنوز مشتری با کد معرف این شخص ثبت‌نام نکرده است." : null,
+        );
         if (state.referredCount > items.length) {
           card.appendChild(el("button", {
             class: "btn small ghost", type: "button", style: "margin:10px auto;display:block",

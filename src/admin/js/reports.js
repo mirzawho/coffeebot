@@ -101,8 +101,17 @@ const ReportsPage = (() => {
       },
     });
 
+    // Pending manual card payouts — a cross-order queue so an admin can find
+    // transfers that still need to be made without opening each order.
+    const pendingBtn = el("button", {
+      class: "btn small secondary",
+      type: "button",
+      text: "ریفاندهای معلق",
+      onClick: () => void OrderDetail.openPendingRefunds(),
+    });
+
     container.appendChild(
-      el("div", { class: "card filter-bar" }, fromInput, el("span", { class: "sep", text: "تا" }), toInput, todayBtn),
+      el("div", { class: "card filter-bar" }, fromInput, el("span", { class: "sep", text: "تا" }), toInput, todayBtn, pendingBtn),
     );
     container.appendChild(note);
 

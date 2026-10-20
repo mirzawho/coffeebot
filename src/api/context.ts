@@ -9,6 +9,7 @@ import type { CustomersService } from "../services/customers";
 import type { LoyaltyService } from "../services/loyalty";
 import type { ChannelMembershipService } from "../services/membership";
 import type { ReferralService } from "../services/referrals";
+import type { RefundsService } from "../services/refunds";
 import type { InlineKeyboardMarkup } from "@grammyjs/types";
 
 export interface ApiApp {
@@ -27,6 +28,8 @@ export interface ApiApp {
   membership: ChannelMembershipService;
   /** Referral codes and attribution (admin customer profile tab). */
   referrals: ReferralService;
+  /** Order refunds: item/full refunds, wallet + card settlement. */
+  refunds: RefundsService;
   /**
    * Telegram bot, used only to resolve receipt file_ids into image bytes for
    * the admin panel, and to rewrite receipt notice captions after a review

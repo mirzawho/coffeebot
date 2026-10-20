@@ -11,6 +11,7 @@ import { ReportService } from "../src/services/reports";
 import { NotificationService } from "../src/services/notifications";
 import { ChannelMembershipService } from "../src/services/membership";
 import { ReferralService } from "../src/services/referrals";
+import { RefundsService } from "../src/services/refunds";
 import { createHttpServer } from "../src/api/server";
 import { signInitData } from "../src/api/middleware/auth";
 import { botState } from "../src/bot/state";
@@ -64,6 +65,7 @@ beforeAll(() => {
     loyalty: new LoyaltyService(db),
     membership: new ChannelMembershipService(db),
     referrals: new ReferralService(db),
+    refunds: new RefundsService(db),
   };
   server = createHttpServer(app);
   base = `http://127.0.0.1:${server.port}`;
@@ -227,7 +229,8 @@ describe("DEBUG=true injects the eruda console", () => {
       customers: new CustomersService(db),
       loyalty: new LoyaltyService(db),
       membership: new ChannelMembershipService(db),
-    referrals: new ReferralService(db),
+      referrals: new ReferralService(db),
+      refunds: new RefundsService(db),
     };
     debugServer = createHttpServer(app);
     debugBase = `http://127.0.0.1:${debugServer.port}`;

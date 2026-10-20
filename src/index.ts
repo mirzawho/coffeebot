@@ -15,6 +15,7 @@ import { CustomersService } from "./services/customers";
 import { LoyaltyService } from "./services/loyalty";
 import { ChannelMembershipService } from "./services/membership";
 import { ReferralService } from "./services/referrals";
+import { RefundsService } from "./services/refunds";
 import { getReportSettings, getSetting, setSetting } from "./services/settings";
 import { TokenService } from "./bot/tokens";
 import { createBot, startBot } from "./bot/index";
@@ -98,6 +99,7 @@ async function main(): Promise<void> {
     depositFlow: new TextCaptureFlow(),
     rejectReasonFlow: new TextCaptureFlow(),
     referralFlow: new TextCaptureFlow(),
+    cardEdit: new TextCaptureFlow(),
   };
 
   const bot = createBot(botApp);
@@ -121,6 +123,7 @@ async function main(): Promise<void> {
     loyalty,
     membership,
     referrals,
+    refunds: new RefundsService(db),
     // Used only to resolve receipt file_ids into image bytes for the panel.
     bot,
   };
